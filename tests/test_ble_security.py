@@ -16,9 +16,10 @@ class BleSecurityTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="linkr-security-")
         cls.addClassCleanup(cls.tmp.cleanup)
         directory = Path(cls.tmp.name)
-        source = (ROOT / "src/ble_security.c").read_text()
+        source = (ROOT / "src/ble_security.c").read_text(encoding="utf-8")
         (directory / "security_production.inc").write_text(
-            re.sub(r'^#include[^\n]*\n', '', source, flags=re.MULTILINE))
+            re.sub(r'^#include[^\n]*\n', '', source, flags=re.MULTILINE),
+            encoding="utf-8")
         cls.binary = directory / "security-test"
         subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall", "-Wextra",
                         "-Werror", "-I", str(directory), str(ROOT / "tests/ble_security_harness.c"),
@@ -87,7 +88,7 @@ class BleSecurityTests(unittest.TestCase):
 
     def test_kconfig_and_manifest_support_the_new_controller(self):
         """Guard the build wiring the C5 security fix depends on."""
-        kconfig = (ROOT / "Kconfig").read_text()
+        kconfig = (ROOT / "Kconfig").read_text(encoding="utf-8")
         for symbol in ["ESP32_BT_LE_SECURITY_ENABLE",
                        "ESP32_BT_LE_LL_CFG_FEAT_LE_ENCRYPTION",
                        "ESP32_BT_LE_CRYPTO_STACK_MBEDTLS"]:
@@ -98,14 +99,14 @@ class BleSecurityTests(unittest.TestCase):
         # ESP32_BT_LE_CRYPTO_STACK_MBEDTLS, which Zephyr satisfies from the
         # legacy mbedTLS modules vendored by hostap. Without the module the
         # build fails to configure instead of silently losing pairing.
-        self.assertIn("hostap", (ROOT / "west.yml").read_text())
+        self.assertIn("hostap", (ROOT / "west.yml").read_text(encoding="utf-8"))
 
     def test_no_plaintext_custom_gatt_attributes_or_default_nus(self):
         for name in ["ble_nus.c", "ble_uart_reliable.c", "ble_mgmt.c"]:
-            source = (ROOT / "src" / name).read_text()
+            source = (ROOT / "src" / name).read_text(encoding="utf-8")
             for permission in re.findall(r'\bBT_GATT_PERM_\w+', source):
                 self.assertIn(permission, {"BT_GATT_PERM_READ_ENCRYPT", "BT_GATT_PERM_WRITE_ENCRYPT"}, name)
-        config = (ROOT / "prj.conf").read_text()
+        config = (ROOT / "prj.conf").read_text(encoding="utf-8")
         for entry in ["CONFIG_BT_SMP=y", "CONFIG_BT_SMP_APP_PAIRING_ACCEPT=y",
                       "CONFIG_BT_BONDING_REQUIRED=y", "CONFIG_BT_SETTINGS=y",
                       "CONFIG_BT_KEYS_OVERWRITE_OLDEST=n", "CONFIG_BT_ZEPHYR_NUS_DEFAULT_INSTANCE=n"]:

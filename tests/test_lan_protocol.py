@@ -18,11 +18,11 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-WS_BRIDGE = (ROOT / "src/ws_bridge.c").read_text()
-APP = (ROOT / "web/app.js").read_text()
-WS_BRIDGE_H = (ROOT / "src/ws_bridge.h").read_text()
-MAIN = (ROOT / "src/main.c").read_text()
-TARGET_BINDING = (ROOT / "src/target_binding.c").read_text()
+WS_BRIDGE = (ROOT / "src/ws_bridge.c").read_text(encoding="utf-8")
+APP = (ROOT / "web/app.js").read_text(encoding="utf-8")
+WS_BRIDGE_H = (ROOT / "src/ws_bridge.h").read_text(encoding="utf-8")
+MAIN = (ROOT / "src/main.c").read_text(encoding="utf-8")
+TARGET_BINDING = (ROOT / "src/target_binding.c").read_text(encoding="utf-8")
 
 FRAME_NAMES = ["WS_AUTH_NONE_FRAME", "WS_AUTH_REQUIRED_FRAME", "WS_AUTH_OK_FRAME"]
 
@@ -66,7 +66,7 @@ class LanHandshakeTests(unittest.TestCase):
         for doc in ["docs/DEVELOPMENT.md", "docs/DEVELOPMENT.zh-CN.md",
                     "docs/LINKR_BLE_API.zh-CN.md"]:
             self.assertRegex(
-                (ROOT / doc).read_text(),
+                (ROOT / doc).read_text(encoding="utf-8"),
                 rf"\b{length}\b",
                 f"{doc} never mentions the {length}-character token",
             )
@@ -110,7 +110,7 @@ class DocumentedCommandTests(unittest.TestCase):
     @staticmethod
     def documented_long_forms(path):
         rows = re.findall(r"^\|\s*`@[^`]+`\s*\|\s*`@linkr ([^`]+)`",
-                          path.read_text(), re.MULTILINE)
+                          path.read_text(encoding="utf-8"), re.MULTILINE)
         # Drop blank cells; the earlier `endswith(("",)) or row` was always true.
         return [row.strip() for row in rows if row.strip()]
 

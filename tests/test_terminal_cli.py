@@ -528,7 +528,7 @@ class TerminalGeometryTests(unittest.TestCase):
             terminal.terminal_geometry_command(80, 24),
             "stty rows 24 cols 80 >/dev/null 2>&1\r",
         )
-        web = (ROOT / "web/terminal_geometry.js").read_text()
+        web = (ROOT / "web/terminal_geometry.js").read_text(encoding="utf-8")
         self.assertIn(
             "stty rows ${geometry.rows} cols ${geometry.cols} >/dev/null 2>&1\\r",
             web,
@@ -542,7 +542,7 @@ class TerminalGeometryTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(terminal.looks_like_shell_prompt(text))
 
-        web = (ROOT / "web/terminal_geometry.js").read_text()
+        web = (ROOT / "web/terminal_geometry.js").read_text(encoding="utf-8")
         self.assertIn(r"/[$#] $/", web)
         self.assertIn(r"/@\S+(?::\S*)?$/", web)
 

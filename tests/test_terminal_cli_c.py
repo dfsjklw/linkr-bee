@@ -47,7 +47,7 @@ def extract(source, start_marker, end_marker, required):
 
 
 def c_version_string():
-    match = re.search(r'#define CLI_VERSION\s+"([^"]+)"', SOURCE_PATH.read_text())
+    match = re.search(r'#define CLI_VERSION\s+"([^"]+)"', SOURCE_PATH.read_text(encoding="utf-8"))
     return match.group(1) if match else ""
 
 
@@ -316,7 +316,7 @@ class CHarnessTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="linkr-c-harness-")
         cls.addClassCleanup(cls.tmp.cleanup)
         directory = Path(cls.tmp.name)
-        source = SOURCE_PATH.read_text()
+        source = SOURCE_PATH.read_text(encoding="utf-8")
 
         device_helpers = extract(
             source, "static int device_rank(", "static bool iter_uuid_array_contains",
@@ -351,7 +351,8 @@ class CHarnessTests(unittest.TestCase):
             HARNESS_PRELUDE + "\n"
             + escape_helpers + "\n" + enter + "\n" + sanitizer + "\n"
             + device_helpers + "\n" + board_rules + "\n" + management_ready
-            + "\n" + validators + "\n" + HARNESS_MAIN
+            + "\n" + validators + "\n" + HARNESS_MAIN,
+            encoding="utf-8",
         )
         cls.binary = directory / "harness"
         # -Werror: the harness also enforces that the extracted helpers are
@@ -543,7 +544,7 @@ class CBinaryArgumentTests(unittest.TestCase):
     def parsed_flags(cls):
         """Every flag parse_args() matches on, read from the source."""
         return set(re.findall(r'strcmp\(flag, "(-{1,2}[a-z][a-z-]*)"\)',
-                              SOURCE_PATH.read_text()))
+                              SOURCE_PATH.read_text(encoding="utf-8")))
 
     def test_completion_lists_exactly_the_options_the_parser_accepts(self):
         self.assertEqual(set(self.bash_option_words(self.completion("bash"))),
@@ -633,8 +634,8 @@ class CParityTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.c_source = SOURCE_PATH.read_text()
-        cls.py_source = PYTHON_PATH.read_text()
+        cls.c_source = SOURCE_PATH.read_text(encoding="utf-8")
+        cls.py_source = PYTHON_PATH.read_text(encoding="utf-8")
 
     def test_version_strings_match(self):
         c_version = re.search(r'#define CLI_VERSION\s+"([^"]+)"', self.c_source)

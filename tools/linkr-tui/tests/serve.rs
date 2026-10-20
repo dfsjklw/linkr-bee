@@ -126,7 +126,14 @@ fn number(line: &str, key: &str) -> u64 {
 fn a_session_answers_many_requests_on_one_link() {
     let mut session = Session::start();
     let ready = session.until("\"event\":\"ready\"");
-    assert!(ready.contains("\"program\":\"bee\""), "{ready}");
+    // The invoked program names itself: `bee`, with the executable suffix
+    // Windows requires.
+    let program = if cfg!(windows) {
+        "\"program\":\"bee.exe\""
+    } else {
+        "\"program\":\"bee\""
+    };
+    assert!(ready.contains(program), "{ready}");
     assert!(ready.contains("\"ops\":["), "{ready}");
     assert!(ready.contains("\"exec\""), "{ready}");
 

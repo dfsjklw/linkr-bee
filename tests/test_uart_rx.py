@@ -16,11 +16,11 @@ class UartRxTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="linkr-uart-rx-")
         cls.addClassCleanup(cls.tmp.cleanup)
         directory = Path(cls.tmp.name)
-        main = (ROOT / "src/main.c").read_text()
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
         start = main.index("static void uart_to_ble_thread(void)")
         end = main.index(
             "\n#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_TX)", start)
-        (directory / "uart_rx_functions.inc").write_text(main[start:end])
+        (directory / "uart_rx_functions.inc").write_text(main[start:end], encoding="utf-8")
         cls.binary = directory / "uart-rx-tests"
         subprocess.run([
             *shlex.split(os.environ.get("CC", "cc")), "-std=c11",

@@ -42,7 +42,7 @@ class FlashFirmwareTests(unittest.TestCase):
 
     def assert_flash(self, result, image, chip, address):
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.log.read_text().splitlines(),
+        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(),
                          ["--chip", chip, "--port", "/dev/linkr-test", "--baud", "921600",
                           "write-flash", address, str(image)])
         self.assertIn("Checksum verified", result.stdout)
