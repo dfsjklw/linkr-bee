@@ -27,13 +27,15 @@ fn stderr(output: &Output) -> String {
 
 /// The command the archives install is `bee`, not the crate's old internal
 /// name: a script that pins `--version` must see the name it can invoke.
+/// Windows appends the executable suffix to the invoked name.
 #[test]
 fn the_version_names_the_command() {
     let output = bee(&["--version"]);
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let program = if cfg!(windows) { "bee.exe" } else { "bee" };
     assert_eq!(
         stdout(&output).trim(),
-        format!("bee {}", env!("CARGO_PKG_VERSION"))
+        format!("{program} {}", env!("CARGO_PKG_VERSION"))
     );
 }
 

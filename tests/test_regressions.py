@@ -40,7 +40,7 @@ class FirmwareTests(unittest.TestCase):
         directory = Path(cls.tmp.name)
         # Compile the actual production function bodies against deterministic
         # host fakes, so the tests exercise retry control flow without a board.
-        wifi = (ROOT / "src/wifi.c").read_text()
+        wifi = (ROOT / "src/wifi.c").read_text(encoding="utf-8")
         # The WebDAV setters are what publish a new URL + generation and clear
         # the ring. Without them compiled in, the retarget scenarios could only
         # simulate that transition and would pass with a broken setter.
@@ -49,12 +49,13 @@ class FirmwareTests(unittest.TestCase):
                            "linkr_webdav_clear_config"])
         upload = extract(wifi, "static void upload_thread(void *a", "\n/* ---",
                          ["upload_thread"])
-        main = (ROOT / "src/main.c").read_text()
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
         forward = extract(main, "static int uart_forward_chunk(", "\n#endif",
                           ["uart_forward_chunk"])
-        (directory / "production_functions.inc").write_text(setters + upload + forward)
+        (directory / "production_functions.inc").write_text(
+            setters + upload + forward, encoding="utf-8")
         config = dict(
-            line.split("=", 1) for line in (ROOT / "prj.conf").read_text().splitlines()
+            line.split("=", 1) for line in (ROOT / "prj.conf").read_text(encoding="utf-8").splitlines()
             if line.startswith("CONFIG_")
         )
         drop = int(config.get("CONFIG_LINKR_BLE_BRIDGE_UART_RX_DROP_NO_CONN") == "y")

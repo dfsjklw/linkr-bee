@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { ABOUT_DATA_FILE, collectAbout, renderAboutModule } from "../../tools/gen_about.mjs";
 
@@ -65,7 +65,7 @@ test("the About page is reachable from both navigation surfaces", () => {
 
 test("the About page renders every group in the data", async () => {
   const data = collectAbout(ROOT);
-  const module = await import(DATA_PATH);
+  const module = await import(pathToFileURL(DATA_PATH).href);
   assert.deepEqual(module.ABOUT_DATA, data);
   assert.equal(module.ABOUT_DATA.groups.length, 3, "runtime, firmware and artwork");
 });

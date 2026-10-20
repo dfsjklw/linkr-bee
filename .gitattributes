@@ -1,0 +1,9 @@
+# Every text file is stored LF and checked out LF: the About data comparison and
+# the vendored-bundle digests compare bytes, so a CRLF checkout fails them on
+# Windows even though the content is identical.
+* text=auto eol=lf
+
+# The Windows launchers Gradle and friends generate keep the ending their shell
+# expects; they are stored as they were generated.
+*.bat text eol=crlf
+*.cmd text eol=crlf

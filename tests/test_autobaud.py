@@ -38,7 +38,7 @@ class AutobaudTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="linkr-autobaud-")
         cls.addClassCleanup(cls.tmp.cleanup)
         directory = Path(cls.tmp.name)
-        production = (ROOT / "src/uart_autobaud.c").read_text()
+        production = (ROOT / "src/uart_autobaud.c").read_text(encoding="utf-8")
         block = extract(
             production,
             "#define AUTOBAUD_WINDOW_MS",
@@ -47,16 +47,16 @@ class AutobaudTests(unittest.TestCase):
              "autobaud_snap", "autobaud_forget", "autobaud_within_pct",
              "linkr_uart_autobaud_init"],
         )
-        (directory / "autobaud_functions.inc").write_text(block)
-        main = (ROOT / "src/main.c").read_text()
+        (directory / "autobaud_functions.inc").write_text(block, encoding="utf-8")
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
         frame = extract(main, "uint32_t linkr_uart_config_frame_half_bits(void)",
                         "\nint linkr_uart_config_reconfigure(",
                         ["linkr_uart_config_frame_half_bits"])
-        (directory / "uart_frame_functions.inc").write_text(frame)
-        rmt = (ROOT / "src/uart_rmt_span.c").read_text()
+        (directory / "uart_frame_functions.inc").write_text(frame, encoding="utf-8")
+        rmt = (ROOT / "src/uart_rmt_span.c").read_text(encoding="utf-8")
         span = extract(rmt, "static void span_measure(",
                        "\nvoid linkr_uart_rmt_span_init(", ["span_measure"])
-        (directory / "span_functions.inc").write_text(span)
+        (directory / "span_functions.inc").write_text(span, encoding="utf-8")
         cls.binary = directory / "autobaud-tests"
         subprocess.run([
             *shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall",

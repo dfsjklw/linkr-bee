@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class HciOrderTests(unittest.TestCase):
     def test_order_failure_disconnect_and_overflow(self):
-        source = re.sub(r'^#include[^\n]*\n', '', (ROOT / 'src/ble_hci_order.c').read_text(), flags=re.M)
+        source = re.sub(r'^#include[^\n]*\n', '', (ROOT / 'src/ble_hci_order.c').read_text(encoding="utf-8"), flags=re.M)
         with tempfile.TemporaryDirectory() as tmp:
             unit = Path(tmp) / 'test.c'
             unit.write_text('''
@@ -72,7 +72,7 @@ int main(void) {
  for(int i=0;i<5;i++) assert(acl[i].freed);
  return 0;
 }
-''')
+''', encoding="utf-8")
             binary = Path(tmp) / 'test'
             subprocess.run([*shlex.split(os.environ.get('CC','cc')), '-std=c11', '-Wall', '-Wextra', '-Werror', str(unit), '-o', str(binary)], check=True)
             subprocess.run([binary], check=True)

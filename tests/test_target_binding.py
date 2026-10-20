@@ -8,7 +8,7 @@ import unittest
 class TargetBindingTests(unittest.TestCase):
     def test_persistence_validation_and_failed_write(self):
         root = Path(__file__).resolve().parents[1]
-        production = re.sub(r'^#include[^\n]*\n', '', (root / 'src/target_binding.c').read_text(), flags=re.M)
+        production = re.sub(r'^#include[^\n]*\n', '', (root / 'src/target_binding.c').read_text(encoding="utf-8"), flags=re.M)
         source = r'''
 #include <assert.h>
 #include <errno.h>
@@ -46,6 +46,6 @@ int main(void) {
 '''
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / 'test.c').write_text(source)
+            (path / 'test.c').write_text(source, encoding='utf-8')
             subprocess.run(['cc','-std=c11',str(path/'test.c'),'-o',str(path/'test')],check=True)
             subprocess.run([str(path/'test')],check=True)
