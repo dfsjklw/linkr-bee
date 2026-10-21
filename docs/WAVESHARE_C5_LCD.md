@@ -174,6 +174,41 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 10. 终端：向桥接串口发送文本（115200），面板下半部分应在 100 ms 内出现同样内容；
     921600 下界面不应卡顿（环形缓冲满时丢弃最新字节）。
 
+## 8. 实测启动日志（首板验证通过）
+
+`west flash -d build/c5-waveshare --esp-device COM5` 之后抓取的串口输出（节选，
+已确认无 `<err>` / `<wrn>` 行）：
+
+```
+I (spi_flash): flash io: dio
+W (spi_flash): Detected size(32768k) larger than the size in the binary image header(8192k)
+I (esp_psram): Found 8MB PSRAM device
+I (esp_psram): Speed: 80MHz
+<inf> board_io: CH32V003 expander ready at 0x24
+<inf> cst3530: CST3530 ready at 0x58 (irq gpio@60091000 pin 5)
+*** Booting Zephyr OS build v4.4.1 ***
+<inf> linkr_display: panel up: 240x320 ST7789
+<inf> linkr_ui: status screen ready
+<inf> fs_nvs: 8 Sectors of 4096 bytes
+<inf> bt_hci_core: HCI: version 6.0 (0x0e) ...
+<inf> linkr_wifi: WiFi idle (no saved SSID); ...
+<inf> linkr_ble_bridge: BLE advertising as "Linkr BLE UART-3"
+```
+
+结论与已知项：
+
+| 项 | 结果 |
+|---|---|
+| 8 MB PSRAM | ✅ 识别为 8 MB，80 MHz |
+| CH32V003 expander | ✅ 0x24 应答，面板复位/背光通路可用 |
+| ST7789 面板 | ✅ 240×320 初始化完成 |
+| LVGL 屏幕 | ✅ 构建成功（PSRAM 缓冲无异常） |
+| CST3530 触摸 | ✅ 0x58 初始化完成 |
+| QMI8658A | ✅ 修正为板上实际地址 **0x6b** 后正常（0x6a 报 `-14`） |
+| SHTC3 / PCF85063A | ✅ 驱动实例化，无总线错误 |
+| 实际 flash | ⚠️ ROM 报告 **32 MB**，二进制头仍声明 8 MB（32 MB 分区待做） |
+| ROM SHA-256 校验 | ⚠️ Zephyr 镜像未附加摘要，ROM 打印 `Attempting to boot anyway` 后正常启动 |
+
 ## 8. 已知风险
 
 | 风险 | 说明 |

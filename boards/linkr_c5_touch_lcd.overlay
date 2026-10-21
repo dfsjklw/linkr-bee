@@ -153,12 +153,13 @@
 		status = "okay";
 	};
 
-	/* QST QMI8658A 6-axis IMU. The board wires its INT1 line to GPIO4,
-	 * while the binding defaults to INT2 (int-pin = 2).
+	/* QST QMI8658A 6-axis IMU. The board straps the address select high
+	 * (vendor BSP uses QMI8658_ADDRESS_HIGH = 0x6b) and wires INT1 to
+	 * GPIO4, while the binding defaults to INT2 (int-pin = 2).
 	 */
-	imu: imu@6a {
+	imu: imu@6b {
 		compatible = "qst,qmi8658a";
-		reg = <0x6a>;
+		reg = <0x6b>;
 		int-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 		int-pin = <1>;
 		status = "okay";
