@@ -2,9 +2,10 @@
  * On-panel terminal view for the Waveshare ESP32-C5-Touch-LCD-2.8.
  *
  * The bridge UART feeds a small lock-protected ring from its interrupt
- * handler; a delayed work item drains the ring every 100 ms, reflows the text
- * into fixed-width lines and updates a single LVGL label. Batching keeps the
- * panel off the UART hot path, which matters at 921600 baud.
+ * handler; a delayed work item drains the ring every 100 ms and hands the text
+ * to a wrapping LVGL label. Line breaking is left to LVGL, which measures real
+ * glyph widths: the UI font is proportional, so padding to a fixed column
+ * count produced ragged and clipped lines instead of clean wraps.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -22,12 +23,11 @@ LOG_MODULE_REGISTER(linkr_terminal, CONFIG_LOG_DEFAULT_LEVEL);
 
 #if defined(CONFIG_LINKR_LCD) && defined(CONFIG_LVGL)
 
-/* Keep in sync with the label width in linkr_ui.c (226 px at 14 px font). */
-#define TERM_COLS 28U
-#define TERM_ROWS 12U
-
 #define FEED_RING_SIZE  256U
 #define FLUSH_PERIOD_MS 100U
+
+/* Roughly 12 lines of 40 characters at the 10 px UI font. */
+#define TERM_TEXT_MAX 512U
 
 static uint8_t feed_ring[FEED_RING_SIZE];
 static size_t feed_head;
@@ -37,7 +37,7 @@ static atomic_t flush_pending;
 
 static struct k_work_delayable flush_work;
 
-static char term_text[(TERM_COLS * TERM_ROWS) + 1U];
+static char term_text[TERM_TEXT_MAX + 1U];
 static size_t term_len;
 
 static size_t ring_pop(uint8_t *out, size_t max)
@@ -54,15 +54,20 @@ static size_t ring_pop(uint8_t *out, size_t max)
 	return count;
 }
 
-static void term_push(char c)
+/* Drop the oldest complete line so the newest output stays visible. */
+static void term_drop_oldest_line(void)
 {
-	if (term_len >= (sizeof(term_text) - 1U)) {
-		/* Drop the oldest line so the newest data always stays visible. */
-		memmove(term_text, term_text + TERM_COLS, term_len - TERM_COLS);
-		term_len -= TERM_COLS;
+	char *nl = strchr(term_text, '\n');
+
+	if (nl != NULL) {
+		size_t drop = (size_t)(nl - term_text) + 1U;
+
+		memmove(term_text, term_text + drop, term_len - drop);
+		term_len -= drop;
+	} else {
+		term_len = 0U;
 	}
 
-	term_text[term_len++] = c;
 	term_text[term_len] = '\0';
 }
 
@@ -72,20 +77,17 @@ static void term_put(char c)
 		return;
 	}
 
+	if (term_len >= TERM_TEXT_MAX) {
+		term_drop_oldest_line();
+	}
+
 	if (c == '\n') {
-		size_t pad = TERM_COLS - (term_len % TERM_COLS);
-
-		while (pad-- > 0U) {
-			term_push(' ');
-		}
-		return;
+		term_text[term_len++] = '\n';
+	} else {
+		term_text[term_len++] = ((c < 0x20) || (c > 0x7E)) ? '.' : c;
 	}
 
-	if ((c < 0x20) || (c > 0x7E)) {
-		c = '.';
-	}
-
-	term_push(c);
+	term_text[term_len] = '\0';
 }
 
 static void flush_handler(struct k_work *work)
@@ -137,7 +139,16 @@ void linkr_terminal_feed(const uint8_t *data, size_t len)
 
 static int linkr_terminal_init(void)
 {
+	static const char banner[] = "Linkr panel ready\n"
+				     "240x320 ST7789 / LVGL\n"
+				     "terminal: uart1\n";
+
 	k_work_init_delayable(&flush_work, flush_handler);
+
+	/* Seed the view so font rendering and line wrapping can be checked
+	 * without an external UART peer; real bridge traffic scrolls it out.
+	 */
+	linkr_terminal_feed((const uint8_t *)banner, sizeof(banner) - 1U);
 	return 0;
 }
 

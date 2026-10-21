@@ -33,8 +33,14 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
 #define UI_DIM_COLOR   0x565F89U
 #define UI_TERM_COLOR  0xC0CAF5U
 
-/* Keep in sync with TERM_COLS in linkr_terminal.c. */
-#define UI_TERM_WIDTH 226
+/* 10 px is the size the vendor UI uses on this 240x320 panel: it renders at a
+ * 1:1 pixel mapping and fits ~40 columns, so glyph edges stay sharp. The
+ * larger proportional faces looked soft and clipped at this resolution.
+ */
+#define UI_FONT (&lv_font_montserrat_10)
+
+/* Panel is 240 px wide; leave 6 px margins on both sides. */
+#define UI_TERM_WIDTH 228
 
 static lv_obj_t *status_label;
 static lv_obj_t *detail_label;
@@ -47,6 +53,7 @@ static lv_obj_t *ui_add_label(lv_obj_t *parent, const char *text, uint32_t color
 
 	lv_label_set_text(label, text);
 	lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+	lv_obj_set_style_text_font(label, UI_FONT, 0);
 	lv_obj_align(label, align, 0, y);
 	return label;
 }
@@ -59,18 +66,19 @@ static void ui_build(void)
 	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
 	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 6);
-	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 28);
-	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 46);
+	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 24);
+	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 38);
 
-	/* linkr_terminal.c produces fixed-width lines, so clipping (not
-	 * wrapping) keeps the terminal layout stable.
+	/* The terminal label wraps by itself (LVGL measures real glyph widths),
+	 * so linkr_terminal.c only has to keep the newest lines of text.
 	 */
 	term_label = lv_label_create(scr);
 	lv_label_set_text(term_label, "");
 	lv_obj_set_style_text_color(term_label, lv_color_hex(UI_TERM_COLOR), 0);
-	lv_label_set_long_mode(term_label, LV_LABEL_LONG_CLIP);
-	lv_obj_set_width(term_label, UI_TERM_WIDTH);
-	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 8, 72);
+	lv_obj_set_style_text_font(term_label, UI_FONT, 0);
+	lv_label_set_long_mode(term_label, LV_LABEL_LONG_WRAP);
+	lv_obj_set_size(term_label, UI_TERM_WIDTH, 252);
+	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 56);
 }
 
 void linkr_ui_set_status(const char *line)
