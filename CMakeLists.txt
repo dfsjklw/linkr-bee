@@ -34,6 +34,7 @@ if(CONFIG_LINKR_LCD)
     src/board_io.c
     src/input_cst3530.c
     src/linkr_display.c
+    src/linkr_status.c
     src/linkr_ui.c
   )
 

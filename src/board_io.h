@@ -51,13 +51,6 @@ uint8_t board_backlight_get(void);
 /** @brief Enable or disable the speaker amplifier (CH32V003 EXIO3). */
 int board_pa_enable(bool enable);
 
-/**
- * @brief Read the raw battery voltage ADC value.
- *
- * @param raw Filled with 0..1023 as reported by the expander.
- */
-int board_battery_raw(uint16_t *raw);
-
 /** @brief True once the expander answered and all lines were programmed. */
 bool board_io_ready(void);
 

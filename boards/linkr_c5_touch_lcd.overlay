@@ -136,4 +136,31 @@
 		y-max = <320>;
 		status = "okay";
 	};
+
+	/* Sensirion SHTC3 temperature/humidity sensor. */
+	shtc3: humidity@70 {
+		compatible = "sensirion,shtc3", "sensirion,shtcx";
+		reg = <0x70>;
+		/* Required by the binding; SHTC3 supports both modes. */
+		measure-mode = "normal";
+		status = "okay";
+	};
+
+	/* NXP PCF85063A real-time clock. */
+	rtc: rtc@51 {
+		compatible = "nxp,pcf85063a";
+		reg = <0x51>;
+		status = "okay";
+	};
+
+	/* QST QMI8658A 6-axis IMU. The board wires its INT1 line to GPIO4,
+	 * while the binding defaults to INT2 (int-pin = 2).
+	 */
+	imu: imu@6a {
+		compatible = "qst,qmi8658a";
+		reg = <0x6a>;
+		int-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+		int-pin = <1>;
+		status = "okay";
+	};
 };

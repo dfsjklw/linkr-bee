@@ -189,28 +189,6 @@ int board_pa_enable(bool enable)
 	return output_update(CH32_PIN_PA_CTRL, enable);
 }
 
-int board_battery_raw(uint16_t *raw)
-{
-	uint8_t buf[2];
-	int err;
-
-	if (!io_ready) {
-		return -ENODEV;
-	}
-	if (raw == NULL) {
-		return -EINVAL;
-	}
-
-	/* The expander returns the 10-bit ADC value as 16-bit little endian. */
-	err = i2c_burst_read(expander_bus, CONFIG_LINKR_LCD_IO_EXPANDER_ADDR, CH32_REG_ADC, buf,
-			     sizeof(buf));
-	if (err != 0) {
-		return err;
-	}
-
-	*raw = (uint16_t)(((uint16_t)buf[1] << 8) | buf[0]);
-	return 0;
-}
 
 /*
  * Runs after the I2C driver (priority 50) and before the display driver

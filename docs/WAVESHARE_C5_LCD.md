@@ -50,7 +50,7 @@ west flash -d build/c5-waveshare
 | 触摸 SDA / SCL / INT | GPIO0 / GPIO1 / GPIO5 | `i2c0`（overlay 改 pinctrl）+ 后续 `input` 驱动 |
 | 触摸 RST | CH32 EXIO0 | `board_touch_reset()` |
 | 功放使能 | CH32 EXIO3 | `board_pa_enable()` |
-| 电池电压 | CH32 ADC (0x06, 16-bit LE) | `board_battery_raw()` |
+| 电池电压 | CH32 ADC (0x06, 16-bit LE) | 未使用（本期不做电量监测） |
 | UART 桥接 | GPIO11 / GPIO12 | `uart1`（沿用现有 overlay） |
 | USB console | GPIO13 / GPIO14 | `usb_serial`（沿用） |
 
@@ -74,11 +74,11 @@ drom0_0_seg    891716 B / 8 MB
 ext_dram_seg     4992 KB / 8 MB       60.94%   ← PSRAM 已生效（heap 4 MB + 占位）
 ```
 
-接入 LVGL 之后（M3）：
+接入 LVGL、触摸与传感器之后（M3+M4+M6）：
 
 ```
-FLASH         1372996 B / 8388352 B   16.37%
-sram0_0_seg    382240 B / 391168 B    97.72%   ← 余量约 8.9 KB
+FLASH         1374804 B / 8388352 B   16.39%
+sram0_0_seg    384048 B / 391168 B    98.18%   ← 余量约 7.1 KB
 ext_dram_seg     5248 KB / 8 MB       64.06%
 ```
 
@@ -134,15 +134,18 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 - [x] CH32V003 板级服务、ST7789 DTS、清屏与背光代码（待硬件验证）
 - [x] **LVGL 接入**：渲染缓冲与对象堆位于 PSRAM 固定窗口，workqueue 自动驱动
       `lv_timer_handler()`，状态界面（`src/linkr_ui.c`）已可构建
+- [x] **CST3530 触摸** `input` 驱动（`src/input_cst3530.c`），含 4 字节寄存器协议
+      与 END_READ 握手
+- [x] **原生外设**：SHTC3 / PCF85063A / QMI8658A 通过 Zephyr 自带驱动接入，并由
+      `src/linkr_status.c` 周期（2 s）刷新到面板
 
-未完成（按顺序）：
+未完成 / 不在本期范围：
 
 - [ ] **硬件点亮验证**（见第 7 节）
 - [ ] 32 MB Flash 分区表：需自定义 board 定义（现有 devkit dts 硬编码 8 MB 分区 dtsi）
-- [ ] CST3530 `input` 驱动
 - [ ] 终端 UI（移植参考工程 `lcd_terminal.c` 的 span/合批策略）
-- [ ] 原生外设：SHTC3 / PCF85063A / QMI8658A（Zephyr 已有驱动，DTS 即可）
-- [ ] 电池电量与 SD 卡
+
+> 电池电量与 SD 卡按需求**排除在本期范围之外**。
 
 ## 7. 硬件验收清单（首次上板）
 
@@ -160,6 +163,9 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 6. 若出现 PSRAM 相关 HardFault 或花屏：用 `nm` 确认 `__lvgl_psram_start`
    与 `_ext_ram_heap_end` 未重叠（见 4.1）。
 7. 确认 BLE/WiFi 功能未回归：开启 PSRAM 后必须重跑既有 BLE 回归与 24 h 压测。
+8. 触摸：点按面板时 `cst3530` 不应打印 `data read failed`；坐标换算留给后续 UI 使用。
+9. 传感器：串口不应出现 `linkr_status` 的 I2C 错误，面板第二行应显示
+   `x.. y.. mg`（IMU）与首行的温湿度/时间。
 
 ## 8. 已知风险
 
