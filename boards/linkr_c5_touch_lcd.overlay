@@ -17,6 +17,11 @@
 / {
 	chosen {
 		zephyr,display = &st7789v;
+		/* Lets the Zephyr LVGL module build its pointer indev from the
+		 * touch controller (CONFIG_LV_Z_POINTER_FROM_CHOSEN_TOUCH), which
+		 * is what makes drag/scroll gestures work on the panel.
+		 */
+		zephyr,touch = &touch;
 	};
 
 	/*

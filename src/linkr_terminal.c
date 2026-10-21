@@ -21,6 +21,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include "linkr_terminal.h"
@@ -31,12 +32,13 @@ LOG_MODULE_REGISTER(linkr_terminal, CONFIG_LOG_DEFAULT_LEVEL);
 
 #if defined(CONFIG_LINKR_LCD) && defined(CONFIG_LVGL)
 
-#define FEED_RING_SIZE  256U
+#define FEED_RING_SIZE  512U
 #define FLUSH_PERIOD_MS 100U
 
 /* 8 px Consolas advances ~5 px, so 228 px fits about 44 columns. */
 #define TERM_COLS LINKR_TERM_COLS
-#define TERM_ROWS LINKR_TERM_ROWS
+/* Buffer the full scrollback; the UI renders LINKR_TERM_ROWS of it. */
+#define TERM_ROWS LINKR_TERM_HISTORY
 
 #define ANSI_DEFAULT_COLOR 7U
 
@@ -55,7 +57,11 @@ static atomic_t flush_pending;
 
 static struct k_work_delayable flush_work;
 
-static char rows[TERM_ROWS][TERM_COLS + 1U];
+/* Scrollback lives in PSRAM: 48 lines do not fit in internal SRAM next to the
+ * BLE/WiFi stacks. boards/linkr_c5_lvgl_psram.ld places .linkr_psram in the
+ * same window as the LVGL buffers.
+ */
+static char rows[TERM_ROWS][TERM_COLS + 1U] __attribute__((section(".linkr_psram")));
 static uint8_t row_color[TERM_ROWS];
 static bool row_dirty[TERM_ROWS];
 
@@ -294,6 +300,10 @@ static void flush_handler(struct k_work *work)
 	uint8_t chunk[32];
 	size_t count;
 	bool any = false;
+	/* Decide before parsing: if the user scrolled up to read history, new
+	 * output must not yank the view back to the bottom.
+	 */
+	bool follow = linkr_ui_terminal_at_bottom();
 
 	ARG_UNUSED(work);
 
@@ -310,6 +320,10 @@ static void flush_handler(struct k_work *work)
 				linkr_ui_terminal_set_line(row, rows[row], row_color[row]);
 				row_dirty[row] = false;
 			}
+		}
+
+		if (follow) {
+			linkr_ui_terminal_scroll_to_bottom();
 		}
 	}
 
@@ -343,18 +357,35 @@ void linkr_terminal_feed(const uint8_t *data, size_t len)
 
 static int linkr_terminal_init(void)
 {
-	static const char banner[] = "Linkr panel ready\n"
-				     "240x320 ST7789 / LVGL\n"
-				     "terminal: uart1\n";
+	static const char banner[] =
+		"Linkr panel ready\n"
+		"240x320 ST7789 / LVGL\n"
+		"terminal: uart1\n"
+		"-- ANSI colour test --\n"
+		"\x1b[01;34mdir-in-blue\x1b[0m\n"
+		"\x1b[01;31mfile-in-red\x1b[0m\n"
+		"\x1b[01;32mexec-in-green\x1b[0m\n"
+		"-- numbered lines follow --\n";
 
 	k_work_init_delayable(&flush_work, flush_handler);
 
 	view_clear();
 
-	/* Seed the view so font rendering and line wrapping can be checked
-	 * without an external UART peer; real bridge traffic scrolls it out.
+	/* Seed more lines than the viewport shows so multi-line rendering and
+	 * the scroll gesture can be exercised without an external UART peer;
+	 * real bridge traffic scrolls this out.
 	 */
 	linkr_terminal_feed((const uint8_t *)banner, sizeof(banner) - 1U);
+
+	for (unsigned int i = 9U; i <= 35U; i++) {
+		char line[16];
+		int len = snprintf(line, sizeof(line), "line %02u\n", i);
+
+		if (len > 0) {
+			linkr_terminal_feed((const uint8_t *)line, (size_t)len);
+		}
+	}
+
 	return 0;
 }
 

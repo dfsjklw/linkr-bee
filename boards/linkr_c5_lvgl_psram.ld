@@ -36,6 +36,12 @@
 	KEEP(*(.lvgl_heap))
 	KEEP(*(.lvgl_heap.*))
 
+	/* Linkr's own PSRAM scratch (terminal scrollback). Internal SRAM cannot
+	 * hold it next to the BLE/WiFi stacks.
+	 */
+	KEEP(*(.linkr_psram))
+	KEEP(*(.linkr_psram.*))
+
 	. = ALIGN(16);
 	__lvgl_psram_end = .;
 }
