@@ -105,6 +105,6 @@ static int linkr_display_init(void)
 	return 0;
 }
 
-SYS_INIT(linkr_display_init, APPLICATION, 90);
+SYS_INIT(linkr_display_init, APPLICATION, 89);
 
 #endif /* CONFIG_LINKR_LCD */

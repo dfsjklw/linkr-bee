@@ -77,6 +77,19 @@
 };
 
 /*
+ * LVGL rendering buffers and its object heap are relocated into PSRAM by a
+ * dedicated linker fragment (boards/linkr_c5_lvgl_psram.ld), not by a
+ * devicetree memory-region: the ESP32-C5 linker script never calls
+ * LINKER_DT_REGIONS(), so 'zephyr,memory-region' nodes generate no MEMORY
+ * area and the sections would become orphans.
+ *
+ * The fragment pins .lvgl_buf/.lvgl_heap above the shared multi heap, which
+ * starts at the mapped-PSRAM base (0x420E0000) and spans
+ * CONFIG_ESP_SPIRAM_HEAP_SIZE. The linker's own .ext_ram.bss section lives at
+ * that same base address, so reusing it for LVGL would overlap the heap.
+ */
+
+/*
  * Board I2C bus: SDA=GPIO0, SCL=GPIO1.
  * The devkit pinmux defaults to GPIO6/GPIO7, which the LCD uses for SPI, so
  * the bus must be moved before any device (touch, sensors, expander) is added.

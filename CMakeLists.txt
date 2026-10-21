@@ -33,7 +33,13 @@ if(CONFIG_LINKR_LCD)
   target_sources(app PRIVATE
     src/board_io.c
     src/linkr_display.c
+    src/linkr_ui.c
   )
+
+  # LVGL rendering buffers and object heap are relocated into the PSRAM window
+  # above the shared multi heap (the C5 linker cannot express this through a
+  # devicetree memory-region).
+  zephyr_linker_sources(SECTIONS boards/linkr_c5_lvgl_psram.ld)
 endif()
 
 # HTTP service resources live in named iterable sections (WebSocket bridge).
