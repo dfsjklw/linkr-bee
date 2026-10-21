@@ -39,6 +39,10 @@ west flash -d build/c5-waveshare
 
 不传这两个参数时，固件与 `main` 分支行为完全一致（面板代码不参与编译）。
 
+CI 中的 `ESP32-C5 Waveshare Touch LCD 2.8` 矩阵项自动带上这两个参数，并在
+`Verify default feature set` 里断言 `CONFIG_ESP_SPIRAM`、`CONFIG_LVGL`、
+`CONFIG_ST7789V`、`CONFIG_MIPI_DBI`、`CONFIG_INPUT` 与 8 MB flash 声明仍然生效。
+
 ## 3. 引脚与设备映射
 
 | 功能 | 引脚 | 实现 |

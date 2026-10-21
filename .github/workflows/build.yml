@@ -190,6 +190,15 @@ jobs:
             toolchain: riscv64-zephyr-elf
             flash_address: "0x2000"
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
+          - name: ESP32-C5 Waveshare Touch LCD 2.8
+            board: esp32c5_devkitc/esp32c5/hpcore
+            slug: esp32c5-waveshare-lcd
+            chip: esp32c5
+            toolchain: riscv64-zephyr-elf
+            flash_address: "0x2000"
+            factory_reset: GPIO28 BOOT to GND for two seconds during boot
+            extra_conf: boards/linkr_c5_touch_lcd.conf
+            extra_overlay: boards/linkr_c5_touch_lcd.overlay
           - name: ESP32-WROOM-32 DevKitC
             board: esp32_devkitc/esp32/procpu
             slug: esp32-wroom-32
@@ -244,8 +253,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          west build -p always -b "${{ matrix.board }}" \
-            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
+          build_args=()
+          if [ -n "${{ matrix.extra_conf }}" ]; then
+            build_args+=("-DEXTRA_CONF_FILE=${GITHUB_WORKSPACE}/app/${{ matrix.extra_conf }}")
+            build_args+=("-DEXTRA_DTC_OVERLAY_FILE=${GITHUB_WORKSPACE}/app/${{ matrix.extra_overlay }}")
+          fi
+          if [ ${#build_args[@]} -gt 0 ]; then
+            west build -p always -b "${{ matrix.board }}" \
+              -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app" -- "${build_args[@]}"
+          else
+            west build -p always -b "${{ matrix.board }}" \
+              -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
+          fi
 
       - name: Verify default feature set
         shell: bash
@@ -296,6 +315,19 @@ jobs:
           fi
           if grep -qx 'CONFIG_SOC_SERIES_ESP32=y' "${config}"; then
             grep -qx 'CONFIG_ESP32_BT_CTLR_LE_SECURITY_ENABLE=y' "${config}"
+          fi
+          # Panel builds must keep PSRAM, LVGL and the touch stack enabled:
+          # losing any of them silently turns the Waveshare image back into a
+          # headless build.
+          if grep -qx 'CONFIG_LINKR_LCD=y' "${config}"; then
+            grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
+            grep -qx 'CONFIG_ESP_SPIRAM_HEAP_SIZE=4194304' "${config}"
+            grep -qx 'CONFIG_LVGL=y' "${config}"
+            grep -qx 'CONFIG_ST7789V=y' "${config}"
+            grep -qx 'CONFIG_MIPI_DBI=y' "${config}"
+            grep -qx 'CONFIG_INPUT=y' "${config}"
+            grep -qx 'CONFIG_LINKR_LCD_IO_EXPANDER_ADDR=0x24' "${config}"
+            grep -qx 'CONFIG_ESPTOOLPY_FLASHSIZE="8MB"' "${config}"
           fi
 
       - name: Package firmware
