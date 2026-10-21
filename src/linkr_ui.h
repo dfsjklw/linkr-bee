@@ -7,6 +7,14 @@
 #ifndef LINKR_UI_H_
 #define LINKR_UI_H_
 
+#include <stdint.h>
+
+/* Terminal geometry shared with linkr_terminal.c: 27 lines of 44 columns fit
+ * the area below the header at the 8 px font (10 px line pitch).
+ */
+#define LINKR_TERM_ROWS 27
+#define LINKR_TERM_COLS 44
+
 /**
  * @brief Replace the primary status line on the panel.
  *
@@ -21,11 +29,12 @@ void linkr_ui_set_status(const char *line);
 void linkr_ui_set_detail(const char *line);
 
 /**
- * @brief Replace the terminal area text (fed by linkr_terminal.c).
+ * @brief Replace one terminal line.
  *
- * The caller owns the buffer and must pass fixed-width lines that fit the
- * 28-column terminal area.
+ * @param row   Line index, 0 .. LINKR_TERM_ROWS-1.
+ * @param text  NUL-terminated text, at most LINKR_TERM_COLS characters.
+ * @param color ANSI palette index (0-15); the palette lives in linkr_ui.c.
  */
-void linkr_ui_terminal_set(const char *text);
+void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color);
 
 #endif /* LINKR_UI_H_ */

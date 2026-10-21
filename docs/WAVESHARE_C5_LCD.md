@@ -177,16 +177,22 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 
 ### UI 字体与排版
 
-- 字体为 **Consolas 14**（4 bpp 抗锯齿等宽，ASCII 0x20–0x7F），用 `lv_font_conv`
-  生成并随源码提交（`src/fonts/lv_font_consola_14.c`），生成命令见
-  `src/linkr_ui.c` 中 `UI_FONT` 的注释。228 px 宽下约 28 列、字宽一致，终端对齐稳定。
-- 终端区 `LV_LABEL_LONG_WRAP` 由 LVGL 按真实字宽折行；`linkr_terminal.c` 只负责
-  保留 `\n`，并在 512 字节窗口满时丢弃最旧的整行。
+- 标题/状态/详情用 **Consolas 14**（4 bpp 抗锯齿等宽），终端区用 **Consolas 8**
+  （2 bpp，行距 10 px）。两个字面都由 `lv_font_conv` 生成并随源码提交
+  （`src/fonts/lv_font_consola_1{4,8}.c`），生成命令见 `src/linkr_ui.c` 注释。
+- 终端区为 **27 行 × 44 列**，每个字符约占原来的 1/3 面积，密度接近参考终端的观感。
+- 终端由 `linkr_terminal.c` 的 **VT100 解析器**驱动：
+  - `ESC[…m` → 16 色调色板索引（`bold` 把 30–37 提升到亮色，所以 `ESC[01;34m`
+    渲染为亮蓝，与 `ls --color` 预期一致）；
+  - `ESC[2J` 清屏、`ESC[H` 归位、OSC 标题被跳过、其余 CSI（如 `ESC[?2004h`
+    bracketed paste）直接丢弃，因此屏幕上不会再出现 `.[01;34` 之类的原文；
+  - `\r`/`\n`/`\b`/`\t` 本地处理，满屏向上滚动一行；
+  - 每行一个 LVGL label（只刷新变化的行），因此可以逐行着色。
 - 面板 SPI 时钟 **20 MHz**（`mipi-max-frequency`）。40 MHz 下观察到重影/彩边，降到
-  20 MHz 后消失；若后续需要更高帧率，可再试 40 MHz 并复核。
-- 历史实现用"按字符数补空格 + `LV_LABEL_LONG_CLIP`"：比例字体下行宽漂移、超出
-  226 px 的字符被裁掉，这是"字体发虚 / 不换行"的根因。位图字体（`unscii_16`）
-  也验证过，可见 1 bpp 渲染无彩边，最终选定抗锯齿等宽方案。
+  20 MHz 后消失。
+- 颜色链路：`CONFIG_LV_COLOR_16_SWAP=y` 让 LVGL 输出大端 RGB565（ST7789 期望大端，
+  而 `CONFIG_ST7789V_RGB565` 走 `PIXEL_FORMAT_RGB_565` 不做字节交换）。缺少这一项时
+  背景 `#1082` 会显示成 `#8210`（洋红），字形边缘出现红/青镶边。
 
 ## 8. 实测启动日志（首板验证通过）
 

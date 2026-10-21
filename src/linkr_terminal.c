@@ -1,11 +1,19 @@
 /*
  * On-panel terminal view for the Waveshare ESP32-C5-Touch-LCD-2.8.
  *
- * The bridge UART feeds a small lock-protected ring from its interrupt
- * handler; a delayed work item drains the ring every 100 ms and hands the text
- * to a wrapping LVGL label. Line breaking is left to LVGL, which measures real
- * glyph widths: the UI font is proportional, so padding to a fixed column
- * count produced ragged and clipped lines instead of clean wraps.
+ * The bridge UART feeds a lock-protected ring from its interrupt handler. A
+ * 100 ms work item drains it through a small VT100 state machine:
+ *
+ *   - ESC [ ... m  SGR sequences are translated into a 16-colour palette
+ *     index (bold promotes 30-37 to the bright variants, so `ESC[01;34m`
+ *     renders as bright blue like the emitting shell intended);
+ *   - ESC [ 2 J / H / other CSI finals clear the view or move the cursor and
+ *     are otherwise consumed, so raw control bytes never reach the glass;
+ *   - ESC ] ... (OSC, e.g. window titles) is skipped up to BEL or ST;
+ *   - \r, \n, \b and \t are handled locally.
+ *
+ * Each rendered line carries one colour, matching how `ls --color` emits one
+ * coloured entry per line. Only dirty lines are pushed to the UI.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -26,8 +34,18 @@ LOG_MODULE_REGISTER(linkr_terminal, CONFIG_LOG_DEFAULT_LEVEL);
 #define FEED_RING_SIZE  256U
 #define FLUSH_PERIOD_MS 100U
 
-/* Roughly 12 lines of 40 characters at the 10 px UI font. */
-#define TERM_TEXT_MAX 512U
+/* 8 px Consolas advances ~5 px, so 228 px fits about 44 columns. */
+#define TERM_COLS LINKR_TERM_COLS
+#define TERM_ROWS LINKR_TERM_ROWS
+
+#define ANSI_DEFAULT_COLOR 7U
+
+enum parse_state {
+	PARSE_TEXT,
+	PARSE_ESC,
+	PARSE_CSI,
+	PARSE_OSC,
+};
 
 static uint8_t feed_ring[FEED_RING_SIZE];
 static size_t feed_head;
@@ -37,8 +55,18 @@ static atomic_t flush_pending;
 
 static struct k_work_delayable flush_work;
 
-static char term_text[TERM_TEXT_MAX + 1U];
-static size_t term_len;
+static char rows[TERM_ROWS][TERM_COLS + 1U];
+static uint8_t row_color[TERM_ROWS];
+static bool row_dirty[TERM_ROWS];
+
+static uint8_t cursor_row;
+static uint8_t cursor_col;
+static uint8_t current_color = ANSI_DEFAULT_COLOR;
+static bool bold;
+
+static enum parse_state state = PARSE_TEXT;
+static char csi[24];
+static size_t csi_len;
 
 static size_t ring_pop(uint8_t *out, size_t max)
 {
@@ -54,47 +82,218 @@ static size_t ring_pop(uint8_t *out, size_t max)
 	return count;
 }
 
-/* Drop the oldest complete line so the newest output stays visible. */
-static void term_drop_oldest_line(void)
+static void row_clear(uint8_t row)
 {
-	char *nl = strchr(term_text, '\n');
+	memset(rows[row], ' ', TERM_COLS);
+	rows[row][TERM_COLS] = '\0';
+	row_color[row] = current_color;
+}
 
-	if (nl != NULL) {
-		size_t drop = (size_t)(nl - term_text) + 1U;
+static void view_clear(void)
+{
+	current_color = ANSI_DEFAULT_COLOR;
+	bold = false;
 
-		memmove(term_text, term_text + drop, term_len - drop);
-		term_len -= drop;
-	} else {
-		term_len = 0U;
+	for (uint8_t i = 0U; i < TERM_ROWS; i++) {
+		row_clear(i);
+		row_dirty[i] = true;
 	}
 
-	term_text[term_len] = '\0';
+	cursor_row = 0U;
+	cursor_col = 0U;
+}
+
+static void scroll_one(void)
+{
+	memmove(rows[0], rows[1], (size_t)(TERM_ROWS - 1U) * sizeof(rows[0]));
+	memmove(&row_color[0], &row_color[1], (size_t)(TERM_ROWS - 1U) * sizeof(row_color[0]));
+	row_clear((uint8_t)(TERM_ROWS - 1U));
+	memmove(&row_dirty[0], &row_dirty[1], (size_t)(TERM_ROWS - 1U) * sizeof(row_dirty[0]));
+	row_dirty[TERM_ROWS - 1U] = true;
+	cursor_row = (uint8_t)(TERM_ROWS - 1U);
+}
+
+static void newline(void)
+{
+	cursor_col = 0U;
+
+	if ((uint8_t)(cursor_row + 1U) >= TERM_ROWS) {
+		scroll_one();
+	} else {
+		cursor_row++;
+		row_clear(cursor_row);
+		row_dirty[cursor_row] = true;
+	}
+}
+
+static void put_char(char c)
+{
+	if (cursor_col >= TERM_COLS) {
+		newline();
+	}
+
+	rows[cursor_row][cursor_col++] = c;
+	row_color[cursor_row] = current_color;
+	row_dirty[cursor_row] = true;
+}
+
+static unsigned parse_uint(const char **p)
+{
+	unsigned value = 0U;
+	bool any = false;
+
+	while (**p >= '0' && **p <= '9') {
+		value = value * 10U + (unsigned)(**p - '0');
+		(*p)++;
+		any = true;
+	}
+
+	return any ? value : 0U;
+}
+
+/* Handle "ESC [ <csi> <final>". */
+static void handle_csi(const char *params, char final)
+{
+	switch (final) {
+	case 'm': {
+		const char *p = params;
+
+		if (*p == '\0') {
+			/* ESC[m == reset */
+			current_color = ANSI_DEFAULT_COLOR;
+			bold = false;
+			return;
+		}
+
+		while (*p != '\0') {
+			unsigned code = parse_uint(&p);
+
+			if (code == 0U) {
+				current_color = ANSI_DEFAULT_COLOR;
+				bold = false;
+			} else if (code == 1U) {
+				bold = true;
+			} else if (code == 22U) {
+				bold = false;
+			} else if (code >= 30U && code <= 37U) {
+				current_color = (uint8_t)(code - 30U + (bold ? 8U : 0U));
+			} else if (code == 39U) {
+				current_color = ANSI_DEFAULT_COLOR;
+			} else if (code >= 90U && code <= 97U) {
+				current_color = (uint8_t)(code - 90U + 8U);
+			}
+			/* Background colours and other attributes are ignored: the
+			 * panel renders text on a fixed dark background.
+			 */
+
+			if (*p == ';') {
+				p++;
+			} else if (*p != '\0') {
+				break;
+			}
+		}
+		break;
+	}
+	case 'J':
+		/* ESC[2J / ESC[J: clear the view. */
+		view_clear();
+		break;
+	case 'H':
+	case 'f':
+		/* Cursor home; row/column addressing is not tracked. */
+		cursor_row = 0U;
+		cursor_col = 0U;
+		break;
+	default:
+		/* Cursor movement, bracketed-paste toggles (ESC[?2004h) and
+		 * everything else is consumed and ignored.
+		 */
+		break;
+	}
 }
 
 static void term_put(char c)
 {
-	if (c == '\r') {
+	switch (state) {
+	case PARSE_TEXT:
+		if (c == 0x1B) {
+			state = PARSE_ESC;
+			return;
+		}
+		if (c == '\r') {
+			cursor_col = 0U;
+			return;
+		}
+		if (c == '\n') {
+			newline();
+			return;
+		}
+		if (c == '\b') {
+			if (cursor_col > 0U) {
+				cursor_col--;
+			}
+			return;
+		}
+		if (c == '\t') {
+			uint8_t next = (uint8_t)((cursor_col + 8U) & ~7U);
+
+			while (cursor_col < next && cursor_col < TERM_COLS) {
+				put_char(' ');
+			}
+			return;
+		}
+		if (c == 0x07) {
+			return; /* bell */
+		}
+		if ((c < 0x20) || (c > 0x7E)) {
+			c = '.';
+		}
+		put_char(c);
+		return;
+
+	case PARSE_ESC:
+		if (c == '[') {
+			state = PARSE_CSI;
+			csi_len = 0U;
+			csi[0] = '\0';
+			return;
+		}
+		if (c == ']') {
+			state = PARSE_OSC;
+			return;
+		}
+		/* Two-byte escape (ESC ( B, ESC = ...): consume and ignore. */
+		state = PARSE_TEXT;
+		return;
+
+	case PARSE_CSI:
+		if (c >= 0x40 && c <= 0x7E) {
+			csi[csi_len] = '\0';
+			handle_csi(csi, c);
+			state = PARSE_TEXT;
+			return;
+		}
+		if (csi_len < sizeof(csi) - 1U) {
+			csi[csi_len++] = c;
+		}
+		return;
+
+	case PARSE_OSC:
+		/* Terminated by BEL or by ESC \. */
+		if (c == 0x07) {
+			state = PARSE_TEXT;
+		} else if (c == 0x1B) {
+			state = PARSE_ESC;
+		}
 		return;
 	}
-
-	if (term_len >= TERM_TEXT_MAX) {
-		term_drop_oldest_line();
-	}
-
-	if (c == '\n') {
-		term_text[term_len++] = '\n';
-	} else {
-		term_text[term_len++] = ((c < 0x20) || (c > 0x7E)) ? '.' : c;
-	}
-
-	term_text[term_len] = '\0';
 }
 
 static void flush_handler(struct k_work *work)
 {
 	uint8_t chunk[32];
 	size_t count;
-	bool changed = false;
+	bool any = false;
 
 	ARG_UNUSED(work);
 
@@ -102,11 +301,16 @@ static void flush_handler(struct k_work *work)
 		for (size_t i = 0U; i < count; i++) {
 			term_put((char)chunk[i]);
 		}
-		changed = true;
+		any = true;
 	}
 
-	if (changed) {
-		linkr_ui_terminal_set(term_text);
+	if (any) {
+		for (uint8_t row = 0U; row < TERM_ROWS; row++) {
+			if (row_dirty[row]) {
+				linkr_ui_terminal_set_line(row, rows[row], row_color[row]);
+				row_dirty[row] = false;
+			}
+		}
 	}
 
 	atomic_clear(&flush_pending);
@@ -144,6 +348,8 @@ static int linkr_terminal_init(void)
 				     "terminal: uart1\n";
 
 	k_work_init_delayable(&flush_work, flush_handler);
+
+	view_clear();
 
 	/* Seed the view so font rendering and line wrapping can be checked
 	 * without an external UART peer; real bridge traffic scrolls it out.

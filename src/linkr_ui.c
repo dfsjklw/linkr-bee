@@ -2,13 +2,13 @@
  * LVGL status screen for the Waveshare ESP32-C5-Touch-LCD-2.8.
  *
  * Layout (240x320):
- *   y=6    title
- *   y=28   status line   (temperature / humidity / RTC time)
- *   y=46   detail line   (IMU acceleration)
- *   y=72   terminal area (bridge UART data, 28x12 characters)
+ *   y=  0  title          (Consolas 14)
+ *   y= 16  status line    (Consolas 14) temperature / humidity / RTC time
+ *   y= 32  detail line    (Consolas 14) IMU acceleration
+ *   y= 50  terminal       (Consolas 8, 27 lines x 10 px, 44 columns)
  *
- * The screen is built after LVGL's own auto-init (APPLICATION 90); the
- * terminal and status samplers push updates from their own work items.
+ * The terminal is rendered as one label per line so linkr_terminal.c can push
+ * only the lines that changed and colour each line independently (ANSI SGR).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -31,26 +31,33 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
 #define UI_TITLE_COLOR 0x7AA2F7U
 #define UI_TEXT_COLOR  0x9ECE6AU
 #define UI_DIM_COLOR   0x565F89U
-#define UI_TERM_COLOR  0xC0CAF5U
 
-/* Consolas 14 (generated with lv_font_conv, 4 bpp, ASCII only): a monospace
- * face with anti-aliasing, so the terminal keeps column alignment while the
- * glyph edges stay smooth. 8 px advance => 28 columns in 228 px.
- *
- * Regenerate with:
- *   npx lv_font_conv@1.5.3 --font C:/Windows/Fonts/consola.ttf --size 14 \
- *     --bpp 4 --format lvgl --lv-include lvgl.h --range 0x20-0x7F \
- *     --no-compress -o src/fonts/lv_font_consola_14.c
+/* Consolas faces generated with lv_font_conv (see src/fonts/):
+ *   npx lv_font_conv@1.5.3 --font C:/Windows/Fonts/consola.ttf --size 8 \
+ *     --bpp 2 --format lvgl --lv-include lvgl.h --range 0x20-0x7F \
+ *     --no-compress -o src/fonts/lv_font_consola_8.c
+ * (and the same for --size 14 --bpp 4 -> lv_font_consola_14.c)
  */
 LV_FONT_DECLARE(lv_font_consola_14);
-#define UI_FONT (&lv_font_consola_14)
+LV_FONT_DECLARE(lv_font_consola_8);
 
-/* Panel is 240 px wide; leave 6 px margins on both sides. */
-#define UI_TERM_WIDTH 228
+#define UI_FONT      (&lv_font_consola_14)
+#define UI_TERM_FONT (&lv_font_consola_8)
+
+#define UI_TERM_Y      50
+#define UI_TERM_PITCH  10
+
+/* ANSI 16-colour palette, tuned for a dark background. */
+static const uint32_t term_palette[16] = {
+	0x000000, 0xCD3131, 0x0DBC79, 0xE5E510,
+	0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
+	0x666666, 0xF14C4C, 0x23D18B, 0xF5F543,
+	0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF,
+};
 
 static lv_obj_t *status_label;
 static lv_obj_t *detail_label;
-static lv_obj_t *term_label;
+static lv_obj_t *term_lines[LINKR_TERM_ROWS];
 
 static lv_obj_t *ui_add_label(lv_obj_t *parent, const char *text, uint32_t color,
 			      lv_align_t align, int32_t y)
@@ -71,20 +78,19 @@ static void ui_build(void)
 	lv_obj_set_style_bg_color(scr, lv_color_hex(UI_BG_COLOR), 0);
 	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 2);
-	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 19);
-	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 36);
+	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 0);
+	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 16);
+	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 32);
 
-	/* The terminal label wraps by itself (LVGL measures real glyph widths),
-	 * so linkr_terminal.c only has to keep the newest lines of text.
-	 */
-	term_label = lv_label_create(scr);
-	lv_label_set_text(term_label, "");
-	lv_obj_set_style_text_color(term_label, lv_color_hex(UI_TERM_COLOR), 0);
-	lv_obj_set_style_text_font(term_label, UI_FONT, 0);
-	lv_label_set_long_mode(term_label, LV_LABEL_LONG_WRAP);
-	lv_obj_set_size(term_label, UI_TERM_WIDTH, 258);
-	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 54);
+	for (uint8_t row = 0U; row < LINKR_TERM_ROWS; row++) {
+		lv_obj_t *line = lv_label_create(scr);
+
+		lv_label_set_text(line, "");
+		lv_obj_set_style_text_font(line, UI_TERM_FONT, 0);
+		lv_obj_set_style_text_color(line, lv_color_hex(term_palette[7]), 0);
+		lv_obj_set_pos(line, 4, UI_TERM_Y + (int32_t)row * UI_TERM_PITCH);
+		term_lines[row] = line;
+	}
 }
 
 void linkr_ui_set_status(const char *line)
@@ -117,16 +123,24 @@ void linkr_ui_set_detail(const char *line)
 #endif
 }
 
-void linkr_ui_terminal_set(const char *text)
+void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
 {
-	if (term_label == NULL || text == NULL) {
+	lv_obj_t *line;
+
+	if (row >= LINKR_TERM_ROWS || text == NULL) {
+		return;
+	}
+
+	line = term_lines[row];
+	if (line == NULL) {
 		return;
 	}
 
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_lock();
 #endif
-	lv_label_set_text(term_label, text);
+	lv_obj_set_style_text_color(line, lv_color_hex(term_palette[color & 0x0FU]), 0);
+	lv_label_set_text(line, text);
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
@@ -167,9 +181,11 @@ void linkr_ui_set_detail(const char *line)
 	ARG_UNUSED(line);
 }
 
-void linkr_ui_terminal_set(const char *text)
+void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
 {
+	ARG_UNUSED(row);
 	ARG_UNUSED(text);
+	ARG_UNUSED(color);
 }
 
 #endif /* CONFIG_LINKR_LCD && CONFIG_LVGL */
