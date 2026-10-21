@@ -33,11 +33,17 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
 #define UI_DIM_COLOR   0x565F89U
 #define UI_TERM_COLOR  0xC0CAF5U
 
-/* Bitmap monospace face (8x16 cells): 1 bpp rendering means glyph edges are
- * pure foreground or background, so RGB565 blending cannot introduce colour
- * fringing, and every cell is pixel aligned. 228 px / 8 px = 28 columns.
+/* Consolas 14 (generated with lv_font_conv, 4 bpp, ASCII only): a monospace
+ * face with anti-aliasing, so the terminal keeps column alignment while the
+ * glyph edges stay smooth. 8 px advance => 28 columns in 228 px.
+ *
+ * Regenerate with:
+ *   npx lv_font_conv@1.5.3 --font C:/Windows/Fonts/consola.ttf --size 14 \
+ *     --bpp 4 --format lvgl --lv-include lvgl.h --range 0x20-0x7F \
+ *     --no-compress -o src/fonts/lv_font_consola_14.c
  */
-#define UI_FONT (&lv_font_unscii_16)
+LV_FONT_DECLARE(lv_font_consola_14);
+#define UI_FONT (&lv_font_consola_14)
 
 /* Panel is 240 px wide; leave 6 px margins on both sides. */
 #define UI_TERM_WIDTH 228
@@ -66,8 +72,8 @@ static void ui_build(void)
 	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
 	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 2);
-	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 20);
-	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 38);
+	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 19);
+	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 36);
 
 	/* The terminal label wraps by itself (LVGL measures real glyph widths),
 	 * so linkr_terminal.c only has to keep the newest lines of text.
@@ -77,8 +83,8 @@ static void ui_build(void)
 	lv_obj_set_style_text_color(term_label, lv_color_hex(UI_TERM_COLOR), 0);
 	lv_obj_set_style_text_font(term_label, UI_FONT, 0);
 	lv_label_set_long_mode(term_label, LV_LABEL_LONG_WRAP);
-	lv_obj_set_size(term_label, UI_TERM_WIDTH, 254);
-	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 58);
+	lv_obj_set_size(term_label, UI_TERM_WIDTH, 258);
+	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 54);
 }
 
 void linkr_ui_set_status(const char *line)

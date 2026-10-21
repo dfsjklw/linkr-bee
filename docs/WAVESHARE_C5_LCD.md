@@ -177,12 +177,16 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 
 ### UI 字体与排版
 
-- 使用 `lv_font_montserrat_10`（与参考工程一致）：240 px 宽的屏上 1:1 像素映射、
-  约 40 列，比 14 px 抗锯齿字体锐利。
-- 终端区宽 228 px，`LV_LABEL_LONG_WRAP` 由 LVGL 按真实字宽折行；
-  `linkr_terminal.c` 只负责保留 `\n`，并在 512 字节窗口满时丢弃最旧的整行。
-- 早期实现用"按字符数补空格 + `LV_LABEL_LONG_CLIP`"：比例字体下行宽漂移、超出
-  226 px 的字符被裁掉，这正是"字体发虚 / 不换行"的根因。
+- 字体为 **Consolas 14**（4 bpp 抗锯齿等宽，ASCII 0x20–0x7F），用 `lv_font_conv`
+  生成并随源码提交（`src/fonts/lv_font_consola_14.c`），生成命令见
+  `src/linkr_ui.c` 中 `UI_FONT` 的注释。228 px 宽下约 28 列、字宽一致，终端对齐稳定。
+- 终端区 `LV_LABEL_LONG_WRAP` 由 LVGL 按真实字宽折行；`linkr_terminal.c` 只负责
+  保留 `\n`，并在 512 字节窗口满时丢弃最旧的整行。
+- 面板 SPI 时钟 **20 MHz**（`mipi-max-frequency`）。40 MHz 下观察到重影/彩边，降到
+  20 MHz 后消失；若后续需要更高帧率，可再试 40 MHz 并复核。
+- 历史实现用"按字符数补空格 + `LV_LABEL_LONG_CLIP`"：比例字体下行宽漂移、超出
+  226 px 的字符被裁掉，这是"字体发虚 / 不换行"的根因。位图字体（`unscii_16`）
+  也验证过，可见 1 bpp 渲染无彩边，最终选定抗锯齿等宽方案。
 
 ## 8. 实测启动日志（首板验证通过）
 
