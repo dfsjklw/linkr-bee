@@ -34,6 +34,10 @@
 #include <zephyr/version.h>
 
 #include "target_binding.h"
+
+#if defined(CONFIG_LINKR_LCD)
+#include "linkr_terminal.h"
+#endif
 #include "ble_mgmt.h"
 #include "ble_uart_reliable.h"
 #include "wifi.h"
@@ -466,6 +470,13 @@ static void uart_rx_irq_callback(const struct device *dev, void *user_data)
 		if (written < (uint32_t)rx_len) {
 			atomic_add(&uart_rx_dropped, rx_len - written);
 		}
+
+#if defined(CONFIG_LINKR_LCD)
+		/* Mirror the bridge traffic on the panel. The helper only copies
+		 * into a lock-protected ring, so it is safe from this ISR.
+		 */
+		linkr_terminal_feed((const uint8_t *)buf, (size_t)rx_len);
+#endif
 
 		k_sem_give(&uart_rx_sem);
 	}

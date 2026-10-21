@@ -20,4 +20,12 @@ void linkr_ui_set_status(const char *line);
  */
 void linkr_ui_set_detail(const char *line);
 
+/**
+ * @brief Replace the terminal area text (fed by linkr_terminal.c).
+ *
+ * The caller owns the buffer and must pass fixed-width lines that fit the
+ * 28-column terminal area.
+ */
+void linkr_ui_terminal_set(const char *text);
+
 #endif /* LINKR_UI_H_ */
