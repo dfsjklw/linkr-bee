@@ -26,5 +26,15 @@ target_sources(app PRIVATE
   src/ws_bridge.c
 )
 
+# Waveshare ESP32-C5-Touch-LCD-2.8 panel support (CH32V003 expander based
+# power/reset rails plus the ST7789 panel bring-up). Only compiled when the
+# board conf enables CONFIG_LINKR_LCD.
+if(CONFIG_LINKR_LCD)
+  target_sources(app PRIVATE
+    src/board_io.c
+    src/linkr_display.c
+  )
+endif()
+
 # HTTP service resources live in named iterable sections (WebSocket bridge).
 zephyr_linker_sources(SECTIONS sections-rom.ld)

@@ -546,4 +546,38 @@ config HTTP_SERVER_STACK_SIZE
 
 endmenu
 
+menu "Linkr LCD panel"
+
+config LINKR_LCD
+	bool "Waveshare ESP32-C5-Touch-LCD-2.8 panel support"
+	depends on DISPLAY && I2C
+	help
+	  Bring up the 2.8 inch 240x320 ST7789 panel of the Waveshare
+	  ESP32-C5-Touch-LCD-2.8 board: the CH32V003 IO expander based reset
+	  sequencing, the backlight PWM channel and the initial screen clear.
+
+	  Requires the matching devicetree overlay
+	  (boards/linkr_c5_touch_lcd.overlay) passed with
+	  -DEXTRA_DTC_OVERLAY_FILE; without it no display device exists and the
+	  panel bring-up logs an error but boot continues.
+
+config LINKR_LCD_IO_EXPANDER_ADDR
+	hex "CH32V003 IO expander I2C address"
+	default 0x24
+	depends on LINKR_LCD
+	help
+	  I2C address of the CH32V003 that drives LCD_RST, TP_RST, the
+	  backlight PWM, the amplifier enable and the battery ADC.
+
+config LINKR_LCD_BACKLIGHT_DEFAULT
+	int "Default backlight duty after boot"
+	default 200
+	range 0 255
+	depends on LINKR_LCD
+	help
+	  0 leaves the panel dark (useful while the ST7789 init sequence is
+	  being validated); 255 is full brightness.
+
+endmenu
+
 source "Kconfig.zephyr"
