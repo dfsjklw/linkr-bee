@@ -33,11 +33,11 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
 #define UI_DIM_COLOR   0x565F89U
 #define UI_TERM_COLOR  0xC0CAF5U
 
-/* 10 px is the size the vendor UI uses on this 240x320 panel: it renders at a
- * 1:1 pixel mapping and fits ~40 columns, so glyph edges stay sharp. The
- * larger proportional faces looked soft and clipped at this resolution.
+/* 12 px: the vendor UI uses 10 px, but on this panel that reads as too small
+ * in practice. 12 px keeps ~34 columns at 1:1 mapping while staying legible;
+ * 14 px was only tried together with the old fixed-column layout.
  */
-#define UI_FONT (&lv_font_montserrat_10)
+#define UI_FONT (&lv_font_montserrat_12)
 
 /* Panel is 240 px wide; leave 6 px margins on both sides. */
 #define UI_TERM_WIDTH 228
@@ -65,9 +65,9 @@ static void ui_build(void)
 	lv_obj_set_style_bg_color(scr, lv_color_hex(UI_BG_COLOR), 0);
 	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 6);
-	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 24);
-	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 38);
+	ui_add_label(scr, "Linkr", UI_TITLE_COLOR, LV_ALIGN_TOP_MID, 4);
+	status_label = ui_add_label(scr, "BLE UART bridge", UI_TEXT_COLOR, LV_ALIGN_TOP_MID, 26);
+	detail_label = ui_add_label(scr, "starting", UI_DIM_COLOR, LV_ALIGN_TOP_MID, 44);
 
 	/* The terminal label wraps by itself (LVGL measures real glyph widths),
 	 * so linkr_terminal.c only has to keep the newest lines of text.
@@ -77,8 +77,8 @@ static void ui_build(void)
 	lv_obj_set_style_text_color(term_label, lv_color_hex(UI_TERM_COLOR), 0);
 	lv_obj_set_style_text_font(term_label, UI_FONT, 0);
 	lv_label_set_long_mode(term_label, LV_LABEL_LONG_WRAP);
-	lv_obj_set_size(term_label, UI_TERM_WIDTH, 252);
-	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 56);
+	lv_obj_set_size(term_label, UI_TERM_WIDTH, 248);
+	lv_obj_align(term_label, LV_ALIGN_TOP_LEFT, 6, 64);
 }
 
 void linkr_ui_set_status(const char *line)
