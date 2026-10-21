@@ -32,8 +32,8 @@ target_sources(app PRIVATE
 if(CONFIG_LINKR_LCD)
   target_sources(app PRIVATE
     src/board_io.c
+    src/fonts/lv_font_consola_10.c
     src/fonts/lv_font_consola_14.c
-    src/fonts/lv_font_consola_8.c
     src/input_cst3530.c
     src/linkr_display.c
     src/linkr_status.c

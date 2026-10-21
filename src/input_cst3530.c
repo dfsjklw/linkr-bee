@@ -39,6 +39,12 @@ LOG_MODULE_REGISTER(cst3530, CONFIG_INPUT_LOG_LEVEL);
 #define CST3530_MAX_POINTS  2U
 #define CST3530_STATUS_MASK 0xF0U
 
+/* The controller only raises INT for the first contact report; a periodic
+ * poll keeps coordinates flowing while the finger moves, which is what makes
+ * the LVGL pointer drag smooth and proportional.
+ */
+#define CST3530_POLL_MS 20
+
 struct cst3530_config {
 	struct i2c_dt_spec i2c;
 	struct gpio_dt_spec irq;
@@ -50,6 +56,8 @@ struct cst3530_data {
 	const struct device *dev;
 	struct k_work work;
 	struct gpio_callback irq_cb;
+	struct k_timer poll_timer;
+	bool pressed;
 };
 
 static void cst3530_addr(uint32_t reg, uint8_t out[4])
@@ -105,6 +113,11 @@ static int cst3530_read(const struct device *dev, uint32_t reg, uint8_t *data, s
 
 static void cst3530_release(const struct device *dev)
 {
+	struct cst3530_data *data = dev->data;
+
+	data->pressed = false;
+	k_timer_stop(&data->poll_timer);
+
 	(void)cst3530_write(dev, CST3530_REG_END_READ, NULL, 0U);
 	input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
 }
@@ -112,8 +125,8 @@ static void cst3530_release(const struct device *dev)
 static void cst3530_process(const struct device *dev)
 {
 	const struct cst3530_config *cfg = dev->config;
+	struct cst3530_data *data = dev->data;
 	uint8_t buf[9];
-	uint8_t extra[(CST3530_MAX_POINTS - 1U) * CST3530_POINT_BYTES];
 	uint8_t points;
 	int ret;
 
@@ -132,36 +145,45 @@ static void cst3530_process(const struct device *dev)
 
 	points = MIN(points, CST3530_MAX_POINTS);
 
-	if (points > 1U) {
-		size_t len = (size_t)(points - 1U) * CST3530_POINT_BYTES;
-
-		ret = cst3530_read(dev, CST3530_REG_COORD_NEXT, extra, len);
-		if (ret != 0) {
-			LOG_ERR("coordinate read failed (%d)", ret);
-			(void)cst3530_write(dev, CST3530_REG_END_READ, NULL, 0U);
-			return;
-		}
-	}
+	/* Only the first point drives the LVGL pointer, so the extra coordinate
+	 * block is not fetched: that saves one I2C round trip per sample, which
+	 * directly improves drag latency.
+	 */
+	ARG_UNUSED(points);
 
 	/* Release the controller before reporting: END_READ is a bus access and
 	 * must not be interleaved with the input callbacks.
 	 */
 	(void)cst3530_write(dev, CST3530_REG_END_READ, NULL, 0U);
 
-	for (uint8_t i = 0U; i < points; i++) {
-		const uint8_t *p = (i == 0U) ? &buf[4] : &extra[(i - 1U) * CST3530_POINT_BYTES];
+	{
+		/* Report a single pointer. CST3530 reassigns track ids between
+		 * reads; forwarding INPUT_ABS_MT_SLOT made LVGL treat the same
+		 * finger as a new contact, which produced random drag
+		 * directions and lost gestures.
+		 */
+		const uint8_t *p = &buf[4];
 		int32_t x = (int32_t)(((p[3] & 0x0FU) << 8) | p[0]);
 		int32_t y = (int32_t)(((p[3] & 0xF0U) << 4) | p[1]);
 
 		x = CLAMP(x, 0, cfg->x_max - 1);
 		y = CLAMP(y, 0, cfg->y_max - 1);
 
-		input_report_abs(dev, INPUT_ABS_MT_SLOT, p[4] & 0x0FU, false, K_FOREVER);
 		input_report_abs(dev, INPUT_ABS_X, x, false, K_FOREVER);
 		input_report_abs(dev, INPUT_ABS_Y, y, false, K_FOREVER);
 	}
 
 	input_report_key(dev, INPUT_BTN_TOUCH, 1, true, K_FOREVER);
+
+	/* Keep sampling while the finger stays down: the controller does not
+	 * raise INT for every movement, so without this the pointer only sees
+	 * the initial contact.
+	 */
+	if (!data->pressed) {
+		data->pressed = true;
+		k_timer_start(&data->poll_timer, K_MSEC(CST3530_POLL_MS),
+			      K_MSEC(CST3530_POLL_MS));
+	}
 }
 
 static void cst3530_work_handler(struct k_work *work)
@@ -169,6 +191,16 @@ static void cst3530_work_handler(struct k_work *work)
 	struct cst3530_data *data = CONTAINER_OF(work, struct cst3530_data, work);
 
 	cst3530_process(data->dev);
+}
+
+/* Re-samples while a finger is down, so movement keeps reaching the pointer. */
+static void cst3530_poll_handler(struct k_timer *timer)
+{
+	struct cst3530_data *data = CONTAINER_OF(timer, struct cst3530_data, poll_timer);
+
+	if (data->pressed) {
+		k_work_submit(&data->work);
+	}
 }
 
 static void cst3530_irq_handler(const struct device *port, struct gpio_callback *cb,
@@ -201,6 +233,7 @@ static int cst3530_init(const struct device *dev)
 	}
 
 	k_work_init(&data->work, cst3530_work_handler);
+	k_timer_init(&data->poll_timer, cst3530_poll_handler, NULL);
 
 	ret = gpio_pin_configure_dt(&cfg->irq, GPIO_INPUT);
 	if (ret != 0) {

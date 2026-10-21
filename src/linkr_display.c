@@ -39,7 +39,11 @@ LOG_MODULE_REGISTER(linkr_display, CONFIG_LOG_DEFAULT_LEVEL);
 
 static const struct device *const display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 
-static uint16_t clear_buf[PANEL_WIDTH * CLEAR_ROWS];
+/* Only used once at boot, so keep it out of the few KB of remaining internal
+ * SRAM and place it in the PSRAM window (boards/linkr_c5_lvgl_psram.ld).
+ */
+static uint16_t clear_buf[PANEL_WIDTH * CLEAR_ROWS]
+	__attribute__((section(".linkr_psram")));
 
 static void panel_clear(uint16_t color)
 {

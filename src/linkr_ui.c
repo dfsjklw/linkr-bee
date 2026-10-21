@@ -39,14 +39,16 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
  * (and the same for --size 14 --bpp 4 -> lv_font_consola_14.c)
  */
 LV_FONT_DECLARE(lv_font_consola_14);
-LV_FONT_DECLARE(lv_font_consola_8);
+LV_FONT_DECLARE(lv_font_consola_10);
 
 #define UI_FONT      (&lv_font_consola_14)
-#define UI_TERM_FONT (&lv_font_consola_8)
+#define UI_TERM_FONT (&lv_font_consola_10)
 
 #define UI_TERM_Y      50
-#define UI_TERM_PITCH  10
-/* Panel is 240 px wide; 4 px margins leave 232 px for the terminal viewport. */
+/* 10 px Consolas reports a line height of 11; 12 gives one row of breathing
+ * room, so the 270 px viewport fits 22 rows.
+ */
+#define UI_TERM_PITCH  12
 #define UI_TERM_WIDTH  232
 
 /* ANSI 16-colour palette, tuned for a dark background. */
@@ -100,13 +102,19 @@ static void ui_build(void)
 	lv_obj_set_scroll_dir(term_cont, LV_DIR_VER);
 	lv_obj_set_scrollbar_mode(term_cont, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_add_flag(term_cont, LV_OBJ_FLAG_SCROLLABLE);
+	/* No elastic bounce and no fling momentum: with sparse touch reports the
+	 * momentum estimate made a long drag scroll only a few lines and stop in
+	 * unpredictable places. Scrolling now tracks the finger 1:1.
+	 */
+	lv_obj_clear_flag(term_cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+	lv_obj_clear_flag(term_cont, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 	/* Flex column instead of manual y offsets: the labels stack by
 	 * themselves, so a bad offset cannot collapse every line onto the same
 	 * row (which looked like "only the last line updates").
 	 */
 	lv_obj_set_layout(term_cont, LV_LAYOUT_FLEX);
 	lv_obj_set_flex_flow(term_cont, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_style_pad_row(term_cont, UI_TERM_PITCH - 8, 0);
+	lv_obj_set_style_pad_row(term_cont, UI_TERM_PITCH - 11, 0);
 
 	for (uint8_t row = 0U; row < LINKR_TERM_HISTORY; row++) {
 		lv_obj_t *line = lv_label_create(term_cont);
@@ -118,6 +126,12 @@ static void ui_build(void)
 		lv_obj_set_width(line, UI_TERM_WIDTH);
 		term_lines[row] = line;
 	}
+
+	/* Start pinned to the newest line: the container is created scrolled to
+	 * the top, which used to read as "user is browsing history" and stopped
+	 * live output from ever showing up without a manual scroll.
+	 */
+	lv_obj_scroll_to_y(term_cont, LV_COORD_MAX, LV_ANIM_OFF);
 }
 
 void linkr_ui_set_status(const char *line)

@@ -16,9 +16,9 @@
  * one label each inside a vertically scrollable container; only
  * LINKR_TERM_ROWS of them are visible at a time (8 px font, 10 px pitch).
  */
-#define LINKR_TERM_ROWS    27
+#define LINKR_TERM_ROWS    22
 #define LINKR_TERM_HISTORY 48
-#define LINKR_TERM_COLS    44
+#define LINKR_TERM_COLS    38
 
 /**
  * @brief Replace the primary status line on the panel.
