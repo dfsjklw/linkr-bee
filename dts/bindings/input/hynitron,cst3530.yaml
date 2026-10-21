@@ -1,0 +1,28 @@
+description: |
+  Hynitron CST3530 capacitive touch controller.
+
+  Found on the Waveshare ESP32-C5-Touch-LCD-2.8 panel. The controller uses a
+  four-byte register address (see the vendor driver in the board BSP) and
+  requires an END_READ handshake after every data read.
+
+compatible: "hynitron,cst3530"
+
+include: [i2c-device.yaml]
+
+properties:
+  irq-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Touch interrupt line. The controller drives it active low when new
+      coordinates are available.
+
+  x-max:
+    type: int
+    default: 240
+    description: Panel width in pixels, used to clamp reported coordinates.
+
+  y-max:
+    type: int
+    default: 320
+    description: Panel height in pixels, used to clamp reported coordinates.

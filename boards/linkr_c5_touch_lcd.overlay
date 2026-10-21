@@ -90,6 +90,20 @@
  */
 
 /*
+ * Gesture/status buttons of the bridge (pairing, factory reset) are read
+ * directly through GPIO by the application. Disable them for the input
+ * subsystem: with CONFIG_INPUT=y the input-gpio-keys driver would otherwise
+ * demand a zephyr,code property and take over the same pins.
+ */
+&{/linkr_pairing_keys} {
+	status = "disabled";
+};
+
+&{/linkr_factory_reset_keys} {
+	status = "disabled";
+};
+
+/*
  * Board I2C bus: SDA=GPIO0, SCL=GPIO1.
  * The devkit pinmux defaults to GPIO6/GPIO7, which the LCD uses for SPI, so
  * the bus must be moved before any device (touch, sensors, expander) is added.
@@ -110,4 +124,16 @@
 	pinctrl-names = "default";
 	clock-frequency = <I2C_BITRATE_FAST>;
 	status = "okay";
+
+	/* Capacitive touch controller. Its reset line is driven by the
+	 * CH32V003 expander (board_io.c), not by a GPIO.
+	 */
+	touch: touch@58 {
+		compatible = "hynitron,cst3530";
+		reg = <0x58>;
+		irq-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+		x-max = <240>;
+		y-max = <320>;
+		status = "okay";
+	};
 };
