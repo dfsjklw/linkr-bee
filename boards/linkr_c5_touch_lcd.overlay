@@ -37,11 +37,12 @@
 			compatible = "sitronix,st7789v";
 			reg = <0>;
 
-			/* 40 MHz to start; the panel and the vendor BSP are
-			 * happy at 80 MHz once the signal integrity of the
-			 * flex cable is confirmed.
+			/* 20 MHz for now: the vendor BSP header defines
+			 * BSP_LCD_PIXEL_CLOCK_HZ as 20 MHz, and a lower clock
+			 * removes any byte-level signal-integrity doubt while
+			 * the panel init parameters are being validated.
 			 */
-			mipi-max-frequency = <DT_FREQ_M(40)>;
+			mipi-max-frequency = <DT_FREQ_M(20)>;
 
 			width = <240>;
 			height = <320>;
