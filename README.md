@@ -111,7 +111,9 @@ The UART side is 3.3 V logic, not RS-232. See the
 3. Power both sides. The blue LED flashes while bytes cross the bridge.
 
 4. Authorize this host: hold **GPIO1 to GND**, connect, and accept the pairing
-   prompt. Release GPIO1 afterwards; the host is remembered.
+   prompt. Release GPIO1 afterwards; the host is remembered. On the Waveshare
+   panel build GPIO1 carries the touch I2C clock, so tap **PAIR** on the screen
+   instead — it opens a 60 s, single-use pairing window.
 
 5. Open a client. For the web terminal:
 
