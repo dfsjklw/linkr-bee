@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include <zephyr/sys/util.h>
 
@@ -46,6 +47,15 @@ int linkr_uart_config_reconfigure(uint32_t baudrate);
  */
 void linkr_uart_autobaud_init(uintptr_t reg_addr);
 
+/**
+ * @brief True while the current line rate is considered trustworthy.
+ *
+ * False means the detector is still probing and may move the port, which is
+ * what the panel shows as "autobaud probing". Always false when autobaud is
+ * compiled out.
+ */
+bool linkr_uart_autobaud_verified(void);
+
 #else
 
 static inline uint32_t linkr_uart_config_current(void)
@@ -63,6 +73,11 @@ static inline int linkr_uart_config_reconfigure(uint32_t baudrate)
 static inline void linkr_uart_autobaud_init(uintptr_t reg_addr)
 {
 	(void)reg_addr;
+}
+
+static inline bool linkr_uart_autobaud_verified(void)
+{
+	return false;
 }
 
 #endif /* LINKR_UART_AUTOBAUD */

@@ -637,4 +637,9 @@ void linkr_uart_autobaud_init(uintptr_t reg_addr)
 	k_work_reschedule(&autobaud_work, K_MSEC(AUTOBAUD_WINDOW_MS));
 }
 
+bool linkr_uart_autobaud_verified(void)
+{
+	return autobaud_verified;
+}
+
 #endif /* LINKR_UART_AUTOBAUD */

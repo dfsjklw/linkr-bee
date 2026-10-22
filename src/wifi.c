@@ -1141,6 +1141,31 @@ bool linkr_wifi_has_ip(void)
     return atomic_get(&wifi_ip_ready) != 0;
 }
 
+int linkr_wifi_link_info(int *rssi, unsigned int *channel)
+{
+    struct wifi_iface_status status;
+    int err;
+
+    if (!atomic_get(&wifi_connected) || !wifi_iface) {
+        return -ENODATA;
+    }
+
+    err = net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, wifi_iface, &status,
+                   sizeof(status));
+    if (err) {
+        return err;
+    }
+
+    if (rssi != NULL) {
+        *rssi = status.rssi;
+    }
+    if (channel != NULL) {
+        *channel = status.channel;
+    }
+
+    return 0;
+}
+
 static void wifi_connect_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct wifi_connect_msg msg;
@@ -1780,8 +1805,7 @@ static const char *wifi_ip_status(char *buf, size_t len)
 }
 
 int linkr_wifi_status(char *buf, size_t len)
-{
-    char ip[NET_IPV4_ADDR_LEN];
+{    char ip[NET_IPV4_ADDR_LEN];
     const char *ip_status = wifi_ip_status(ip, sizeof(ip));
     const char *ssid;
     int n;
