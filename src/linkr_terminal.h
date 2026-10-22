@@ -7,6 +7,7 @@
 #ifndef LINKR_TERMINAL_H_
 #define LINKR_TERMINAL_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -19,5 +20,16 @@
  * non-ASCII bytes are rendered as '.'.
  */
 void linkr_terminal_feed(const uint8_t *data, size_t len);
+
+/**
+ * @brief True when output arrived that the operator has not looked at yet.
+ *
+ * Set by linkr_terminal_feed() (including from the UART ISR) and cleared when
+ * the terminal page becomes visible.
+ */
+bool linkr_terminal_unread(void);
+
+/** @brief Forget the unread flag; the terminal page is now on screen. */
+void linkr_terminal_unread_clear(void);
 
 #endif /* LINKR_TERMINAL_H_ */

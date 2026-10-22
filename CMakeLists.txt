@@ -35,7 +35,7 @@ if(CONFIG_LINKR_LCD)
     src/fonts/lv_font_consola_10.c
     src/fonts/lv_font_consola_14.c
     src/linkr_display.c
-    src/linkr_status.c
+    src/linkr_panel.c
     src/linkr_terminal.c
     src/linkr_touch.c
     src/linkr_ui.c

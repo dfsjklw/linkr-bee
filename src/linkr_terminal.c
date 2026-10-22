@@ -1,4 +1,4 @@
-/*
+﻿/*
  * On-panel terminal view for the Waveshare ESP32-C5-Touch-LCD-2.8.
  *
  * The bridge UART feeds a lock-protected ring from its interrupt handler. A
@@ -55,6 +55,11 @@ static size_t feed_tail;
 static struct k_spinlock feed_lock;
 static atomic_t flush_pending;
 
+/* Output the operator has not seen yet: this drives the unread dot on the
+ * status page. Written from the UART ISR, cleared by the UI.
+ */
+static atomic_t unread;
+
 static struct k_work_delayable flush_work;
 
 /* Scrollback lives in PSRAM: 48 lines do not fit in internal SRAM next to the
@@ -92,7 +97,9 @@ static void row_clear(uint8_t row)
 {
 	memset(rows[row], ' ', TERM_COLS);
 	rows[row][TERM_COLS] = '\0';
-	row_color[row] = current_color;
+	/* A blank line belongs to no command: give it the default colour rather
+	 * than whatever SGR the previous output left active. */
+	row_color[row] = ANSI_DEFAULT_COLOR;
 }
 
 static void view_clear(void)
@@ -114,14 +121,28 @@ static void scroll_one(void)
 	memmove(rows[0], rows[1], (size_t)(TERM_ROWS - 1U) * sizeof(rows[0]));
 	memmove(&row_color[0], &row_color[1], (size_t)(TERM_ROWS - 1U) * sizeof(row_color[0]));
 	row_clear((uint8_t)(TERM_ROWS - 1U));
-	memmove(&row_dirty[0], &row_dirty[1], (size_t)(TERM_ROWS - 1U) * sizeof(row_dirty[0]));
-	row_dirty[TERM_ROWS - 1U] = true;
+	/* Every visible line now holds the text of the line below it, so every
+	 * label must be pushed again.
+	 *
+	 * Carrying row_dirty[] upwards together with the contents (the obvious
+	 * thing, and what this used to do) marks the moved lines *clean* whenever
+	 * the line they came from had already been sent -- yet their text changed,
+	 * so flush_handler() skipped them and the panel kept showing the old
+	 * lines. That is exactly the "new output mixed with stale output" symptom.
+	 */
+	memset(row_dirty, 1, sizeof(row_dirty));
 	cursor_row = (uint8_t)(TERM_ROWS - 1U);
 }
 
 static void newline(void)
 {
 	cursor_col = 0U;
+	/* Start every line in the default colour. Programs frequently leave an
+	 * SGR active at the end of a line (ls with a colourised LS_COLORS is the
+	 * common case); without this reset its green/blue tinted the first line
+	 * of whatever command ran next. */
+	current_color = ANSI_DEFAULT_COLOR;
+	bold = false;
 
 	if ((uint8_t)(cursor_row + 1U) >= TERM_ROWS) {
 		scroll_one();
@@ -300,10 +321,6 @@ static void flush_handler(struct k_work *work)
 	uint8_t chunk[32];
 	size_t count;
 	bool any = false;
-	/* Decide before parsing: if the user scrolled up to read history, new
-	 * output must not yank the view back to the bottom.
-	 */
-	bool follow = linkr_ui_terminal_following();
 
 	ARG_UNUSED(work);
 
@@ -322,8 +339,12 @@ static void flush_handler(struct k_work *work)
 			}
 		}
 
-		if (follow) {
-			linkr_ui_terminal_scroll_to_bottom();
+		/* The UI decides whether the dot is worth showing (it is not,
+		 * while the terminal page is on screen); it also keeps the
+		 * pulse from restarting once the dot sits solid.
+		 */
+		if (atomic_get(&unread)) {
+			linkr_ui_terminal_unread(true);
 		}
 	}
 
@@ -333,6 +354,7 @@ static void flush_handler(struct k_work *work)
 void linkr_terminal_feed(const uint8_t *data, size_t len)
 {
 	k_spinlock_key_t key;
+	bool wrote = false;
 
 	if (data == NULL || len == 0U) {
 		return;
@@ -347,44 +369,44 @@ void linkr_terminal_feed(const uint8_t *data, size_t len)
 		}
 		feed_ring[feed_head] = data[i];
 		feed_head = next;
+		wrote = true;
 	}
 	k_spin_unlock(&feed_lock, key);
+
+	if (!wrote) {
+		return;
+	}
+
+	/* One atomic store from the ISR; the status page reads it through
+	 * linkr_terminal_unread() long after this handler returned.
+	 */
+	atomic_set(&unread, 1);
 
 	if (atomic_cas(&flush_pending, 0, 1)) {
 		(void)k_work_reschedule(&flush_work, K_MSEC(FLUSH_PERIOD_MS));
 	}
 }
 
+bool linkr_terminal_unread(void)
+{
+	return atomic_get(&unread) != 0;
+}
+
+void linkr_terminal_unread_clear(void)
+{
+	atomic_clear(&unread);
+}
+
 static int linkr_terminal_init(void)
 {
-	static const char banner[] =
-		"Linkr panel ready\n"
-		"240x320 ST7789 / LVGL\n"
-		"terminal: uart1\n"
-		"-- ANSI colour test --\n"
-		"\x1b[01;34mdir-in-blue\x1b[0m\n"
-		"\x1b[01;31mfile-in-red\x1b[0m\n"
-		"\x1b[01;32mexec-in-green\x1b[0m\n"
-		"-- numbered lines follow --\n";
-
 	k_work_init_delayable(&flush_work, flush_handler);
 
-	view_clear();
-
-	/* Seed more lines than the viewport shows so multi-line rendering and
-	 * the scroll gesture can be exercised without an external UART peer;
-	 * real bridge traffic scrolls this out.
+	/* Start with an empty grid. The old self-test banner (ANSI colour samples
+	 * plus 27 "line NN" lines) existed to exercise multi-line rendering and
+	 * scrolling before real traffic arrived; the terminal is now a fixed
+	 * 25-line live view, so it stays blank until the target says something.
 	 */
-	linkr_terminal_feed((const uint8_t *)banner, sizeof(banner) - 1U);
-
-	for (unsigned int i = 9U; i <= 35U; i++) {
-		char line[16];
-		int len = snprintf(line, sizeof(line), "line %02u\n", i);
-
-		if (len > 0) {
-			linkr_terminal_feed((const uint8_t *)line, (size_t)len);
-		}
-	}
+	view_clear();
 
 	return 0;
 }
@@ -397,6 +419,15 @@ void linkr_terminal_feed(const uint8_t *data, size_t len)
 {
 	ARG_UNUSED(data);
 	ARG_UNUSED(len);
+}
+
+bool linkr_terminal_unread(void)
+{
+	return false;
+}
+
+void linkr_terminal_unread_clear(void)
+{
 }
 
 #endif /* CONFIG_LINKR_LCD && CONFIG_LVGL */
