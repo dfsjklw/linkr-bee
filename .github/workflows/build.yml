@@ -325,7 +325,9 @@ jobs:
             grep -qx 'CONFIG_LVGL=y' "${config}"
             grep -qx 'CONFIG_ST7789V=y' "${config}"
             grep -qx 'CONFIG_MIPI_DBI=y' "${config}"
-            grep -qx 'CONFIG_INPUT=y' "${config}"
+            # LVGL emits big-endian RGB565 for the ST7789; without the swap the
+            # panel shows magenta with colour fringes.
+            grep -qx 'CONFIG_LV_COLOR_16_SWAP=y' "${config}"
             grep -qx 'CONFIG_LINKR_LCD_IO_EXPANDER_ADDR=0x24' "${config}"
             grep -qx 'CONFIG_ESPTOOLPY_FLASHSIZE="8MB"' "${config}"
           fi

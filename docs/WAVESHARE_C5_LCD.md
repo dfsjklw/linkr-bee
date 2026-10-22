@@ -41,7 +41,8 @@ west flash -d build/c5-waveshare
 
 CI 中的 `ESP32-C5 Waveshare Touch LCD 2.8` 矩阵项自动带上这两个参数，并在
 `Verify default feature set` 里断言 `CONFIG_ESP_SPIRAM`、`CONFIG_LVGL`、
-`CONFIG_ST7789V`、`CONFIG_MIPI_DBI`、`CONFIG_INPUT` 与 8 MB flash 声明仍然生效。
+`CONFIG_ST7789V`、`CONFIG_MIPI_DBI`、`CONFIG_LV_COLOR_16_SWAP` 与 8 MB flash 声明
+仍然生效。
 
 ## 3. 引脚与设备映射
 
@@ -51,7 +52,7 @@ CI 中的 `ESP32-C5 Waveshare Touch LCD 2.8` 矩阵项自动带上这两个参�
 | LCD DC | GPIO9 | `mipi_dbi.dc-gpios` |
 | LCD RST | CH32 EXIO1 | `board_io.c` |
 | LCD 背光 | CH32 PWM (0x05) | `board_backlight_set()` |
-| 触摸 SDA / SCL / INT | GPIO0 / GPIO1 / GPIO5 | `i2c0`（overlay 改 pinctrl）+ 后续 `input` 驱动 |
+| 触摸 SDA / SCL / INT | GPIO0 / GPIO1 / GPIO5 | `i2c0`（overlay 改 pinctrl）+ `linkr_touch.c` 轮询 |
 | 触摸 RST | CH32 EXIO0 | `board_touch_reset()` |
 | 功放使能 | CH32 EXIO3 | `board_pa_enable()` |
 | 电池电压 | CH32 ADC (0x06, 16-bit LE) | 未使用（本期不做电量监测） |
@@ -138,8 +139,9 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 - [x] CH32V003 板级服务、ST7789 DTS、清屏与背光代码（待硬件验证）
 - [x] **LVGL 接入**：渲染缓冲与对象堆位于 PSRAM 固定窗口，workqueue 自动驱动
       `lv_timer_handler()`，状态界面（`src/linkr_ui.c`）已可构建
-- [x] **CST3530 触摸** `input` 驱动（`src/input_cst3530.c`），含 4 字节寄存器协议
-      与 END_READ 握手
+- [x] **CST3530 触摸**（`src/linkr_touch.c`）：4 字节寄存器协议 + END_READ 握手，
+      由 **LVGL pointer 的 read 回调同步轮询**（与参考工程的
+      `esp_lcd_touch_read_data()` 调用方式一致），31 ms 读取周期与刷新同拍
 - [x] **原生外设**：SHTC3 / PCF85063A / QMI8658A 通过 Zephyr 自带驱动接入，并由
       `src/linkr_status.c` 周期（2 s）刷新到面板
 - [x] **终端视图**：`src/linkr_terminal.c` 在 UART ISR 中把字节写入受自旋锁保护的
@@ -168,7 +170,7 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 6. 若出现 PSRAM 相关 HardFault 或花屏：用 `nm` 确认 `__lvgl_psram_start`
    与 `_ext_ram_heap_end` 未重叠（见 4.1）。
 7. 确认 BLE/WiFi 功能未回归：开启 PSRAM 后必须重跑既有 BLE 回归与 24 h 压测。
-8. 触摸：点按面板时 `cst3530` 不应打印 `data read failed`；坐标换算留给后续 UI 使用。
+8. 触摸：拖动终端区时应跟手、方向一致；串口不应出现 `linkr_touch` 的读取错误。
 9. 传感器：串口不应出现 `linkr_status` 的 I2C 错误，面板第二行应显示
    `x.. y.. mg`（IMU）与首行的温湿度/时间。
 10. 终端：上电后终端区应先显示三行自检文本（`Linkr panel ready` 等），说明字体与

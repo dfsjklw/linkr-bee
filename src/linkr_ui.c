@@ -25,6 +25,7 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
 #include <lvgl_zephyr.h>
 
 #include "linkr_ui.h"
+#include "linkr_touch.h"
 
 /* Dark background with the palette used by the reference terminal UI. */
 #define UI_BG_COLOR    0x101014U
@@ -134,6 +135,43 @@ static void ui_build(void)
 	lv_obj_scroll_to_y(term_cont, LV_COORD_MAX, LV_ANIM_OFF);
 }
 
+/*
+ * LVGL polls this every refresh period, exactly like the vendor example polls
+ * esp_lcd_touch_read_data() from its indev callback: the read and the frame
+ * that consumes it stay on the same timeline, which is what makes dragging
+ * track the finger 1:1.
+ */
+static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+	uint16_t x = 0U;
+	uint16_t y = 0U;
+
+	ARG_UNUSED(indev);
+
+	if (linkr_touch_read(&x, &y)) {
+		data->point.x = (lv_coord_t)x;
+		data->point.y = (lv_coord_t)y;
+		data->state = LV_INDEV_STATE_PRESSED;
+	} else {
+		data->state = LV_INDEV_STATE_RELEASED;
+	}
+}
+
+static void ui_input_init(void)
+{
+	lv_indev_t *indev;
+
+	if (linkr_touch_init() != 0) {
+		LOG_WRN("touch input disabled");
+		return;
+	}
+
+	indev = lv_indev_create();
+	lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+	lv_indev_set_read_cb(indev, touch_read_cb);
+	lv_indev_set_display(indev, lv_display_get_default());
+}
+
 void linkr_ui_set_status(const char *line)
 {
 	if (status_label == NULL || line == NULL) {
@@ -171,7 +209,6 @@ void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
 	if (row >= LINKR_TERM_HISTORY || text == NULL) {
 		return;
 	}
-
 	line = term_lines[row];
 	if (line == NULL) {
 		return;
@@ -227,6 +264,7 @@ static int linkr_ui_init(void)
 	lvgl_lock();
 #endif
 	ui_build();
+	ui_input_init();
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
