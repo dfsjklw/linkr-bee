@@ -265,6 +265,29 @@ config LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH
 	  pairing without physical button access, e.g. for boards without a
 	  dedicated pairing button or during development.
 
+config LINKR_BLE_PAIRING_AUTH_TOUCH
+	bool "Authorize BLE pairing from the on-screen panel"
+	depends on LINKR_LCD
+	default n
+	help
+	  Add a time-limited authorization window that the operator opens by
+	  tapping PAIR on the panel. It is the touch-screen equivalent of
+	  holding the pairing GPIO: the tap proves someone is standing at the
+	  device, and a successful pairing closes the window immediately.
+
+	  Independent of LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH; when both are
+	  enabled either authorization source is accepted.
+
+config LINKR_BLE_PAIRING_WINDOW_MS
+	int "On-screen pairing authorization window (ms)"
+	depends on LINKR_BLE_PAIRING_AUTH_TOUCH
+	default 60000
+	range 5000 300000
+	help
+	  How long a tap on PAIR keeps the device pairable. Longer windows are
+	  more convenient and less safe: while the window is open any central
+	  in radio range can pair.
+
 config LINKR_BLE_BRIDGE_TEST_UART_ECHO
 	bool "Echo received UART bytes back to UART"
 	help
