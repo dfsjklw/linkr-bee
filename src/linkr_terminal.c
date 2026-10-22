@@ -303,7 +303,7 @@ static void flush_handler(struct k_work *work)
 	/* Decide before parsing: if the user scrolled up to read history, new
 	 * output must not yank the view back to the bottom.
 	 */
-	bool follow = linkr_ui_terminal_at_bottom();
+	bool follow = linkr_ui_terminal_following();
 
 	ARG_UNUSED(work);
 

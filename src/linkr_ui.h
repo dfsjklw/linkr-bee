@@ -50,6 +50,15 @@ void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color);
  */
 bool linkr_ui_terminal_at_bottom(void);
 
+/**
+ * @brief True when new output should scroll the view.
+ *
+ * Unlike linkr_ui_terminal_at_bottom() this also respects a deliberate drag:
+ * once the user scrolls away the view stays put until they come back to the
+ * bottom, even if the container's residual offset is a pixel off.
+ */
+bool linkr_ui_terminal_following(void);
+
 /** @brief Scroll the terminal view to the newest line. */
 void linkr_ui_terminal_scroll_to_bottom(void);
 

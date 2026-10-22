@@ -182,7 +182,13 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 - 标题/状态/详情用 **Consolas 14**（4 bpp 抗锯齿等宽），终端区用 **Consolas 8**
   （2 bpp，行距 10 px）。两个字面都由 `lv_font_conv` 生成并随源码提交
   （`src/fonts/lv_font_consola_1{4,8}.c`），生成命令见 `src/linkr_ui.c` 注释。
-- 终端区为 **27 行 × 44 列**，每个字符约占原来的 1/3 面积，密度接近参考终端的观感。
+- 终端区为 **22 行 × 38 列**（10 px 字体、12 px 行距），缓冲区 48 行存放在 PSRAM。
+- **自动跟随**：新输出到达时，若视口在底部（`scroll_bottom <= 8`，与参考工程一致）
+  且用户没有主动上滑，则滚动到最新行；手指上滑期间暂停跟随，滑回底部后恢复。
+  两个实现要点：
+  - 每行 label 用**一个空格**初始化：空 label 高度为 0，容器会没有滚动范围；
+  - 滚动前先 `lv_obj_update_layout()`，否则 `scroll_to_y()` 按旧布局算目标。
+  实测日志：`term: remaining=0 following=1` → `term scroll: y=311 remaining=0`。
 - 终端由 `linkr_terminal.c` 的 **VT100 解析器**驱动：
   - `ESC[…m` → 16 色调色板索引（`bold` 把 30–37 提升到亮色，所以 `ESC[01;34m`
     渲染为亮蓝，与 `ls --color` 预期一致）；

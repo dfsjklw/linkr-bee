@@ -65,6 +65,21 @@ static lv_obj_t *detail_label;
 static lv_obj_t *term_cont;
 static lv_obj_t *term_lines[LINKR_TERM_HISTORY];
 
+/* Set when the user drags the terminal view; cleared when it returns to the
+ * bottom. Programmatic scrolling does not set it (see term_scroll_cb).
+ */
+static bool user_scrolled;
+
+static void term_scroll_cb(lv_event_t *event)
+{
+	/* scroll_to_y() raises LV_EVENT_SCROLL as well; only a real finger drag
+	 * (an active pointer indev) should pause auto-follow.
+	 */
+	if (lv_indev_active() != NULL) {
+		user_scrolled = true;
+	}
+}
+
 static lv_obj_t *ui_add_label(lv_obj_t *parent, const char *text, uint32_t color,
 			      lv_align_t align, int32_t y)
 {
@@ -116,11 +131,16 @@ static void ui_build(void)
 	lv_obj_set_layout(term_cont, LV_LAYOUT_FLEX);
 	lv_obj_set_flex_flow(term_cont, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_style_pad_row(term_cont, UI_TERM_PITCH - 11, 0);
+	lv_obj_add_event_cb(term_cont, term_scroll_cb, LV_EVENT_SCROLL, NULL);
 
 	for (uint8_t row = 0U; row < LINKR_TERM_HISTORY; row++) {
 		lv_obj_t *line = lv_label_create(term_cont);
 
-		lv_label_set_text(line, "");
+		/* Seed with a space, not "": an empty label has zero height, so the
+		 * container had no scroll range until text arrived, and scroll_to_y()
+		 * kept using the stale (tiny) content height.
+		 */
+		lv_label_set_text(line, " ");
 		lv_label_set_long_mode(line, LV_LABEL_LONG_CLIP);
 		lv_obj_set_style_text_font(line, UI_TERM_FONT, 0);
 		lv_obj_set_style_text_color(line, lv_color_hex(term_palette[7]), 0);
@@ -128,10 +148,10 @@ static void ui_build(void)
 		term_lines[row] = line;
 	}
 
-	/* Start pinned to the newest line: the container is created scrolled to
-	 * the top, which used to read as "user is browsing history" and stopped
-	 * live output from ever showing up without a manual scroll.
+	/* Start pinned to the newest line. The layout must be resolved first,
+	 * otherwise the scroll target is computed from the pre-layout height.
 	 */
+	lv_obj_update_layout(scr);
 	lv_obj_scroll_to_y(term_cont, LV_COORD_MAX, LV_ANIM_OFF);
 }
 
@@ -226,7 +246,34 @@ void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
 
 bool linkr_ui_terminal_at_bottom(void)
 {
-	int32_t remaining;
+	lv_coord_t remaining;
+	bool at_bottom;
+
+	if (term_cont == NULL) {
+		return true;
+	}
+
+#if defined(CONFIG_LV_Z_LVGL_MUTEX)
+	lvgl_lock();
+#endif
+	/* Mirrors the vendor terminal, which compares against a small tolerance
+	 * instead of demanding an exact zero: the flex layout leaves a couple of
+	 * pixels of residual scroll range at the bottom, so "== 0" never matched
+	 * and live output was never followed.
+	 */
+	remaining = lv_obj_get_scroll_bottom(term_cont);
+	at_bottom = remaining <= 8;
+#if defined(CONFIG_LV_Z_LVGL_MUTEX)
+	lvgl_unlock();
+#endif
+
+	return at_bottom;
+}
+
+bool linkr_ui_terminal_following(void)
+{
+	lv_coord_t remaining;
+	bool following;
 
 	if (term_cont == NULL) {
 		return true;
@@ -236,11 +283,16 @@ bool linkr_ui_terminal_at_bottom(void)
 	lvgl_lock();
 #endif
 	remaining = lv_obj_get_scroll_bottom(term_cont);
+	if (remaining <= 8) {
+		/* Returning to the bottom resumes live follow. */
+		user_scrolled = false;
+	}
+	following = !user_scrolled;
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
 
-	return remaining <= 0;
+	return following;
 }
 
 void linkr_ui_terminal_scroll_to_bottom(void)
@@ -252,7 +304,12 @@ void linkr_ui_terminal_scroll_to_bottom(void)
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_lock();
 #endif
+	/* New text can change the label heights; resolve the layout before
+	 * scrolling or the target is computed from the previous geometry.
+	 */
+	lv_obj_update_layout(term_cont);
 	lv_obj_scroll_to_y(term_cont, LV_COORD_MAX, LV_ANIM_OFF);
+	user_scrolled = false;
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
@@ -302,6 +359,11 @@ void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
 }
 
 bool linkr_ui_terminal_at_bottom(void)
+{
+	return true;
+}
+
+bool linkr_ui_terminal_following(void)
 {
 	return true;
 }
