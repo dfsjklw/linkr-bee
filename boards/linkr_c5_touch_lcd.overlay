@@ -37,12 +37,19 @@
 			compatible = "sitronix,st7789v";
 			reg = <0>;
 
-			/* 20 MHz for now: the vendor BSP header defines
-			 * BSP_LCD_PIXEL_CLOCK_HZ as 20 MHz, and a lower clock
-			 * removes any byte-level signal-integrity doubt while
-			 * the panel init parameters are being validated.
+			/* 80 MHz, matching the vendor reference project
+			 * (14_wireless_serial_webserver sets pclk_hz = 80 MHz on
+			 * the same panel and flex cable). A full 240x320 RGB565
+			 * frame is 153600 bytes: 15.4 ms here versus 61 ms at
+			 * 20 MHz, i.e. a 65 fps ceiling instead of 16 fps.
+			 *
+			 * The earlier "40 MHz shows ghosting" note was written
+			 * while the panel init parameters were still being
+			 * validated; the reference BSP proves the link itself is
+			 * fine at 80 MHz. If ghosting or colour fringing does
+			 * appear, step down to 60, then 40 MHz.
 			 */
-			mipi-max-frequency = <DT_FREQ_M(20)>;
+			mipi-max-frequency = <DT_FREQ_M(80)>;
 
 			width = <240>;
 			height = <320>;
@@ -91,18 +98,24 @@
  */
 
 /*
- * Gesture/status buttons of the bridge (pairing, factory reset) are read
- * directly through GPIO by the application. Disable them for the input
- * subsystem: with CONFIG_INPUT=y the input-gpio-keys driver would otherwise
- * demand a zephyr,code property and take over the same pins.
+ * The shared C5 board overlay defines two gpio-keys nodes: pairing on GPIO1
+ * and factory reset on GPIO28. Nothing on this board consumes them, so the
+ * "disabled" overrides that used to sit here were removed:
+ *
+ *   - CONFIG_INPUT is off, so input-gpio-keys is not built and no driver
+ *     binds to either node; the overrides had no effect;
+ *   - the pairing key is physically unreachable here (GPIO1 is the touch
+ *     I2C clock), and pairing is authorized from the panel's PAIR button
+ *     instead (CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH);
+ *   - the factory-reset pin is read directly by main.c's GPIO code, not
+ *     through the input subsystem.
+ *
+ * The nodes themselves must stay: their linkr-pairing / linkr-factory-reset
+ * aliases are compiled unconditionally into ble_security.c and main.c.
+ *
+ * Re-enabling CONFIG_INPUT would make input-gpio-keys demand a zephyr,code
+ * property on both keys -- add one, or disable the two nodes again.
  */
-&{/linkr_pairing_keys} {
-	status = "disabled";
-};
-
-&{/linkr_factory_reset_keys} {
-	status = "disabled";
-};
 
 /*
  * Board I2C bus: SDA=GPIO0, SCL=GPIO1.
