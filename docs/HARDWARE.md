@@ -119,6 +119,7 @@ ESP32-C5 DevKitC 差异：
 - **esp32c3_supermini**（主目标，已验证）
 - esp32c3_devkitm / esp32c3_devkitc（overlay 已提供，引脚同上）
 - esp32c5_devkitc/esp32c5/hpcore（UART1 GPIO11/12，USB Serial/JTAG console，GPIO28 恢复出厂）
+- Waveshare ESP32-C5-Touch-LCD-2.8（同一 C5 目标 + `boards/linkr_c5_touch_lcd.*`，面板与触摸见 [面板文档](WAVESHARE_C5_LCD.md)）
 - **esp32_devkitc/esp32/procpu**（ESP32-WROOM-32，Xtensa 双核，已验证）
 
 ### ESP32-WROOM-32 (Xtensa) 差异
@@ -156,7 +157,9 @@ WROOM-32 的 board conf 默认设置
 作为可选输入保留。GATT 仍要求加密和绑定；未完成配对或加密失败会断开。已有
 绑定的主机使用保存的 LTK 加密重连，不需要操作 GPIO4。若需要物理授权，将该
 选项设为 `y`：GPIO4 内部上拉、低有效，新主机首次配对或替换旧密钥前必须把
-GPIO4 接到 GND。C3/C5 在各自 board conf 中显式保持 GPIO1 授权。
+GPIO4 接到 GND。C3 在 board conf 中显式保持 GPIO1 授权；C5 DevKitC 的 GPIO1
+上没有可按的按键，保持 `n`，面板构建改由屏幕上的 **PAIR** 按钮授权（见
+[Waveshare C5 LCD 面板](WAVESHARE_C5_LCD.md)）。
 
 GPIO2 是板载蓝色活动 LED，低有效，UART 收发时闪烁；`gpio-leds` 和固件的
 活动指示共用该引脚。**GPIO2 现在是输出，不能把按键或跳线接到 GND**，否则会
@@ -218,7 +221,7 @@ ESP32-WROOM-32 的 dram1 仅 96KB，需要以下限制：
   - `@d=http://host/path/` / `@d off` / `@d?`（匿名 HTTP WebDAV）
   - `@h`（help）
 - WiFi 默认启用但无线电关闭，`@w=` 后开启；凭据默认只在 RAM，只有启用 `CONFIG_LINKR_BLE_BRIDGE_PERSIST_CREDENTIALS=y` 才写入 NVS（要求 secure boot + flash encryption）
-- C3/C5 的 GPIO1 为配对授权输入，内部上拉、低有效，通过按钮或跳线接 GND；WROOM 的 GPIO4 为可选输入，默认 `PAIRING_GPIO_AUTH=n`，不需要物理按键。Management 与两个 UART 服务要求加密 BLE；绑定持久化，已绑定主机重连无需拉低配对 GPIO。配对 GPIO 不执行恢复出厂。详见 [蓝牙配对](BLE_PAIRING.md)。
+- C3 的 GPIO1 为配对授权输入，内部上拉、低有效，通过按钮或跳线接 GND；C5 DevKitC 的 GPIO1 上没有按键，默认 `PAIRING_GPIO_AUTH=n`，面板构建改由屏幕 PAIR 按钮授权；WROOM 的 GPIO4 为可选输入，默认 `PAIRING_GPIO_AUTH=n`，不需要物理按键。Management 与两个 UART 服务要求加密 BLE；绑定持久化，已绑定主机重连无需拉低配对 GPIO。配对 GPIO 不执行恢复出厂。详见 [蓝牙配对](BLE_PAIRING.md)。
 
 ## 13. 量产要点
 

@@ -2,20 +2,25 @@
 
 ## 用户操作
 
-配对授权输入因板而异，均内部上拉、低电平有效，引脚为 3.3 V 逻辑。C3/C5
-默认要求物理授权；WROOM 默认关闭，GPIO4 仅作为可选输入保留：
+配对授权输入因板而异，均内部上拉、低电平有效，引脚为 3.3 V 逻辑。C3 默认要求
+物理授权；C5 DevKitC 与 WROOM 默认关闭。C5 的 GPIO1 上没有可按的按键，面板
+构建改由屏幕上的 **PAIR** 按钮授权：
 
 | 板型 | 配对 GPIO | 当前 board conf |
 |------|-----------|-----------------|
 | ESP32-C3 DevKitC / DevKitM / Super Mini | GPIO1 | `PAIRING_GPIO_AUTH=y` |
-| ESP32-C5 DevKitC | GPIO1 | `PAIRING_GPIO_AUTH=y` |
+| ESP32-C5 DevKitC | GPIO1（板上无按键） | `PAIRING_GPIO_AUTH=n` |
+| Waveshare ESP32-C5-Touch-LCD-2.8（面板构建） | 无（屏幕 PAIR 按钮） | `PAIRING_GPIO_AUTH=n` + `PAIRING_AUTH_TOUCH=y` |
 | ESP32-WROOM-32 DevKitC | GPIO4（可选） | `PAIRING_GPIO_AUTH=n` |
+
+面板构建的 PAIR 按钮打开一个限时授权窗口（默认 60 s、配对成功后立即关闭），
+详见 [Waveshare C5 LCD 面板](WAVESHARE_C5_LCD.md)。
 
 配对 GPIO 不被默认 UART、LED 或恢复出厂功能占用（WROOM 的 GPIO13 仅在启用
 autobaud 时作按键，GPIO2 为活动 LED）。用按钮或跳线将配对 GPIO 接到 Bee 的 GND。
 
-以下步骤适用于启用授权检查的板型（C3/C5；WROOM 需先设置
-`CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`）：
+以下步骤适用于启用授权检查的板型（C3；C5 面板构建改点屏幕 PAIR，C5 DevKitC
+与 WROOM 需先设置 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`）：
 
 1. 新主机/App 首次连接前，将配对 GPIO 接地。
 2. 在客户端选择 Bee 并连接，接受操作系统配对提示。无屏设备使用
@@ -28,7 +33,7 @@ autobaud 时作按键，GPIO2 为活动 LED）。用按钮或跳线将配对 GPI
 继续，需要重新发起。新增绑定与替换旧密钥都受此门禁约束。引脚读取失败时拒绝
 配对。低电平期间附近其他主机也可申请配对，完成后及时释放。WROOM 默认关闭
 授权，因此新主机可直接配对；GATT 仍要求加密和绑定。Just Works 不提供 MITM
-身份核验。
+身份核验。C5 DevKitC 默认也关闭，面板构建改由屏幕 PAIR 按钮打开一个限时窗口。
 
 ## 客户端
 
@@ -38,8 +43,9 @@ autobaud 时作按键，GPIO2 为活动 LED）。用按钮或跳线将配对 GPI
 - Android App：连接后检查系统绑定状态；缺少绑定时调用 `createBond`，失败则
   断开连接，不继续读写串口或管理特征。
 - Python CLI：`--pair` 在 Linux 等支持的平台主动调用系统配对；macOS 在读取
-  加密特征时弹出系统配对。首次操作时，启用授权检查的板型先拉低配对 GPIO
-  （C3/C5 为 GPIO1；WROOM 默认跳过），必要时增加 `--timeout`。
+  加密特征时弹出系统配对。首次操作时，启用授权检查的板型先用跳线拉低配对 GPIO
+  或点一次面板 PAIR（C3 为 GPIO1；C5 DevKitC 与 WROOM 默认跳过），必要时增加
+  `--timeout`。
   连接或配对失败以退出码 `1` 结束（终端会话中设备断开是 `3`）；先 `--scan`
   可以确认设备是否在场（它会列出全部附近设备，包括未广播名字的）。
 - Linux C CLI：`--pair` 调用 BlueZ `Device1.Pair`。系统需有可用的 Bluetooth
@@ -75,8 +81,9 @@ Management、Reliable UART 和兼容 NUS 的特征值及 CCC 均要求加密访�
 
 ## 实机验收（构建与主机测试不能替代）
 
-下表针对启用配对授权的配置（C3/C5，或手工开启的 WROOM）。WROOM 默认
-`PAIRING_GPIO_AUTH=n`，应预期任何新主机都不需要 GPIO4 即可配对。
+下表针对启用配对授权的配置（C3，或手工开启的 C5 DevKitC / WROOM）。C5 DevKitC
+与 WROOM 默认 `PAIRING_GPIO_AUTH=n`，应预期任何新主机都不需要 GPIO 即可配对；
+面板构建则把"配对 GPIO"换成屏幕上的 PAIR 按钮。
 
 | 步骤 | 预期 |
 | --- | --- |
@@ -91,6 +98,7 @@ Management、Reliable UART 和兼容 NUS 的特征值及 CCC 均要求加密访�
 | 普通固件更新不擦设置区后重连 | 原绑定继续有效 |
 | 执行板级恢复出厂 | 全部绑定清空，配对 GPIO 高时旧主机不能重新配对 |
 
-表中“配对 GPIO”在 C3/C5 为 GPIO1；WROOM 默认关闭授权，手工启用时才是 GPIO4。
-建议覆盖 C3/C5/WROOM、Android、iOS、桌面 Chrome 与 Linux BlueZ，并在配对
+表中“配对 GPIO”在 C3 为 GPIO1，手工开启授权时 C5 DevKitC 同为 GPIO1（面板构建
+换成屏幕 PAIR 按钮），WROOM 默认关闭授权、手工启用时才是 GPIO4。建议覆盖
+C3/C5/WROOM、Android、iOS、桌面 Chrome 与 Linux BlueZ，并在配对
 期间并发 UART 流量及 WiFi 活动验证栈和内存余量。
