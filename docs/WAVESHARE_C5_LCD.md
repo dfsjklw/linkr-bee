@@ -87,6 +87,16 @@ sram0_0_seg    389648 B / 391168 B    99.61%   ← 余量约 1.5 KB
 ext_dram_seg     5312 KB / 8 MB       64.84%
 ```
 
+合并上游 main（默认启用的 watchdog + 动态 BLE 名）之后，内部 SRAM 一度只剩
+112 B（99.97%），靠下调 `ESP32_TIMER_TASK_STACK_SIZE`（4096→3072）与
+`SYSTEM_WORKQUEUE_STACK_SIZE`（3072→2560）收回约 1.5 KB：
+
+```
+FLASH         1376884 B / 8388352 B   16.41%
+sram0_0_seg    389520 B / 391168 B    99.58%   ← 余量约 1.6 KB
+ext_dram_seg     5312 KB / 8 MB       64.84%
+```
+
 > 渲染缓冲（VDB）在**内部 SRAM**，LVGL 对象堆（128 KB）在 PSRAM。两者分开是
 > 上板实测的结论，见第 7 节"渲染性能与换页耗时"。
 >

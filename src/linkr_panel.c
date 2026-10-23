@@ -231,10 +231,13 @@ static void update_uart(void)
 
 	if (!IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_UART_AUTOBAUD)) {
 		snprintf(line, sizeof(line), "%s  auto off", frame);
-	} else if (linkr_uart_autobaud_verified()) {
-		snprintf(line, sizeof(line), "%s  auto lock", frame);
-	} else {
+	} else if (linkr_uart_autobaud_running() || !linkr_uart_autobaud_verified()) {
+		/* A pass in flight reads "probe" even before it decides anything:
+		 * the follower is on-demand now, so the detector sits idle at boot
+		 * and "lock" only means the current rate has been measured. */
 		snprintf(line, sizeof(line), "%s  auto probe", frame);
+	} else {
+		snprintf(line, sizeof(line), "%s  auto lock", frame);
 	}
 	linkr_ui_set_field(LINKR_UI_FIELD_UART, line);
 }
