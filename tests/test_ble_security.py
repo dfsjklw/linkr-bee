@@ -53,6 +53,39 @@ class BleSecurityTests(unittest.TestCase):
     def test_security_and_gpio_errors_fail_closed(self):
         subprocess.run([self.binary, "fail_closed"], check=True)
 
+    def test_touch_window_is_single_use_and_time_limited(self):
+        """The panel's PAIR window authorizes on its own and closes again."""
+        binary = Path(self.tmp.name) / "security-test-touch"
+        subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall",
+                        "-Wextra", "-Werror", "-DCONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=1",
+                        "-I", self.tmp.name, str(ROOT / "tests/ble_security_harness.c"),
+                        "-o", str(binary)], check=True)
+        subprocess.run([binary, "touch_window"], check=True)
+
+    def test_panel_build_authorizes_from_the_tap_only(self):
+        """With the GPIO gate off, as in boards/linkr_c5_touch_lcd.conf."""
+        binary = Path(self.tmp.name) / "security-test-touch-only"
+        subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall",
+                        "-Wextra", "-Werror",
+                        "-DCONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=1",
+                        "-DCONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=0",
+                        "-I", self.tmp.name, str(ROOT / "tests/ble_security_harness.c"),
+                        "-o", str(binary)], check=True)
+        subprocess.run([binary, "touch_only"], check=True)
+
+    def test_touch_disabled_reports_unsupported(self):
+        """The default binary is compiled without the window, like a C3 build."""
+        subprocess.run([self.binary, "touch_absent"], check=True)
+
+    def test_touch_window_kconfig_matches_the_production_limit(self):
+        kconfig = (ROOT / "Kconfig").read_text(encoding="utf-8")
+        self.assertIn("config LINKR_BLE_PAIRING_AUTH_TOUCH", kconfig)
+        # Must stay in step with PAIRING_WINDOW_MAX_MS in src/ble_security.c,
+        # which is what linkr_ble_pairing_authorize() rejects above.
+        self.assertIn("range 5000 300000", kconfig)
+        panel = (ROOT / "boards/linkr_c5_touch_lcd.conf").read_text(encoding="utf-8")
+        self.assertIn("CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=y", panel)
+
     def test_c3_build_requires_controller_encryption(self):
         command = [*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-fsyntax-only",
                    "-DCONFIG_SOC_SERIES_ESP32C3=1", "-I", self.tmp.name,
