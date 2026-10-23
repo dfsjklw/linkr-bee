@@ -40,6 +40,9 @@ FIRMWARE_BOARDS = {
     "esp32c3-devkitm": ("esp32c3_devkitm", "esp32c3"),
     "esp32c3-devkitc": ("esp32c3_devkitc", "esp32c3"),
     "esp32c5-devkitc": ("esp32c5_devkitc/esp32c5/hpcore", "esp32c5"),
+    # Same SoC and devicetree as the devkit; the LCD build only adds the
+    # Waveshare panel conf and overlay on top (boards/linkr_c5_touch_lcd.*).
+    "esp32c5-waveshare-lcd": ("esp32c5_devkitc/esp32c5/hpcore", "esp32c5"),
     "esp32-wroom-32": ("esp32_devkitc/esp32/procpu", "esp32"),
 }
 
