@@ -8,15 +8,48 @@ the BLE transport is native.
 
 ## Touch terminal keys
 
-The terminal has a two-row accessory keyboard on phones and tablets. Keyboard,
-Esc, Tab and Shift/Ctrl/Alt stay on the left; the right side scrolls through an
-inverted-T arrow cluster, Home/End, Paste, Enter, Page Up/Down, Backspace, symbols
-and common Ctrl shortcuts. Tap a modifier before the next key; tap again to
+The accessory keyboard provides Esc, Tab, Shift/Ctrl/Alt, arrows, Home/End,
+Paste, Enter, Page Up/Down, Backspace, symbols and common Ctrl shortcuts.
+Tap a modifier before the next key; tap again to
 cancel. Modifiers reset after use or disconnect. For example, Ctrl then C sends
 an interrupt, Shift + Tab sends reverse Tab, and Alt + B moves back a word in
-shells that support it. Paste uses the clipboard when available and otherwise
-prompts you to long-press the terminal. Both rows stay above the soft keyboard
-and are shared with the Web and HarmonyOS clients.
+shells that support it. Paste uses the clipboard when available. The key strip
+stays above the soft keyboard and is shared with the Web and HarmonyOS clients.
+On compact screens, favorite keys appear first; **More** exposes the complete
+keyboard and **Choose favorite keys** saves a local selection. The keyboard entry
+and pinned Ctrl-C remain accessible. Opening the IME collapses the extra keys to
+preserve terminal space; landscape also hides the preset-command row.
+
+AI settings keep the model connection in the basic form. Protocol, extra headers,
+reasoning, token limits and pricing are under **Advanced settings** on touch and
+compact screens. The form scrolls above a separate save area; a validation error
+in a collapsed section opens it and focuses the affected field.
+
+Touch follows the phone's own selection model: drag vertically to scroll
+history, tap to open the soft keyboard, and long press to select. The word under
+the finger is selected at once and two draggable dots appear: drag a dot to move
+that edge precisely, character by character and across lines, and use the
+floating Copy pill (or the toolbar Copy button). Copy still returns the selected
+text if the WebView drops its own DOM selection during the hold, whole-transcript
+copy preserves wrapped lines and boundary spaces, and tapping either copy control
+does not close the keyboard or lose the fallback selection. The same gestures work while
+the soft keyboard is open: a long press still selects and copies, and a vertical
+drag still scrolls history without closing the keyboard. Scrolling and selection
+never open the keyboard, including the delayed focus some Android WebViews
+perform after `touchend`; any hold past the long-press threshold is always
+treated as a selection, never a keyboard-opening tap, and the WebView's own
+long-press selection is suppressed so it cannot take over the gesture. The
+keyboard button mirrors the
+IME the user actually sees, including a keyboard dismissed from Android's own
+hide button, and pressing it asks the IME to show again instead of doing nothing.
+These touch paths live in the shared web UI because WebView text selection cannot
+reach xterm's rendered rows.
+
+The native shells handle the soft keyboard locally. Opening it shrinks the
+WebView and refits the terminal rows; closing it restores the previous layout.
+They deliberately do not send `stty` to the target, so the remote tty keeps its
+size. Android in particular never runs `stty rows/cols`. The browser Web build
+still synchronizes rows and columns after login and on layout changes.
 
 ## About page
 
@@ -322,6 +355,13 @@ The output is written to `mobile/dist/`. In a normal browser the build continues
 to use Web Bluetooth. Inside Capacitor it uses
 `@capacitor-community/bluetooth-le`.
 
+The native plugin accepts one filter shape, so the app scans by the Linkr
+Management Service. That finds every current board whatever name the owner
+gave it, but an old NUS-only board (fixed `Linkr BLE UART...` name, no
+Management Service) is deliberately out of scope on native: reach it with the
+Web build in Chrome/Edge or with the desktop TUI/CLI, which can scan for both
+shapes.
+
 ## Generate native projects
 
 ```sh
@@ -362,9 +402,12 @@ The first release is intentionally foreground-only. Do not add iOS
 `bluetooth-central` background mode until disconnect/reconnect and power behavior
 have been tested on real hardware.
 
-For a new host, hold Bee GPIO1 to GND before connecting and accept OS pairing.
-Android checks the existing bond and creates one only when absent; iOS handles
-pairing on encrypted GATT reads. Existing bonds reconnect without GPIO1.
+For a new host on C3/C5, hold GPIO1 to GND before connecting and accept OS
+pairing. WROOM ships with pairing authorization disabled, so no GPIO4 press is
+needed; GPIO4 is used only when
+`CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`. Android checks the existing bond
+and creates one only when absent; iOS handles pairing on encrypted GATT reads.
+Existing bonds reconnect without the pairing GPIO.
 See [pairing and recovery](../docs/BLE_PAIRING.md) for lost keys, the eight-host
 limit, factory reset, and required real-device acceptance checks.
 

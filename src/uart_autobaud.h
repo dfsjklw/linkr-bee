@@ -11,9 +11,10 @@
 #ifndef LINKR_UART_AUTOBAUD_H_
 #define LINKR_UART_AUTOBAUD_H_
 
+#include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 #include <zephyr/sys/util.h>
 
@@ -28,6 +29,29 @@
 #define LINKR_UART_AUTOBAUD 0
 #endif
 
+/**
+ * Final state of one detection pass. The callback runs on the system
+ * workqueue after the pass has stopped, so a command handler can use it to
+ * publish an asynchronous Management Service event.
+ */
+enum linkr_uart_autobaud_result {
+	/** A confirmed different rate was programmed into the port. */
+	LINKR_UART_AUTOBAUD_APPLIED,
+	/** The line already matched the configured rate; the port was not moved. */
+	LINKR_UART_AUTOBAUD_UNCHANGED,
+	/** No measurable capture arrived before the inactivity timeout. */
+	LINKR_UART_AUTOBAUD_TIMEOUT,
+	/** The pass was cancelled with linkr_uart_autobaud_stop(). */
+	LINKR_UART_AUTOBAUD_STOPPED,
+	/** uart_configure() rejected the confirmed rate. */
+	LINKR_UART_AUTOBAUD_FAILED,
+};
+
+/** Reported once per pass; old_baud is always the rate before the pass. */
+typedef void (*linkr_uart_autobaud_callback_t)(
+	enum linkr_uart_autobaud_result result, uint32_t old_baud,
+	uint32_t new_baud);
+
 #if LINKR_UART_AUTOBAUD
 
 /*
@@ -40,8 +64,9 @@ uint32_t linkr_uart_config_frame_half_bits(void);
 int linkr_uart_config_reconfigure(uint32_t baudrate);
 
 /**
- * Arm the hardware pulse-width detector and start following the peer's line
- * rate. Must be called once, after the port has been configured.
+ * Prepare the follower without starting a pass. Must be called once, after
+ * the port has been configured. The detector and the RMT receiver stay idle
+ * until linkr_uart_autobaud_request() is called.
  *
  * @param reg_addr MMIO base of the bridge UART, as DT_REG_ADDR().
  */
@@ -50,11 +75,35 @@ void linkr_uart_autobaud_init(uintptr_t reg_addr);
 /**
  * @brief True while the current line rate is considered trustworthy.
  *
- * False means the detector is still probing and may move the port, which is
- * what the panel shows as "autobaud probing". Always false when autobaud is
- * compiled out.
+ * False while a pass is probing, and after this module applied a rate that
+ * nothing has measured yet; that is what the panel shows as "autobaud
+ * probing". Always false when autobaud is compiled out.
  */
 bool linkr_uart_autobaud_verified(void);
+
+/** Install the completion callback (optional). */
+void linkr_uart_autobaud_set_callback(linkr_uart_autobaud_callback_t callback);
+
+/**
+ * Start one detection pass. Safe to call from an ISR (the GPIO trigger does).
+ *
+ * @return 0 when the pass was accepted, -EALREADY when one is already queued
+ *         or running.
+ */
+int linkr_uart_autobaud_request(void);
+
+/**
+ * Cancel the current pass. The callback, when installed, reports STOPPED.
+ *
+ * @return 0 when a pass was running or queued, -EALREADY when idle.
+ */
+int linkr_uart_autobaud_stop(void);
+
+/** True while a pass is queued or running. */
+bool linkr_uart_autobaud_running(void);
+
+/** Inactivity timeout used by a pass, in milliseconds. */
+uint32_t linkr_uart_autobaud_timeout_ms(void);
 
 #else
 
@@ -78,6 +127,32 @@ static inline void linkr_uart_autobaud_init(uintptr_t reg_addr)
 static inline bool linkr_uart_autobaud_verified(void)
 {
 	return false;
+}
+
+static inline void linkr_uart_autobaud_set_callback(
+	linkr_uart_autobaud_callback_t callback)
+{
+	(void)callback;
+}
+
+static inline int linkr_uart_autobaud_request(void)
+{
+	return -ENOTSUP;
+}
+
+static inline int linkr_uart_autobaud_stop(void)
+{
+	return -ENOTSUP;
+}
+
+static inline bool linkr_uart_autobaud_running(void)
+{
+	return false;
+}
+
+static inline uint32_t linkr_uart_autobaud_timeout_ms(void)
+{
+	return 0;
 }
 
 #endif /* LINKR_UART_AUTOBAUD */

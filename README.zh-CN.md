@@ -48,7 +48,7 @@ Linkr Bee 让这条控制台随时可连，不用常驻一根 USB 串口线、�
 | --- | --- | --- |
 | Web 终端 | 桌面浏览器直接使用，无需安装客户端 | [使用指南](docs/USAGE.zh-CN.md) |
 | Rust CLI / TUI | 键盘操作、桌面终端、脚本与 Agent 会话 | [主机终端](tools/linkr-tui/README.md)（英文） |
-| Android / iOS App | 原生 BLE 与共享触控终端 | [移动端](mobile/README.md)（英文） |
+| Android / iOS App | 原生 BLE 与共享触控终端：拖动滚动、轻点输入、长按出现双圆点精确框选并复制 | [移动端](mobile/README.md)（英文） |
 | HarmonyOS NEXT App | 手机和平板布局、原生 BLE 宿主 | [鸿蒙客户端](harmonyos/README.md)（英文） |
 | Python / C 终端 | 现有桌面脚本与 Linux / Buildroot 集成 | [终端工具](docs/DEVELOPMENT.zh-CN.md#ble-终端) |
 
@@ -97,11 +97,15 @@ UART 一侧是 3.3 V 逻辑电平，不是 RS-232。自行设计硬件前先看
 2. 接线：交叉连接 TX/RX，并连接 GND。ESP32-C3 Super Mini 上桥接 UART 为 GPIO20 (RX)
    和 GPIO21 (TX)，其他板子见[硬件需求](docs/HARDWARE.md#3-引脚分配)。
 
-3. 给两侧上电。串口有数据时板载蓝灯闪烁。
+3. 给两侧上电。所有板子在串口收发数据时都会让板载蓝灯闪烁（WROOM 为 GPIO2）。
+   WROOM 的自动波特率按键为 GPIO13，只在
+   `CONFIG_LINKR_BLE_BRIDGE_UART_AUTOBAUD=y` 时使用（默认构建关闭）。
 
-4. 给当前主机授权：把 **GPIO1 接地**，连接并接受系统配对提示，完成后释放 GPIO1。
-   这台主机会被记住。Waveshare 面板构建上 GPIO1 是触摸 I2C 时钟，改为点屏幕上的
-   **PAIR** 按钮——它会打开一个 60 秒、一次性的配对窗口。
+4. 需要物理授权的板型，把配对 GPIO 接地（C3/C5 为 **GPIO1**），连接并接受系统
+   配对提示，完成后释放。WROOM 默认关闭配对授权，不需要按 GPIO4；如需启用，
+   打开 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`。Waveshare 面板构建上
+   GPIO1 是触摸 I2C 时钟，改为点屏幕上的 **PAIR** 按钮——它会打开一个 60 秒、
+   一次性的配对窗口。这台主机会被记住。
 
 5. 打开客户端。Web 终端：
 
@@ -130,9 +134,10 @@ UART 一侧是 3.3 V 逻辑电平，不是 RS-232。自行设计硬件前先看
 
 </details>
 
-UART 参数改完立即生效，目标机用非标准波特率启动时不用重新刷固件。终端还会在登录后和
-窗口变化时同步目标机的窗口大小，全屏程序依赖这个。如果有输出但输入没反应，先确认目标
-RX 接的是配件 TX，并且除非 CTS 和 RTS 都接了，否则关掉硬件流控。
+UART 参数改完立即生效，目标机用非标准波特率启动时不用重新刷固件。浏览器终端会在登录后
+和窗口变化时同步目标机的窗口大小，全屏程序依赖这个；原生手机 App 则只在软键盘开合时
+缩小或恢复本地画面，远端 TTY 尺寸保持不变。如果有输出但输入没反应，先确认目标 RX 接的
+是配件 TX，并且除非 CTS 和 RTS 都接了，否则关掉硬件流控。
 
 <p align="center">
   <img src="assets/screenshots/linkr-bee-terminal-mobile.jpg" alt="Linkr Bee 手机终端" width="360">
@@ -164,7 +169,9 @@ Ctrl 组合。助手根据可用空间切换为上下排列或左右分栏。
 
 ## 配对与安全
 
-- 蓝牙链路要求加密和绑定，每台新主机配对时把 **GPIO1 接地**授权一次。
+- 蓝牙链路要求加密和绑定。C3/C5 每台新主机配对时把 **GPIO1** 接地授权一次；
+  WROOM 默认关闭物理授权，不需要按 GPIO4，启用
+  `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y` 后才要求拉低 GPIO4。
 - 最多记住八台主机，重启后保留，不会自动淘汰旧主机；要加第九台，先删掉不用的或恢复
   出厂。
 - 配对使用 LE Secure Connections Just Works，没有中间人身份核验，只在能看见配件的
@@ -183,12 +190,14 @@ Ctrl 组合。助手根据可用空间切换为上下排列或左右分栏。
 | 没有输出 | 目标 TX 接了配件 RX、目标确实在输出、波特率一致 |
 | 有输出但输入没反应 | 目标 RX 接了配件 TX；除非 CTS 和 RTS 都接了，否则关掉硬件流控 |
 | 输出乱码 | UART 格式与目标一致：波特率、数据位、校验位、停止位 |
-| 没有配对提示 | 连接之前就把 GPIO1 接地 |
+| 没有配对提示 | C3/C5 在连接前把 GPIO1 接地；WROOM 默认不需要按 GPIO，除非启用了可选的配对授权 |
 | 局域网模式连不上 | 配件在 2.4 GHz 网络上、主机同网段、令牌与蓝牙通道读到的一致 |
 
 ## 已知限制
 
-- 设备按 Linkr 管理服务匹配，`Linkr BLE UART-*` 后缀任意。
+- 设备按 Linkr Management Service 匹配，不依赖广播名。默认名为
+  `Linkr Bee XXXX`，`XXXX` 是硬件 MAC 最后四位十六进制（例如
+  `58:BF:25:33:07:8C` → `078C`）；自定义名只用于显示，可用 `@n` 设置。
 - Web Bluetooth 只有 Chrome 和 Chromium 支持，Safari 和 Firefox 没有该接口。
 - WiFi 配网仅支持 2.4 GHz。
 - iOS 模拟器不支持 BLE，需要真机。

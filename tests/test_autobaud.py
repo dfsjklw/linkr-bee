@@ -45,7 +45,8 @@ class AutobaudTests(unittest.TestCase):
             "\n#endif /* LINKR_UART_AUTOBAUD */",
             ["autobaud_tick", "autobaud_reads_like_a_missing_bit",
              "autobaud_snap", "autobaud_forget", "autobaud_within_pct",
-             "linkr_uart_autobaud_init"],
+             "linkr_uart_autobaud_init", "linkr_uart_autobaud_request",
+             "linkr_uart_autobaud_stop"],
         )
         (directory / "autobaud_functions.inc").write_text(block, encoding="utf-8")
         main = (ROOT / "src/main.c").read_text(encoding="utf-8")
@@ -69,6 +70,41 @@ class AutobaudTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=5)
         return dict(line.split("=", 1)
                     for line in result.stdout.splitlines() if "=" in line)
+
+    def test_autobaud_stays_idle_until_a_pass_is_requested(self):
+        """The product default: booting must not follow anything.
+
+        A line that the automatic follower would have moved to 9600 is
+        presented for twenty windows. Without a request the tick must not
+        even poll the span, and the port must stay where it was configured.
+        """
+        result = self.run_scenario("idle")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "0")
+        self.assertEqual(result["results"], "0")
+
+    def test_a_pass_times_out_without_traffic(self):
+        """One-shot means it ends: no capture for five seconds is a timeout.
+
+        The harness consumes the request at time zero, as the firmware's
+        K_NO_WAIT start tick does. The fake clock then advances one 400 ms
+        window at a time; fifteen empty windows cross the 5 s inactivity
+        deadline and report TIMEOUT once.
+        """
+        result = self.run_scenario("timeout")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "0")
+        self.assertEqual(result["results"], "1")
+        self.assertEqual(result["result"], "2")  # TIMEOUT
+        self.assertEqual(result["result_old"], "115200")
+        self.assertEqual(result["result_new"], "115200")
+
+    def test_a_stopped_pass_reports_stopped(self):
+        result = self.run_scenario("stop")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "0")
+        self.assertEqual(result["results"], "1")
+        self.assertEqual(result["result"], "3")  # STOPPED
 
     def test_raw_captures_with_one_tick_jitter_confirm_an_odd_rate(self):
         result = self.run_scenario("raw_rmt_jitter")
@@ -126,6 +162,10 @@ class AutobaudTests(unittest.TestCase):
         self.assertEqual(result["rate"], "9600")
         self.assertEqual(result["reconfigs"], "1")
         self.assertEqual(result["last"], "9600")
+        self.assertEqual(result["results"], "1")
+        self.assertEqual(result["result"], "0")  # APPLIED
+        self.assertEqual(result["result_old"], "115200")
+        self.assertEqual(result["result_new"], "9600")
 
     def test_a_verified_link_still_follows_a_peer_that_speeds_up(self):
         """A missing single-bit run can only ever read low, never high.
@@ -137,6 +177,24 @@ class AutobaudTests(unittest.TestCase):
         self.assertEqual(result["rate"], "921600")
         self.assertEqual(result["reconfigs"], "1")
         self.assertEqual(result["last"], "921600")
+
+    def test_a_second_pass_can_undo_an_applied_divisor_rate(self):
+        """A new @a must not re-trust the rate the previous pass applied.
+
+        921600 -> 115200 is our own rate divided by eight. The first pass
+        applies 921600; the line then moves to 115200 on a busy link. A new
+        manual pass has to be allowed to follow the divisor, otherwise the
+        only way back is to wait for silence the peer may never leave.
+        """
+        result = self.run_scenario("second_pass_can_undo_applied_rate")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "2")
+        self.assertEqual(result["last"], "115200")
+        self.assertEqual(result["results"], "2")
+        self.assertEqual(result["result"], "0")  # APPLIED
+        self.assertEqual(result["result_old"], "921600")
+        self.assertEqual(result["result_new"], "115200")
+        self.assertEqual(result["verified"], "0")
 
     def test_a_verified_link_still_follows_a_slowdown_it_cannot_be_an_artifact_of(self):
         """The refusal is the shape of a missing run, not "slower" in general.
@@ -291,6 +349,33 @@ class AutobaudTests(unittest.TestCase):
         self.assertEqual(result["rate"], "115200")
         self.assertEqual(result["reconfigs"], "0")
         self.assertEqual(result["verified"], "1")
+
+    def test_a_busy_line_renews_the_inactivity_timeout(self):
+        """A capture or a low pin sample restarts the five-second clock.
+
+        The old code renewed only on a capture, so a line that never idled
+        long enough for the receiver to begin was treated as silent and the
+        pass timed out while the peer was still talking. Thirty windows are
+        twelve seconds: past the inactivity limit, but this line is not
+        inactive.
+        """
+        result = self.run_scenario("a_busy_line_renews_the_timeout")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "0")
+        self.assertEqual(result["results"], "0")
+
+    def test_a_busy_line_is_still_bounded_by_the_hard_deadline(self):
+        """Renewal must not let a permanently busy line hold the port open.
+
+        At sixty seconds the pass reports TIMEOUT and keeps the configured
+        rate; the fake clock runs to sixty-four seconds, so the deadline is
+        crossed and later ticks see an idle follower.
+        """
+        result = self.run_scenario("a_busy_line_hits_the_hard_deadline")
+        self.assertEqual(result["rate"], "115200")
+        self.assertEqual(result["reconfigs"], "0")
+        self.assertEqual(result["results"], "1")
+        self.assertEqual(result["result"], "2")  # TIMEOUT
 
 
 if __name__ == "__main__":

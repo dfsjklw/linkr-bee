@@ -2,14 +2,18 @@
 
 import { createLanTokenStore } from "./lan_token_store.js";
 import {
+  BLE_NAME_QUERY_COMMAND,
   DIAGNOSTICS_COMMAND,
   UART_QUERY_COMMAND,
   WIFI_QUERY_COMMAND,
   WEBDAV_QUERY_COMMAND,
+  bleNameCommand,
+  parseBleName,
   parseInfoGroups,
   parseUartSettings,
   parseWebdavStatus,
   parseWifiStatus,
+  printableDeviceName,
   redactCommand,
   replyStatus,
   setUartCommand,
@@ -32,6 +36,7 @@ import {
 } from "./management_protocol.js";
 import { applyInputModifiers, terminalKeySequence } from "./terminal_keys.js";
 import { subscribeTerminalInput } from "./terminal_input.js";
+import { createTerminalKeyPreferences } from "./terminal_key_preferences.js";
 import { SerialJournal } from "./serial_journal.js";
 import { createAgentPanel } from "./agent_panel.js";
 import { createAgentSettings } from "./agent_settings.js";
@@ -49,6 +54,7 @@ const terminalSessionTracker = createTerminalSessionTracker();
 const agentJournal = new SerialJournal();
 let agentPanel = null;
 let agentSettings = null;
+let terminalKeyPreferences = null;
 let aboutPage = null;
 let serialInputRevision = 0;
 let serialInputPending = false;
@@ -73,7 +79,36 @@ const MGMT_CAP_DEVICE_ID = 1 << 3;
 const MGMT_CAP_ASYNC_EVENTS = 1 << 4;
 const MGMT_CAP_RELIABLE_UART = 1 << 5;
 const BLE_MAX_ATT_VALUE = 244;
-const BLE_DEVICE_NAME_PREFIX = "Linkr BLE UART";
+const LEGACY_BLE_DEVICE_NAME_PREFIX = "Linkr BLE UART";
+/* A Linkr Bee is a device that speaks the Management Service, and that is
+ * how the picker finds one: the advertised name is a label the owner can
+ * change, so a name filter would find the factory names and nothing else.
+ * The oldest NUS-only firmware has no service to be found by and no
+ * per-device name, so its fixed name is offered as well; whether a board is
+ * one of those is decided by the service it does not have, not by its
+ * name. */
+const BLE_REQUEST_FILTERS = [
+  { services: [MGMT_SERVICE] },
+  { namePrefix: LEGACY_BLE_DEVICE_NAME_PREFIX },
+];
+
+/* Whether a failed read says the Management Service is not there, as
+ * opposed to the read being refused: a board that is not paired yet, or
+ * one whose encryption is not in place yet. The first is a legacy board
+ * whose terminal still works; the second is a pairing problem, and calling
+ * it a legacy board would hide the reason the user needs. */
+function isMissingService(error) {
+  const name = error?.name || "";
+  const text = String(error?.message || "").toLowerCase();
+  return (
+    name === "NotFoundError" ||
+    text.includes("no characteristic") ||
+    text.includes("no service") ||
+    text.includes("not found") ||
+    text.includes("unknown service")
+  );
+}
+
 const WIFI_SCAN_CMD = "@w scan";
 const WIFI_SCAN_PREFIX = "@scan ";
 const WIFI_SCAN_TIMEOUT_MS = 50000;
@@ -89,6 +124,17 @@ const isHarmonyHost =
   document.documentElement.dataset.platform === "harmonyos";
 const prefersSettingsDrawer = isHarmonyHost || coarsePointerMedia.matches;
 
+/* Native shells shrink their own WebView when the soft keyboard opens. Keep
+ * that local: a resize caused by the keyboard is a display change, not a
+ * request to reflow the remote shell. Browsers still synchronize the remote
+ * tty with stty, because their viewport is the actual terminal window. */
+function handlesTerminalGeometryLocally() {
+  const platform =
+    window.LinkrNativeBle?.platform ||
+    globalThis.Capacitor?.getPlatform?.();
+  return platform === "android" || platform === "ios" || isHarmonyHost;
+}
+
 document.documentElement.classList.toggle(
   "settings-drawer-layout",
   prefersSettingsDrawer,
@@ -103,6 +149,7 @@ const state = {
   nusReady: false,
   mgmtReady: false,
   reliableReady: false,
+  legacy: false,
   reliableTxSequence: 1,
   reliableRxSequence: 1,
   reliableRxDesync: false,
@@ -146,6 +193,9 @@ const state = {
    * reports a FINAL phase, or when the fallback poll takes over. */
   wifiOperation: null,
   wifiOperationTimer: null,
+  bleName: null,
+  bleNameCustom: null,
+  bleNameSupported: null,
   diagnostics: {},
   logSize: 0,
   terminalGeometry: null,
@@ -181,6 +231,11 @@ const elements = {
   diagUart: $("diagUart"),
   diagWifi: $("diagWifi"),
   diagUpload: $("diagUpload"),
+  bleNameInput: $("bleNameInput"),
+  bleNameSetButton: $("bleNameSetButton"),
+  bleNameDefaultButton: $("bleNameDefaultButton"),
+  bleNameQueryButton: $("bleNameQueryButton"),
+  bleNameStatus: $("bleNameStatus"),
   setUartButton: $("setUartButton"),
   clearButton: $("clearButton"),
   saveButton: $("saveButton"),
@@ -366,6 +421,22 @@ const I18N = {
     diagUpload: "Upload Queue",
     refreshDiagnostics: "Refresh diagnostics",
     diagnosticsUpdated: "Diagnostics updated",
+    bleNameTitle: "BLE device name",
+    bleNameAria: "BLE device name",
+    bleNameHint: "Shown when scanning nearby devices. 1–29 UTF-8 bytes; Chinese and emoji are allowed (an emoji usually uses 4 bytes). The Device ID used for verification does not change.",
+    bleName: "Advertised name",
+    placeholderBleName: "Linkr Bee 078C",
+    bleNameUnknown: "Connect over BLE to read the current name.",
+    bleNameDefault: "Restore default",
+    bleNameQuery: "Read name",
+    bleNameSet: "BLE name updated",
+    bleNameReset: "Default BLE name restored",
+    bleNameInvalid: "Enter 1–29 UTF-8 bytes, without control characters.",
+    bleNameUnsupported: "This firmware does not support BLE name changes.",
+    bleNameReadFailed: "Could not read the BLE name.",
+    bleNameStateDefault: "current: {name} (default)",
+    bleNameStateCustom: "current: {name} (custom)",
+    legacyHint: "Legacy firmware: Management Service not found. Terminal is available; accessory settings are disabled.",
     wifiWebdav: "WiFi & WebDAV",
     connect: "Connect",
     disconnect: "Disconnect",
@@ -549,6 +620,22 @@ const I18N = {
     diagUpload: "上传队列",
     refreshDiagnostics: "刷新诊断",
     diagnosticsUpdated: "诊断信息已更新",
+    bleNameTitle: "BLE 设备名称",
+    bleNameAria: "BLE 设备名称",
+    bleNameHint: "扫描附近设备时显示的名称，最多 29 个 UTF-8 字节，可直接使用中文和 emoji（每个 emoji 通常占 4 字节）。用于连接校验的 Device ID 不会改变。",
+    bleName: "广播名称",
+    placeholderBleName: "Linkr Bee 078C",
+    bleNameUnknown: "通过 BLE 连接后可读取当前名称。",
+    bleNameDefault: "恢复默认",
+    bleNameQuery: "读取名称",
+    bleNameSet: "BLE 名称已更新",
+    bleNameReset: "已恢复默认 BLE 名称",
+    bleNameInvalid: "请输入 1–29 个 UTF-8 字节，且不能包含控制字符。",
+    bleNameUnsupported: "当前固件不支持修改 BLE 名称。",
+    bleNameReadFailed: "读取 BLE 名称失败。",
+    bleNameStateDefault: "当前：{name}（默认）",
+    bleNameStateCustom: "当前：{name}（自定义）",
+    legacyHint: "旧固件：未发现 Management Service，仅终端功能可用，配件设置已禁用。",
     wifiWebdav: "WiFi 与 WebDAV",
     connect: "连接",
     disconnect: "断开",
@@ -1021,11 +1108,13 @@ function applyLang() {
   renderRefLists();
   refreshDynamicTexts();
   renderDiagnostics();
+  renderBleNameStatus();
   updateWifiConnectionView();
   updateFullscreenButton();
   updateModifierButtons();
   agentPanel?.refreshLang();
   agentSettings?.refreshLang();
+  terminalKeyPreferences?.refreshLang();
   aboutPage?.refreshLang();
 }
 
@@ -1067,6 +1156,9 @@ function markTerminalBusy() {
 }
 
 function scheduleTerminalGeometrySync() {
+  if (handlesTerminalGeometryLocally()) {
+    return;
+  }
   clearTerminalGeometrySyncTimer();
   const geometry = state.terminalGeometry;
   const session = state.terminalGeometrySession;
@@ -1250,6 +1342,33 @@ function initTerminal() {
   state.term.open(elements.terminalOutput);
   subscribeTerminalInput(state.term, onTerminalData);
   state.term.onResize(onTerminalResize);
+  state.term.onScroll(() => {
+    onTerminalScroll();
+    positionTerminalSelectionHandles();
+  });
+  state.term.onSelectionChange(() => {
+    if (state.term?.hasSelection()) {
+      positionTerminalSelectionHandles();
+      return;
+    }
+    // A long press can make the WebView collapse its own DOM selection, which
+    // in turn clears the xterm selection we just made. Reapply it while the
+    // gesture is fresh so the highlight and Copy keep working; user input and
+    // a new touch clear the stored endpoints first, so those never reassert.
+    if (
+      !terminalSelection.reasserting &&
+      terminalSelection.start &&
+      terminalSelection.end &&
+      performance.now() - terminalSelection.stamp < 1500
+    ) {
+      const { start, end } = terminalSelection;
+      terminalSelection.reasserting = true;
+      setTerminalSelection(start, end);
+      terminalSelection.reasserting = false;
+      return;
+    }
+    hideTerminalSelectionHandles();
+  });
   applyTerminalFont(state.fontFamily);
   fitTerminal();
 
@@ -1623,7 +1742,7 @@ function hasManagementCapability(capability) {
 }
 
 function requestDeviceState() {
-  if (!state.connected || state.mode !== "ble") {
+  if (!state.connected || state.mode !== "ble" || !state.mgmtReady) {
     return Promise.resolve();
   }
   const requests = [requestDiagnostics()];
@@ -1638,6 +1757,160 @@ function requestDeviceState() {
     requests.push(sendControl("@s?"));
   }
   return Promise.all(requests);
+}
+
+function updateBleNameControls() {
+  const enabled =
+    state.connected &&
+    state.mode === "ble" &&
+    state.mgmtReady &&
+    state.bleNameSupported !== false;
+  elements.bleNameInput.disabled = !enabled;
+  elements.bleNameSetButton.disabled = !enabled;
+  elements.bleNameDefaultButton.disabled = !enabled;
+  elements.bleNameQueryButton.disabled = !enabled;
+}
+
+function renderBleNameStatus() {
+  if (!state.connected || state.mode !== "ble") {
+    elements.bleNameStatus.textContent = t("bleNameUnknown");
+    return;
+  }
+  // A legacy NUS-only board is connected; it simply has no Management
+  // Service, so "connect over BLE" would be untrue. Say the firmware does
+  // not support renaming instead.
+  if (!state.mgmtReady || state.bleNameSupported === false) {
+    elements.bleNameStatus.textContent = t("bleNameUnsupported");
+    return;
+  }
+  if (!state.bleName) {
+    elements.bleNameStatus.textContent = t("bleNameUnknown");
+    return;
+  }
+  const key = state.bleNameCustom ? "bleNameStateCustom" : "bleNameStateDefault";
+  // A function replacement, not a string: a name containing `$&` or `$'`
+  // must not be interpreted as a replacement pattern.
+  elements.bleNameStatus.textContent = t(key).replace("{name}", () => state.bleName);
+}
+
+function applyBleName(parsed, { custom = null } = {}) {
+  state.bleName = parsed.name;
+  if (custom !== null) {
+    state.bleNameCustom = Boolean(custom);
+  } else if (parsed.custom !== null) {
+    state.bleNameCustom = parsed.custom;
+  }
+  state.bleNameSupported = true;
+  elements.bleNameInput.value = parsed.name;
+  // The board's own name is the name everything else shows. The name the
+  // picker carried is a snapshot the owner can change from another client, so
+  // a top bar that keeps it would name a board that no longer answers to it.
+  if (state.device) {
+    state.device = { ...state.device, name: parsed.name };
+    renderDeviceName();
+  }
+  updateBleNameControls();
+  renderBleNameStatus();
+}
+
+function renderDeviceName() {
+  elements.deviceName.textContent = state.mode === "ws"
+    ? state.wsHost || ""
+    : state.device
+      ? state.device.name || state.device.id
+      : "";
+}
+
+async function readBleName({ quiet = false } = {}) {
+  if (!state.connected || state.mode !== "ble" || !state.mgmtReady) {
+    return null;
+  }
+  try {
+    const reply = await sendControl(BLE_NAME_QUERY_COMMAND, {
+      returnResponse: true,
+    });
+    const parsed = parseBleName(reply, { query: true });
+    if (!parsed) {
+      state.bleName = null;
+      state.bleNameCustom = null;
+      state.bleNameSupported = false;
+      updateBleNameControls();
+      renderBleNameStatus();
+      if (!quiet) toast(t("bleNameUnsupported"), "error");
+      return null;
+    }
+    applyBleName(parsed);
+    return parsed;
+  } catch (error) {
+    // An old board answers the query with "ERR unknown command". That is not
+    // a transient read failure: the firmware simply has no rename command.
+    if (/^ERR\b/i.test(String(error.message))) {
+      state.bleName = null;
+      state.bleNameCustom = null;
+      state.bleNameSupported = false;
+      updateBleNameControls();
+      renderBleNameStatus();
+      return null;
+    }
+    if (!quiet) {
+      appendLine(`[error] ${error.message}`);
+      toast(t("bleNameReadFailed"), "error");
+    }
+    return null;
+  }
+}
+
+async function changeBleName(command, successKey, custom) {
+  const reply = await sendControl(command, { returnResponse: true });
+  const status = replyStatus(reply);
+  if (!status.ok) {
+    throw new Error(status.error || t("bleNameReadFailed"));
+  }
+  // A write's reply has no `custom=` field, so it is parsed without the
+  // suffix rule and then verified by the read below.
+  const parsed = parseBleName(reply);
+  if (!parsed) {
+    throw new Error(t("bleNameReadFailed"));
+  }
+  applyBleName(parsed, { custom });
+  // The board is asked again, so the name on screen is the one the board
+  // reports and not the one the write's own reply carried. A write's reply
+  // has no `custom=` field, and the advertisement only carries the new name
+  // once the board has started broadcasting it. A reset's MAC suffix is not
+  // predictable here, so it only has to read back; a set must read back the
+  // name we asked for.
+  const expected = command === "@n default" ? null : command.slice(3);
+  const readBack = await readBleName({ quiet: true });
+  if (!readBack || (expected !== null && readBack.name !== expected)) {
+    throw new Error(t("bleNameReadFailed"));
+  }
+  toast(t(successKey));
+}
+
+async function setNameFromInput() {
+  let command;
+  try {
+    command = bleNameCommand({ name: elements.bleNameInput.value });
+  } catch (_error) {
+    elements.bleNameStatus.textContent = t("bleNameInvalid");
+    elements.bleNameInput.focus();
+    return;
+  }
+  try {
+    await changeBleName(command, "bleNameSet", true);
+  } catch (error) {
+    elements.bleNameStatus.textContent = t("bleNameReadFailed");
+    appendLine(`[error] ${error.message}`);
+  }
+}
+
+async function restoreDefaultBleName() {
+  try {
+    await changeBleName("@n default", "bleNameReset", false);
+  } catch (error) {
+    elements.bleNameStatus.textContent = t("bleNameReadFailed");
+    appendLine(`[error] ${error.message}`);
+  }
 }
 
 function scheduleWifiStateRefresh() {
@@ -1958,21 +2231,676 @@ function setAutoScroll(value, scroll) {
   }
 }
 
-let terminalViewport = null;
-
-function onViewportScroll() {
-  // Scroll fires every frame while the log streams; re-querying the viewport (and
-  // re-resolving it after xterm re-opens) is cheaper than the three layout reads
-  // below, which must stay.
-  if (!terminalViewport || !terminalViewport.isConnected) {
-    terminalViewport = elements.terminalOutput.querySelector(".xterm-viewport");
-  }
-  const vp = terminalViewport;
-  if (!vp) {
+function onTerminalScroll() {
+  if (!state.term) {
     return;
   }
-  const atBottom = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 2;
-  setAutoScroll(atBottom, false);
+  // xterm 6 renders through .xterm-scrollable-element; .xterm-viewport is an
+  // empty legacy node whose scrollTop never changes. Follow the buffer instead.
+  const buffer = state.term.buffer.active;
+  setAutoScroll(buffer.viewportY >= buffer.baseY, false);
+}
+
+const TERMINAL_TOUCH_SLOP = 10;
+const TERMINAL_LONG_PRESS_MS = 400;
+const terminalTouch = {
+  active: false,
+  startX: 0,
+  startY: 0,
+  startTime: 0,
+  lastY: 0,
+  moved: false,
+  scrolling: false,
+  longPress: false,
+  selectionBase: null,
+  blurOnEnd: false,
+  cancelled: false,
+  suppressClick: false,
+  suppressFocusUntil: 0,
+  timer: 0,
+};
+
+// The two draggable dots and the floating Copy pill shown after a long press.
+// The endpoints are buffer cells, so the dots follow the same text the way the
+// phone's own selection handles do.
+const terminalSelection = {
+  start: null,
+  end: null,
+  // The text is snapshotted when the selection is made. Android WebViews can
+  // collapse their DOM selection during a long press, which makes xterm clear
+  // its own selection; Copy must still return what the user selected.
+  text: "",
+  stamp: 0,
+  drag: null,
+  ui: null,
+  reasserting: false,
+};
+
+function clearTerminalTouchTimer() {
+  if (terminalTouch.timer) {
+    clearTimeout(terminalTouch.timer);
+    terminalTouch.timer = 0;
+  }
+}
+
+function suppressTerminalFocus(ms = 600) {
+  terminalTouch.suppressClick = true;
+  terminalTouch.suppressFocusUntil = performance.now() + ms;
+}
+
+function releaseTerminalFocusSuppression() {
+  terminalTouch.suppressClick = false;
+  terminalTouch.suppressFocusUntil = 0;
+}
+
+function terminalFocusSuppressed() {
+  return performance.now() < terminalTouch.suppressFocusUntil;
+}
+
+function blurTerminalIfFocusSuppressed() {
+  if (terminalFocusSuppressed()) {
+    state.term?.blur();
+  }
+}
+
+function terminalCellAt(clientX, clientY) {
+  const term = state.term;
+  const screen = elements.terminalOutput.querySelector(".xterm-screen");
+  if (!term || !screen) {
+    return null;
+  }
+  const rect = screen.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  const x = Math.min(Math.max(clientX - rect.left, 0), rect.width - 1);
+  const y = Math.min(Math.max(clientY - rect.top, 0), rect.height - 1);
+  return {
+    col: Math.min(term.cols - 1, Math.floor((x / rect.width) * term.cols)),
+    row:
+      term.buffer.active.viewportY +
+      Math.min(term.rows - 1, Math.floor((y / rect.height) * term.rows)),
+    rowHeight: rect.height / term.rows,
+  };
+}
+
+function terminalCellIsWordChar(line, col) {
+  const cell = line.getCell(col);
+  if (!cell) {
+    return false;
+  }
+  // A wide character occupies two cells; the trailing cell has width zero and
+  // belongs to the same word as the character before it.
+  if (cell.getWidth() === 0) {
+    return true;
+  }
+  return Boolean(cell.getChars()) && !/\s/.test(cell.getChars());
+}
+
+function terminalWordRangeAt(cell) {
+  const term = state.term;
+  if (!term || !cell) {
+    return null;
+  }
+  const line = term.buffer.active.getLine(cell.row);
+  if (!line) {
+    return null;
+  }
+  const col = Math.min(cell.col, Math.max(0, line.length - 1));
+  if (!terminalCellIsWordChar(line, col)) {
+    return {
+      start: { row: cell.row, col },
+      end: { row: cell.row, col },
+    };
+  }
+  let start = col;
+  let end = col;
+  while (start > 0 && terminalCellIsWordChar(line, start - 1)) {
+    start -= 1;
+  }
+  while (end + 1 < line.length && terminalCellIsWordChar(line, end + 1)) {
+    end += 1;
+  }
+  return {
+    start: { row: cell.row, col: start },
+    end: { row: cell.row, col: end },
+  };
+}
+
+function terminalCellGeometry(cell) {
+  const term = state.term;
+  const screen = elements.terminalOutput.querySelector(".xterm-screen");
+  if (!term || !screen || !cell) {
+    return null;
+  }
+  const viewportRow = cell.row - term.buffer.active.viewportY;
+  if (viewportRow < 0 || viewportRow >= term.rows) {
+    return null;
+  }
+  const rect = screen.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  const cellWidth = rect.width / term.cols;
+  const cellHeight = rect.height / term.rows;
+  return {
+    left: rect.left + cell.col * cellWidth,
+    right: rect.left + Math.min(term.cols, cell.col + 1) * cellWidth,
+    top: rect.top + viewportRow * cellHeight,
+    bottom: rect.top + (viewportRow + 1) * cellHeight,
+    cellWidth,
+    cellHeight,
+    screen: rect,
+  };
+}
+
+function positionTerminalSelectionHandles() {
+  const ui = terminalSelection.ui;
+  const { start, end } = terminalSelection;
+  if (!ui || !start || !end) {
+    if (ui) {
+      ui.root.hidden = true;
+    }
+    return;
+  }
+  const startGeo = terminalCellGeometry(start);
+  const endGeo = terminalCellGeometry(end);
+  if (!startGeo || !endGeo) {
+    // The selection scrolled out of the viewport; the dots would be wrong.
+    ui.root.hidden = true;
+    return;
+  }
+  ui.root.hidden = false;
+  const vv = window.visualViewport;
+  const margin = 14;
+  const viewLeft = vv?.offsetLeft || 0;
+  const viewTop = vv?.offsetTop || 0;
+  const viewRight = viewLeft + (vv?.width || window.innerWidth);
+  const viewBottom = viewTop + (vv?.height || window.innerHeight);
+  const clampX = (x) =>
+    Math.min(viewRight - margin, Math.max(viewLeft + margin, x));
+  const clampY = (y) =>
+    Math.min(viewBottom - margin, Math.max(viewTop + margin, y));
+
+  // The start dot sits above the first selected cell and the end dot below the
+  // last one, so neither dot covers the text being selected.
+  ui.start.style.left = `${clampX(startGeo.left)}px`;
+  ui.start.style.top = `${clampY(startGeo.top - 16)}px`;
+  ui.end.style.left = `${clampX(endGeo.right)}px`;
+  ui.end.style.top = `${clampY(endGeo.bottom + 16)}px`;
+
+  const selectionTop = Math.min(startGeo.top, endGeo.top);
+  const selectionBottom = Math.max(startGeo.bottom, endGeo.bottom);
+  const copyAbove = selectionTop - viewTop > 64;
+  ui.copy.classList.toggle("terminal-selection-copy-below", !copyAbove);
+  ui.copy.style.left = `${clampX((startGeo.left + endGeo.right) / 2)}px`;
+  ui.copy.style.top = `${copyAbove ? selectionTop - 10 : selectionBottom + 10}px`;
+}
+
+function hideTerminalSelectionHandles() {
+  terminalSelection.start = null;
+  terminalSelection.end = null;
+  terminalSelection.text = "";
+  terminalSelection.stamp = 0;
+  terminalSelection.drag = null;
+  if (terminalSelection.ui) {
+    terminalSelection.ui.root.hidden = true;
+  }
+}
+
+function onSelectionHandleDown(event) {
+  const which = event.currentTarget.dataset.selectionHandle;
+  const start = terminalSelection.start;
+  const end = terminalSelection.end;
+  if (!start || !end || (which !== "start" && which !== "end")) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  const endpoint = which === "start" ? start : end;
+  const geometry = terminalCellGeometry(endpoint);
+  // The opposite endpoint stays put while this dot moves the active edge.
+  terminalSelection.drag = {
+    which,
+    fixed: which === "start" ? { ...end } : { ...start },
+    row: endpoint.row,
+    col: endpoint.col,
+    pointerX: event.clientX,
+    pointerY: event.clientY,
+    cellWidth: geometry?.cellWidth || 8,
+    cellHeight: geometry?.cellHeight || 16,
+  };
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+}
+
+function onSelectionHandleMove(event) {
+  const drag = terminalSelection.drag;
+  if (!drag) {
+    return;
+  }
+  event.preventDefault();
+  const term = state.term;
+  if (!term) {
+    return;
+  }
+  // Measure from the grabbed cell, not from the dot's pixel position: the
+  // start dot sits on the left edge and the end dot on the right edge, so an
+  // absolute lookup would jump one cell on the first move. Rounding also lets
+  // small finger jitter stay on the same character.
+  const viewportY = term.buffer.active.viewportY;
+  const rowDelta = Math.round((event.clientY - drag.pointerY) / drag.cellHeight);
+  const colDelta = Math.round((event.clientX - drag.pointerX) / drag.cellWidth);
+  const cell = {
+    row: Math.min(
+      viewportY + term.rows - 1,
+      Math.max(viewportY, drag.row + rowDelta),
+    ),
+    col: Math.min(term.cols - 1, Math.max(0, drag.col + colDelta)),
+  };
+  if (drag.which === "start") {
+    setTerminalSelection(cell, drag.fixed);
+  } else {
+    setTerminalSelection(drag.fixed, cell);
+  }
+}
+
+function onSelectionHandleUp(event) {
+  if (!terminalSelection.drag) {
+    return;
+  }
+  const handle = event.currentTarget;
+  if (handle?.releasePointerCapture && event.pointerId != null) {
+    try {
+      handle.releasePointerCapture(event.pointerId);
+    } catch (_error) {
+      // The capture was already released.
+    }
+  }
+  terminalSelection.drag = null;
+  positionTerminalSelectionHandles();
+}
+
+function ensureTerminalSelectionUi() {
+  if (terminalSelection.ui) {
+    return terminalSelection.ui;
+  }
+  const root = document.createElement("div");
+  root.className = "terminal-selection-ui";
+  root.hidden = true;
+
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "terminal-selection-copy";
+  copy.textContent = t("copy");
+  // Keep the terminal focused (and a soft keyboard open) while copying. The
+  // click still fires; only the focus stealing is suppressed.
+  copy.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  copy.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const text = terminalCopyText();
+    if (!text) {
+      toast(t("copyFailed"), "error");
+      return;
+    }
+    copyToClipboard(text).then(
+      (copied) =>
+        toast(t(copied ? "copied" : "copyFailed"), copied ? undefined : "error"),
+      () => toast(t("copyFailed"), "error"),
+    );
+  });
+
+  const handles = {};
+  for (const which of ["start", "end"]) {
+    const handle = document.createElement("span");
+    handle.className = `terminal-selection-handle terminal-selection-handle-${which}`;
+    handle.dataset.selectionHandle = which;
+    handle.setAttribute("aria-hidden", "true");
+    handle.addEventListener("pointerdown", onSelectionHandleDown);
+    handles[which] = handle;
+  }
+  root.append(copy, handles.start, handles.end);
+  document.body.append(root);
+  terminalSelection.ui = { root, copy, start: handles.start, end: handles.end };
+
+  window.addEventListener("pointermove", onSelectionHandleMove, {
+    passive: false,
+  });
+  window.addEventListener("pointerup", onSelectionHandleUp);
+  window.addEventListener("pointercancel", onSelectionHandleUp);
+  window.addEventListener("resize", positionTerminalSelectionHandles, {
+    passive: true,
+  });
+  window.visualViewport?.addEventListener(
+    "resize",
+    positionTerminalSelectionHandles,
+    { passive: true },
+  );
+  return terminalSelection.ui;
+}
+
+function setTerminalSelection(start, end) {
+  const term = state.term;
+  if (!term || !start || !end) {
+    return false;
+  }
+  let first = start;
+  let last = end;
+  if (
+    first.row > last.row ||
+    (first.row === last.row && first.col > last.col)
+  ) {
+    [first, last] = [last, first];
+  }
+  // xterm's public select() takes a linear cell count. Include the cell under
+  // the finger so dragging to a character selects that character too.
+  const length =
+    (last.row - first.row) * term.cols + (last.col - first.col) + 1;
+  term.select(first.col, first.row, length);
+  if (!term.hasSelection()) {
+    hideTerminalSelectionHandles();
+    return false;
+  }
+  terminalSelection.start = { row: first.row, col: first.col };
+  terminalSelection.end = { row: last.row, col: last.col };
+  terminalSelection.text = term.getSelection();
+  terminalSelection.stamp = performance.now();
+  ensureTerminalSelectionUi();
+  positionTerminalSelectionHandles();
+  return true;
+}
+
+function extendTerminalSelection(clientX, clientY) {
+  const cell = terminalCellAt(clientX, clientY);
+  const base = terminalTouch.selectionBase;
+  if (!cell || !base) {
+    return;
+  }
+  // Native-style extension: the long-pressed word stays selected and the drag
+  // grows the range from the word edge nearest the finger. Moving back inside
+  // the word leaves just the word selected.
+  const beforeWord =
+    cell.row < base.start.row ||
+    (cell.row === base.start.row && cell.col < base.start.col);
+  const afterWord =
+    cell.row > base.end.row ||
+    (cell.row === base.end.row && cell.col > base.end.col);
+  if (beforeWord) {
+    setTerminalSelection(cell, base.end);
+  } else if (afterWord) {
+    setTerminalSelection(base.start, cell);
+  } else {
+    setTerminalSelection(base.start, base.end);
+  }
+}
+
+function selectTerminalWordAt(clientX, clientY) {
+  const cell = terminalCellAt(clientX, clientY);
+  const range = terminalWordRangeAt(cell);
+  if (!range) {
+    return false;
+  }
+  // The word under the finger is selected at once; the drag keeps that word
+  // and extends from its edge, exactly like the phone's own selection.
+  terminalTouch.selectionBase = range;
+  return setTerminalSelection(range.start, range.end);
+}
+
+function beginTerminalLongPress(clientX, clientY) {
+  if (terminalTouch.longPress || terminalSelection.start) {
+    return true;
+  }
+  if (!selectTerminalWordAt(clientX, clientY)) {
+    return false;
+  }
+  terminalTouch.longPress = true;
+  suppressTerminalFocus();
+  navigator.vibrate?.(8);
+  return true;
+}
+
+function onTerminalTouchStart(event) {
+  if (!state.connected || !state.term || event.touches.length !== 1) {
+    return;
+  }
+  const touch = event.touches[0];
+  clearTerminalTouchTimer();
+  // Hold focus off for the whole gesture. A tap releases it in touchend, while
+  // a scroll or long press keeps it suppressed so WebView cannot flash the
+  // keyboard before we know which gesture this is.
+  suppressTerminalFocus(5000);
+  terminalTouch.active = true;
+  terminalTouch.startX = touch.clientX;
+  terminalTouch.startY = touch.clientY;
+  terminalTouch.startTime = performance.now();
+  terminalTouch.lastY = touch.clientY;
+  terminalTouch.moved = false;
+  terminalTouch.scrolling = false;
+  terminalTouch.longPress = false;
+  terminalTouch.selectionBase = null;
+  // Read the keyboard state here, not in pointerdown: some WebViews deliver
+  // only touch events. A keyboard that is already open must stay open while
+  // the user selects text or scrolls.
+  terminalTouch.blurOnEnd = !terminalHasFocus();
+  terminalTouch.cancelled = false;
+  // Drop any WebView-owned DOM selection before xterm draws its own. A later
+  // collapsed DOM selection inside the rows makes xterm clear the selection.
+  const domSelection = document.getSelection?.();
+  if (domSelection?.rangeCount) {
+    domSelection.removeAllRanges();
+  }
+  // Clear our own selection UI first: clearSelection() fires the change event,
+  // and the endpoints must already be gone so the guard does not reassert the
+  // previous selection.
+  hideTerminalSelectionHandles();
+  state.term.clearSelection();
+  terminalTouch.timer = setTimeout(() => {
+    terminalTouch.timer = 0;
+    if (!terminalTouch.active || terminalTouch.moved || terminalTouch.scrolling) {
+      return;
+    }
+    beginTerminalLongPress(terminalTouch.startX, terminalTouch.startY);
+  }, TERMINAL_LONG_PRESS_MS);
+}
+
+function onTerminalTouchMove(event) {
+  if (!terminalTouch.active) {
+    return;
+  }
+  const touch = event.touches[0];
+  if (!touch) {
+    return;
+  }
+  const dx = touch.clientX - terminalTouch.startX;
+  const dy = touch.clientY - terminalTouch.startY;
+
+  if (terminalTouch.longPress) {
+    // Native-style selection: keep the finger's cell as the moving edge. This
+    // also works while the soft keyboard is open, because the gesture never
+    // takes focus away from the terminal. Mark the gesture as consumed so a
+    // later touchcancel can never turn it back into a tap or reset the word.
+    event.preventDefault();
+    terminalTouch.moved = true;
+    extendTerminalSelection(touch.clientX, touch.clientY);
+    return;
+  }
+  if (
+    !terminalTouch.scrolling &&
+    Math.abs(dy) > TERMINAL_TOUCH_SLOP &&
+    Math.abs(dy) >= Math.abs(dx)
+  ) {
+    terminalTouch.scrolling = true;
+    suppressTerminalFocus();
+    clearTerminalTouchTimer();
+  }
+  if (terminalTouch.scrolling) {
+    // xterm 6 has no touch scrolling of its own; drive the buffer directly.
+    // The keyboard state is left alone, so history can be read with the
+    // keyboard either open or closed.
+    event.preventDefault();
+    const cell = terminalCellAt(touch.clientX, touch.clientY);
+    const rowHeight = cell?.rowHeight || 18;
+    const rows = Math.trunc((terminalTouch.lastY - touch.clientY) / rowHeight);
+    if (rows) {
+      state.term?.scrollLines(rows);
+      terminalTouch.lastY -= rows * rowHeight;
+      terminalTouch.moved = true;
+    }
+    return;
+  }
+  if (Math.abs(dx) > TERMINAL_TOUCH_SLOP || Math.abs(dy) > TERMINAL_TOUCH_SLOP) {
+    terminalTouch.moved = true;
+    clearTerminalTouchTimer();
+  }
+}
+
+function finishTerminalTouch(event) {
+  if (!terminalTouch.active) {
+    return;
+  }
+  const wasScrolling = terminalTouch.scrolling;
+  let wasLongPress = terminalTouch.longPress;
+  const wasMoved = terminalTouch.moved;
+  const wasCancelled = terminalTouch.cancelled;
+  const heldMs = performance.now() - terminalTouch.startTime;
+  const blurOnEnd = terminalTouch.blurOnEnd;
+  const startX = terminalTouch.startX;
+  const startY = terminalTouch.startY;
+  clearTerminalTouchTimer();
+  terminalTouch.active = false;
+  terminalTouch.scrolling = false;
+  terminalTouch.longPress = false;
+  terminalTouch.selectionBase = null;
+  terminalTouch.moved = false;
+  terminalTouch.blurOnEnd = false;
+  terminalTouch.cancelled = false;
+
+  // A WebView may swallow the long-press timer or send touchcancel when its
+  // own gesture detector fires. A stationary press that lasted long enough is
+  // still a selection gesture, never a tap that opens the keyboard.
+  const heldLongEnough = heldMs >= TERMINAL_LONG_PRESS_MS - 20;
+  if (!wasLongPress && !wasScrolling && !wasMoved && heldLongEnough) {
+    wasLongPress = beginTerminalLongPress(startX, startY);
+  }
+  // A selection that is already on screen proves this was a long press, even
+  // if the WebView reset the gesture state under us.
+  if (terminalSelection.start) {
+    wasLongPress = true;
+  }
+
+  if (wasScrolling || wasLongPress || wasCancelled || (heldLongEnough && !wasMoved)) {
+    // Keep the synthetic click/mousedown and any delayed WebView focus from
+    // reopening the keyboard after a scroll or selection gesture. The next
+    // touchstart releases the guard, so a deliberate tap still opens it.
+    suppressTerminalFocus(1200);
+    if (blurOnEnd) {
+      state.term?.blur();
+      for (const delay of [0, 120, 400, 800]) {
+        window.setTimeout(blurTerminalIfFocusSuppressed, delay);
+      }
+    }
+    event.preventDefault();
+    return;
+  }
+  if (!wasMoved) {
+    releaseTerminalFocusSuppression();
+    window.requestAnimationFrame(() => {
+      if (state.connected) state.term?.focus();
+    });
+  }
+}
+
+function onTerminalTouchCancel(event) {
+  // touchcancel often arrives when the WebView tries to take the gesture for
+  // its own text selection. A stationary touch becomes a selection instead of
+  // a tap, and a cancelled gesture never opens the keyboard.
+  if (!terminalTouch.active) {
+    return;
+  }
+  if (!terminalTouch.longPress && !terminalTouch.moved &&
+      !terminalTouch.scrolling && !terminalSelection.start) {
+    beginTerminalLongPress(terminalTouch.startX, terminalTouch.startY);
+  }
+  terminalTouch.cancelled = true;
+  finishTerminalTouch(event);
+}
+
+function terminalCopyText() {
+  const term = state.term;
+  if (!term) {
+    return "";
+  }
+  const selected = term.getSelection();
+  if (selected) {
+    return selected;
+  }
+  // Android may collapse its DOM selection right after a long press, which
+  // makes xterm drop the selection. The snapshot keeps Copy working.
+  if (terminalSelection.text) {
+    return terminalSelection.text;
+  }
+  const buffer = term.buffer.active;
+  const lines = [];
+  let current = "";
+  for (let i = 0; i < buffer.length; i += 1) {
+    const line = buffer.getLine(i);
+    if (!line) {
+      continue;
+    }
+    // isWrapped belongs to the continuation, not to the row it follows.
+    // Keep boundary spaces inside a wrapped line; only trim its final row.
+    const continues = buffer.getLine(i + 1)?.isWrapped;
+    current += line.translateToString(!continues);
+    if (!continues) {
+      lines.push(current);
+      current = "";
+    }
+  }
+  if (current) {
+    lines.push(current);
+  }
+  while (lines.length && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.join("\n");
+}
+
+async function copyToClipboard(text) {
+  if (!text) {
+    return false;
+  }
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      // Capacitor WebViews and non-secure origins can reject the async API.
+    }
+  }
+  // Supply the requested text through the browser's copy event. Selecting a
+  // temporary textarea would steal terminal focus and dismiss the soft IME.
+  let copied = false;
+  const onCopy = (event) => {
+    if (!event.clipboardData) {
+      return;
+    }
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    // xterm's own copy handler must not replace a snapshot or whole transcript.
+    event.stopImmediatePropagation();
+    copied = true;
+  };
+  document.addEventListener("copy", onCopy, true);
+  try {
+    return document.execCommand("copy") && copied;
+  } catch (_error) {
+    return false;
+  } finally {
+    document.removeEventListener("copy", onCopy, true);
+  }
 }
 
 let connectionInFlight = false;
@@ -2017,7 +2945,7 @@ function setConnected(connected, { preserveJournal = false } = {}) {
   const isWs = state.mode === "ws";
   const canConnect =
     Boolean(state.term) && (isWs || Boolean(bleTransport?.isAvailable()));
-  const canControl = connected && !isWs;
+  const canControl = connected && !isWs && state.mgmtReady;
   const canControlWifi = canControl && hasManagementCapability(MGMT_CAP_WIFI);
   const canMutateWifi =
     canControlWifi && hasManagementCapability(MGMT_CAP_ASYNC_EVENTS);
@@ -2046,11 +2974,7 @@ function setConnected(connected, { preserveJournal = false } = {}) {
       connected ? "connected" : "disconnected",
     );
   }
-  elements.deviceName.textContent = isWs
-    ? state.wsHost || ""
-    : state.device
-      ? state.device.name || state.device.id
-      : "";
+  renderDeviceName();
   elements.connectButton.disabled = connectionInFlight || connected || !canConnect;
   if (elements.mobileConnectBtn) {
     elements.mobileConnectBtn.disabled = connectionInFlight || (!connected && !canConnect);
@@ -2102,6 +3026,8 @@ function setConnected(connected, { preserveJournal = false } = {}) {
     .querySelectorAll("#cheatList button[data-cmd]")
     .forEach((button) => (button.disabled = !connected));
   refreshConnectionActions();
+  updateBleNameControls();
+  renderBleNameStatus();
   if (connected) {
     setAutoScroll(true, true);
     state.term?.focus();
@@ -2115,6 +3041,16 @@ function rememberDevice(device, restored = false) {
   state.device = device;
   state.deviceRestored = restored;
   saveSetting(LAST_DEVICE_ID_KEY, device.id);
+  /* The name belongs to the board that was there: an input still holding
+   * the last board's name would write it onto this one. */
+  state.bleName = null;
+  state.bleNameCustom = null;
+  state.bleNameSupported = null;
+  if (elements.bleNameInput) {
+    elements.bleNameInput.value = "";
+  }
+  updateBleNameControls();
+  renderBleNameStatus();
   setConnected(false);
 }
 
@@ -2127,14 +3063,11 @@ async function restoreAuthorizedDevice() {
     const devices = await bleTransport.getDevices(
       lastDeviceId ? [lastDeviceId] : [],
     );
-    const candidates = devices.filter(
-      (device) =>
-        device.id === lastDeviceId ||
-        (device.name && device.name.startsWith(BLE_DEVICE_NAME_PREFIX)),
-    );
-    const device =
-      candidates.find((candidate) => candidate.id === lastDeviceId) ||
-      candidates[0];
+    // The id is the only thing that identifies a board: the advertised
+    // name is a label the owner can change, so a board is restored by the
+    // id it was last seen under. Restoring by a name would pick whichever
+    // board happens to carry it and talk to the wrong one.
+    const device = devices.find((candidate) => candidate.id === lastDeviceId);
 
     if (!device) {
       return;
@@ -2146,7 +3079,7 @@ async function restoreAuthorizedDevice() {
       return;
     }
     rememberDevice(device, true);
-    appendLine(`[restore] ${device.name || device.id}`);
+    appendLine(`[restore] ${printableDeviceName(device.name, device.id)}`);
     toast(t("authorizedDeviceReady"));
   } catch (error) {
     debugLine(`[restore] ${error.message}`);
@@ -2154,7 +3087,7 @@ async function restoreAuthorizedDevice() {
 }
 
 function requestDiagnostics() {
-  if (!state.connected) {
+  if (!state.connected || state.mode !== "ble" || !state.mgmtReady) {
     return Promise.resolve();
   }
   state.diagnostics = {};
@@ -2431,6 +3364,9 @@ function onTerminalData(data, { raw = false, userInput = true } = {}) {
     return;
   }
   markTerminalBusy();
+  // Typing is an explicit end to the selection: do not keep stale handles or a
+  // stale copy snapshot around.
+  hideTerminalSelectionHandles();
   const modifiers = pendingModifiers();
   const modified = Object.values(modifiers).some(Boolean);
   if (modified) data = applyInputModifiers(data, modifiers);
@@ -2624,6 +3560,13 @@ function onDisconnected() {
   state.nusReady = false;
   state.mgmtReady = false;
   state.reliableReady = false;
+  state.legacy = false;
+  state.bleName = null;
+  state.bleNameCustom = null;
+  state.bleNameSupported = null;
+  if (elements.bleNameInput) {
+    elements.bleNameInput.value = "";
+  }
   state.reliableMaxPayload = 20;
   state.reliableWriteSize = BLE_MAX_ATT_VALUE;
   // Drop any half-received frame: the next connection restarts the sequence.
@@ -2797,6 +3740,44 @@ async function connect({ chooseDevice = false } = {}) {
   }
 }
 
+/* A pre-Management-Service board still speaks the plain Nordic UART Service.
+ * Subscribe to its notify characteristic and mark the session terminal-only:
+ * every accessory control is gated on `state.mgmtReady`, so none of them will
+ * try to send a management frame the old firmware cannot answer. */
+async function adoptLegacyNus(device) {
+  const notificationSession = {};
+  bleNotificationSession = notificationSession;
+  state.writeGeneration += 1;
+  agentPanel?.connectionChanged(false);
+  agentJournal.reset();
+  await bleTransport.startNotifications(
+    device.id,
+    NUS_SERVICE,
+    NUS_TX,
+    (value) => {
+      if (bleNotificationSession !== notificationSession) return;
+      const bytes = new Uint8Array(
+        value.buffer.slice(
+          value.byteOffset,
+          value.byteOffset + value.byteLength,
+        ),
+      );
+      handleIncomingBytes(bytes);
+    },
+  );
+  state.legacy = true;
+  state.mgmtReady = false;
+  state.reliableReady = false;
+  state.nusReady = true;
+  state.mgmtCapabilities = 0;
+  state.deviceId = "";
+  state.deviceRestored = false;
+  elements.wsTokenInput.value = lanTokens.selectDevice("");
+  setConnected(true, { preserveJournal: true });
+  appendLine(`[legacy] ${printableDeviceName(device.name, device.id)}`);
+  appendLine(t("legacyHint"));
+}
+
 async function connectOnce({ chooseDevice = false } = {}) {
   if (state.mode === "ws") {
     setConnecting(true);
@@ -2828,25 +3809,39 @@ async function connectOnce({ chooseDevice = false } = {}) {
   try {
     await bleTransport.initialize();
     if (!device) {
-      appendLine(`[scan] requesting Linkr Management v1 device`);
+      appendLine(`[scan] requesting a Linkr Bee device`);
       device = await bleTransport.requestDevice({
-        filters: [{ services: [MGMT_SERVICE] }],
+        filters: BLE_REQUEST_FILTERS,
         optionalServices: [MGMT_SERVICE, NUS_SERVICE, RELIABLE_UART_SERVICE],
       });
       rememberDevice(device);
     }
 
     appendLine(`[pairing] ${t("pairingHint")}`);
-    appendLine(`[connect] ${device.name || device.id}`);
+    appendLine(`[connect] ${printableDeviceName(device.name, device.id)}`);
     pairingAttempted = true;
     await bleTransport.connect(device.id, onDisconnected);
     transportConnected = true;
     state.nusReady = true;
-    const protocolValue = await bleTransport.read(
-      device.id,
-      MGMT_SERVICE,
-      MGMT_PROTOCOL,
-    );
+    state.legacy = false;
+    let protocolValue;
+    try {
+      protocolValue = await bleTransport.read(
+        device.id,
+        MGMT_SERVICE,
+        MGMT_PROTOCOL,
+      );
+    } catch (error) {
+      /* The oldest firmware has no Management Service, and its terminal
+       * stays usable. Which board this is, is told by the failure and not
+       * by the name: a service that is not there is a legacy board, while
+       * a read that was refused is a pairing problem on a board that
+       * promised the service. The name says neither - the owner chooses
+       * it, and can choose it for a current board too. */
+      if (!isMissingService(error)) throw error;
+      await adoptLegacyNus(device);
+      return;
+    }
     if (protocolValue.byteLength < 10 || protocolValue.getUint8(0) !== MGMT_API_MAJOR) {
       throw new Error("Unsupported Linkr Management API version");
     }
@@ -2869,14 +3864,19 @@ async function connectOnce({ chooseDevice = false } = {}) {
     if (deviceIdValue.byteLength !== 16) {
       throw new Error("Invalid Linkr Device ID length");
     }
-    state.deviceId = Array.from(
-      new Uint8Array(
-        deviceIdValue.buffer.slice(
-          deviceIdValue.byteOffset,
-          deviceIdValue.byteOffset + deviceIdValue.byteLength,
-        ),
-      ),
-      (byte) => byte.toString(16).padStart(2, "0"),
+    // Any device can advertise the Management Service UUID; the namespace is
+    // what makes the service a filter. Python and the C client check it too.
+    const deviceIdBytes = new Uint8Array(
+      deviceIdValue.buffer,
+      deviceIdValue.byteOffset,
+      deviceIdValue.byteLength,
+    );
+    const linkrNamespace = [0x4c, 0x49, 0x4e, 0x4b, 0x52, 0x42, 0x4c, 0x45, 0x01, 0x00];
+    if (!linkrNamespace.every((byte, index) => deviceIdBytes[index] === byte)) {
+      throw new Error("Device ID is not a Linkr Bee ID");
+    }
+    state.deviceId = Array.from(deviceIdBytes, (byte) =>
+      byte.toString(16).padStart(2, "0"),
     ).join("");
     elements.wsTokenInput.value = lanTokens.selectDevice(state.deviceId);
     // Notifications can arrive before startNotifications resolves. Start the
@@ -2942,6 +3942,7 @@ async function connectOnce({ chooseDevice = false } = {}) {
     requestDeviceState().catch((error) =>
       appendLine(`[error] ${error.message}`),
     );
+    readBleName({ quiet: true });
   } catch (error) {
     appendLine(`[error] ${error.message}`);
     if (pairingAttempted) {
@@ -3005,6 +4006,17 @@ async function disconnect() {
           state.device.id,
           RELIABLE_UART_SERVICE,
           RELIABLE_UART_TX,
+        );
+      } catch (_error) {
+        // Ignore disconnect races.
+      }
+    }
+    if (state.legacy && state.device) {
+      try {
+        await bleTransport.stopNotifications(
+          state.device.id,
+          NUS_SERVICE,
+          NUS_TX,
         );
       } catch (_error) {
         // Ignore disconnect races.
@@ -3132,6 +4144,26 @@ function terminalHasFocus() {
   return Boolean(active && elements.terminalOutput.contains(active));
 }
 
+function softKeyboardIsVisible() {
+  if (!terminalHasFocus()) {
+    return false;
+  }
+  // A focused hidden textarea does not mean the IME is showing: Android lets
+  // the user dismiss the keyboard with its own hide button while the textarea
+  // keeps focus. On touch devices the visual viewport is the only truth.
+  if (coarsePointerMedia.matches || isHarmonyHost) {
+    return softKeyboardLayout.active;
+  }
+  return true;
+}
+
+function syncKeyboardButtonState() {
+  elements.focusTerminalButton?.setAttribute(
+    "aria-pressed",
+    String(softKeyboardIsVisible()),
+  );
+}
+
 function syncSoftKeyboardLayout() {
   const { width, height } = viewportSize();
   if (
@@ -3178,7 +4210,11 @@ function syncSoftKeyboardLayout() {
   }
 
   softKeyboardLayout.active = active;
+  if (active) terminalKeyPreferences?.collapse();
   document.documentElement.classList.toggle("soft-keyboard-open", active);
+  // The button must follow the keyboard the user actually sees, including a
+  // keyboard dismissed from Android's own hide button.
+  syncKeyboardButtonState();
   scheduleFit();
 }
 
@@ -3272,7 +4308,7 @@ function syncSidebarAccessibility({ focusDrawer = false, restoreToggle = false }
   }
 
   if (focusDrawer && drawerOpen) {
-    requestAnimationFrame(() => elements.drawerClose.focus());
+    requestAnimationFrame(() => elements.drawerClose.focus({ preventScroll: true }));
   } else if (
     restoreToggle &&
     !drawerOpen &&
@@ -3285,6 +4321,14 @@ function syncSidebarAccessibility({ focusDrawer = false, restoreToggle = false }
 function setMobileSidebarOpen(open, { restoreFocus = true } = {}) {
   if (!usesSettingsDrawer()) {
     return;
+  }
+  if (open) {
+    // Close the IME before the drawer slides in. Otherwise the keyboard resize
+    // and the terminal refit underneath run during the slide and make it stutter.
+    state.term?.blur();
+    // The selection dots float above the terminal; they must not sit on top of
+    // the drawer.
+    hideTerminalSelectionHandles();
   }
   elements.appShell.classList.toggle("sidebar-open", open);
   syncSidebarAccessibility({
@@ -3316,6 +4360,7 @@ function toggleSidebar() {
 
 function openAgentSettings() {
   setSettingsPage("ai");
+  hideTerminalSelectionHandles();
   sidebarReturnFocus = $("agentSettingsButton");
   if (usesSettingsDrawer()) {
     setMobileSidebarOpen(true);
@@ -3430,6 +4475,22 @@ function bind() {
       .catch((error) => appendLine(`[error] ${error.message}`));
   });
 
+  elements.bleNameSetButton.addEventListener("click", () => {
+    setNameFromInput();
+  });
+  elements.bleNameDefaultButton.addEventListener("click", () => {
+    restoreDefaultBleName();
+  });
+  elements.bleNameQueryButton.addEventListener("click", () => {
+    readBleName();
+  });
+  elements.bleNameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      setNameFromInput();
+    }
+  });
+
   elements.clearButton.addEventListener("click", () => {
     clearTerminalOutput(true);
     state.logBytes = [];
@@ -3443,6 +4504,12 @@ function bind() {
 
   // Keep the terminal textarea focused when a pointer activates an accessory
   // key. Focus synchronously on click so iOS can retain/open its soft keyboard.
+  elements.terminalKeyBar.addEventListener("pointerdown", (event) => {
+    // A key press is an explicit input action. Drop the scroll/long-press
+    // focus guard before the button handlers below run.
+    releaseTerminalFocusSuppression();
+    if (event.target.closest("button")) event.preventDefault();
+  }, true);
   elements.terminalKeyBar.addEventListener("mousedown", (event) => {
     if (event.target.closest("button")) event.preventDefault();
   });
@@ -3486,12 +4553,99 @@ function bind() {
   });
 
   elements.focusTerminalButton.addEventListener("click", () => {
-    state.term?.focus();
+    releaseTerminalFocusSuppression();
+    if (softKeyboardIsVisible()) {
+      state.term?.blur();
+      elements.focusTerminalButton.setAttribute("aria-pressed", "false");
+    } else if (terminalHasFocus()) {
+      // The IME was dismissed with its own hide button while the textarea kept
+      // focus. Calling focus() again would be a no-op, so cycle the focus.
+      state.term?.blur();
+      window.setTimeout(() => {
+        state.term?.focus();
+      }, 40);
+    } else {
+      state.term?.focus();
+    }
+    syncKeyboardButtonState();
+    window.setTimeout(syncKeyboardButtonState, 350);
+  });
+  elements.terminalOutput.addEventListener("focusin", syncKeyboardButtonState);
+  elements.terminalOutput.addEventListener("focusout", () => {
+    window.requestAnimationFrame(syncKeyboardButtonState);
   });
 
-  elements.terminalOutput.addEventListener("pointerdown", () => {
-    if (state.connected) {
-      window.requestAnimationFrame(() => state.term?.focus());
+  // A scroll or long press can make Android WebView focus the hidden textarea
+  // after our touchend handler. Reject that focus until the next touch starts.
+  elements.terminalOutput.addEventListener("focusin", (event) => {
+    if (!terminalFocusSuppressed()) {
+      return;
+    }
+    event.stopPropagation();
+    if (event.target instanceof HTMLElement) {
+      event.target.blur();
+    }
+  }, true);
+  for (const type of ["mousedown", "mouseup", "click"]) {
+    elements.terminalOutput.addEventListener(type, (event) => {
+      if (!terminalTouch.suppressClick) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
+  }
+
+  elements.terminalOutput.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "touch") {
+      // xterm focuses its hidden textarea from pointerdown, which opens the
+      // keyboard before we know whether this is a scroll, long press or tap.
+      // A confirmed tap focuses after touchend instead.
+      event.stopPropagation();
+    }
+  }, true);
+  elements.terminalOutput.addEventListener("pointerdown", (event) => {
+    // Touch taps are handled after touchend, so a scroll or long press does
+    // not focus the hidden textarea and pop the keyboard open.
+    if (!state.connected || event.pointerType === "touch") {
+      return;
+    }
+    releaseTerminalFocusSuppression();
+    window.requestAnimationFrame(() => state.term?.focus());
+  });
+  elements.terminalOutput.addEventListener("touchstart", onTerminalTouchStart, {
+    passive: true,
+  });
+  elements.terminalOutput.addEventListener("touchmove", onTerminalTouchMove, {
+    passive: false,
+  });
+  elements.terminalOutput.addEventListener("touchend", finishTerminalTouch, {
+    passive: false,
+  });
+  elements.terminalOutput.addEventListener("touchcancel", onTerminalTouchCancel, {
+    passive: false,
+  });
+  elements.terminalOutput.addEventListener("contextmenu", (event) => {
+    // A long press selects text through xterm; suppress the WebView's native
+    // canvas menu, which cannot copy the DOM-rendered terminal anyway. Some
+    // WebViews swallow the touch timer and only signal the hold through this
+    // event, so use it as a backup for the selection gesture.
+    if (!coarsePointerMedia.matches && event.pointerType !== "touch") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const x = event.clientX || terminalTouch.startX;
+    const y = event.clientY || terminalTouch.startY;
+    if (beginTerminalLongPress(x, y)) {
+      suppressTerminalFocus(1200);
+    }
+  });
+  elements.terminalOutput.addEventListener("selectstart", (event) => {
+    // The WebView would start its own selection over the rendered rows and
+    // take the gesture away from the xterm selection the app drives.
+    if (coarsePointerMedia.matches) {
+      event.preventDefault();
     }
   });
 
@@ -3603,21 +4757,26 @@ function bind() {
   elements.autoscrollBtn.addEventListener("click", () => {
     setAutoScroll(!state.autoScroll, true);
   });
+  elements.copyBtn.addEventListener("pointerdown", (event) => {
+    // Copying must not blur the terminal and close the keyboard.
+    event.preventDefault();
+  });
   elements.copyBtn.addEventListener("click", () => {
     if (!state.term) {
       return;
     }
-    const sel = state.term.getSelection();
-    if (sel) {
-      if (!navigator.clipboard?.writeText) {
-        toast(t("copyFailed"), "error");
-        return;
-      }
-      navigator.clipboard.writeText(sel).then(
-        () => toast(t("copied")),
-        () => toast(t("copyFailed"), "error"),
-      );
+    // With no selection, copy the whole transcript. This is the only reliable
+    // path in a WebView where native text selection does not reach xterm's
+    // DOM renderer.
+    const text = terminalCopyText();
+    if (!text) {
+      toast(t("copyFailed"), "error");
+      return;
     }
+    copyToClipboard(text).then(
+      (copied) => toast(t(copied ? "copied" : "copyFailed"), copied ? undefined : "error"),
+      () => toast(t("copyFailed"), "error"),
+    );
   });
 
   elements.themeButton.addEventListener("click", toggleTheme);
@@ -3800,6 +4959,14 @@ function init() {
   }
   setConnected(false);
   bind();
+  // Keep the same buttons and UART listeners when changing their visual order.
+  // Storage denial must not prevent the terminal itself from starting.
+  let keyStorage;
+  try { keyStorage = localStorage; } catch { keyStorage = { getItem: () => null, setItem: () => { throw new Error("Storage unavailable"); } }; }
+  terminalKeyPreferences = createTerminalKeyPreferences({
+    bar: elements.terminalKeyBar, getLang: () => lang, storage: keyStorage,
+    onCustomize: () => { resetModifiers(); hideTerminalSelectionHandles(); state.term?.blur(); },
+  });
   agentPanel = createAgentPanel({
     button: $("agentButton"), getLang: () => lang,
     settings: agentSettings,
@@ -3855,12 +5022,6 @@ function init() {
     mobileMedia.addEventListener("change", syncSidebarForViewport);
   } else if (mobileMedia.addListener) {
     mobileMedia.addListener(syncSidebarForViewport);
-  }
-  if (state.term) {
-    const vp = elements.terminalOutput.querySelector(".xterm-viewport");
-    if (vp) {
-      vp.addEventListener("scroll", onViewportScroll, { passive: true });
-    }
   }
   appendLine(t("welcome"));
   if (state.mode === "ble") {

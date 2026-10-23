@@ -29,7 +29,7 @@ const toolCall = (name, args) => ({ type: "toolCall", id: `call-${name}`, name, 
 const toolResultText = (message) => message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
 
 function makeAgent({ accessory, stream, getStatus = () => status, sendInput = () => assert.fail("accessory tests must not write UART") }) {
-  return createSerialAgent({
+  return createSerialAgent({ toolProfile: 'full',
     config, stream, accessory,
     runLimits: { maxTurns: 8, maxTools: 16 },
     device: { mode: "auto", getStatus, readLog: () => ({ text: "", cursor: 0 }), execute: sendInput,
@@ -65,18 +65,18 @@ test("diagnostics are read without approval and reach the next model turn", asyn
     stream: fakeStream((context) => {
       if (++turns === 1) return [toolCall("get_accessory_diagnostics", {})];
       const evidence = JSON.parse(toolResultText(context.messages.at(-1)));
-      assert.equal(evidence.groups.fw.version, "0.2.0");
+      assert.equal(evidence.groups.fw.version, "0.1.2");
       assert.equal(evidence.settled, true);
       assert.equal(evidence.source, "accessory-management-channel");
-      return [{ type: "text", text: "Firmware 0.2.0 is running." }];
+      return [{ type: "text", text: "Firmware 0.1.2 is running." }];
     }),
     accessory: {
       capability: () => ({ available: true }),
       diagnostics: async ({ signal }) => {
         assert.equal(signal?.aborted, false);
         readings += 1;
-        return { settled: true, lines: ["@info fw version=0.2.0 zephyr=4.4.1"],
-          groups: { fw: { version: "0.2.0", zephyr: "4.4.1" } } };
+        return { settled: true, lines: ["@info fw version=0.1.2 zephyr=4.4.1"],
+          groups: { fw: { version: "0.1.2", zephyr: "4.4.1" } } };
       },
     },
   });

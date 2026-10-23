@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { withToolGroups } from './tool-loading.mjs';
 
 /* Phase three of the assistant: durable notes about a target, visible token
  * accounting, and a report you can hand to someone else. */
@@ -48,11 +49,11 @@ function sse({ text, tool, usage }) {
 
 async function mockModel(page, respond) {
   const bodies = [];
+  const reply=withToolGroups(request=>{bodies.push(request);return respond(bodies.length);});
   await page.route("https://agent.test/v1/chat/completions", async (route) => {
     const headers = { "access-control-allow-origin": "*", "access-control-allow-headers": "*" };
     if (route.request().method() === "OPTIONS") { await route.fulfill({ status: 204, headers }); return; }
-    bodies.push(route.request().postDataJSON());
-    await route.fulfill({ status: 200, headers, contentType: "text/event-stream", body: sse(respond(bodies.length)) });
+    await route.fulfill({ status: 200, headers, contentType: "text/event-stream", body: sse(await reply(route.request().postDataJSON())) });
   });
   return bodies;
 }
@@ -99,6 +100,7 @@ test("token use and the estimated cost are shown for the conversation", async ({
 
 test("prices are validated in the settings form and survive a reload", async ({ page }) => {
   await page.locator("#agentSettingsButton").click();
+  await page.locator("#agentAdvancedSettings > summary").click();
   await page.locator("#agentPriceInput").fill("0.27");
   await page.locator("#agentPriceOutput").fill("1.1");
   await page.locator("#agentSettingsSave").click();
@@ -109,6 +111,7 @@ test("prices are validated in the settings form and survive a reload", async ({ 
   await page.locator("#agentSettingsButton").click();
   await expect(page.locator("#agentPriceInput")).toHaveValue("0.27");
   await expect(page.locator("#agentPriceOutput")).toHaveValue("1.1");
+  await page.locator("#agentAdvancedSettings > summary").click();
   await page.locator("#agentPriceInput").fill("-1");
   await page.locator("#agentSettingsSave").click();
   await expect(page.locator("#agentSettingsStatus")).toContainText(/Prices must be numbers|单价必须是/);

@@ -21,6 +21,7 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -45,6 +46,7 @@
 #include "uart_autobaud.h"
 #include "uart_bulk_tx.h"
 #include "ws_bridge.h"
+#include "watchdog.h"
 
 LOG_MODULE_REGISTER(linkr_ble_bridge, LOG_LEVEL_INF);
 
@@ -131,7 +133,7 @@ struct bridge_packet {
 #endif
 
 static const struct device *const bridge_uart = DEVICE_DT_GET(LINKR_UART_NODE);
-#if defined(ACTIVITY_LED_NODE)
+#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
 static const struct gpio_dt_spec activity_led =
 	GPIO_DT_SPEC_GET(ACTIVITY_LED_NODE, gpios);
 static struct k_work_delayable led_off_work;
@@ -140,13 +142,25 @@ static struct k_work_delayable led_off_work;
 static const struct gpio_dt_spec factory_reset_gpio =
 	GPIO_DT_SPEC_GET(FACTORY_RESET_NODE, gpios);
 #endif
+#if LINKR_UART_AUTOBAUD && DT_HAS_ALIAS(linkr_autobaud)
+static const struct gpio_dt_spec autobaud_button =
+	GPIO_DT_SPEC_GET(DT_ALIAS(linkr_autobaud), gpios);
+static struct gpio_callback autobaud_button_cb;
+static uint32_t autobaud_button_last_ms;
+#endif
 static struct bt_conn *current_conn;
 static struct k_mutex conn_lock;
 static struct k_mutex uart_config_lock;
 static struct k_work_delayable advertise_work;
+static atomic_t advertise_refresh_req;
 static atomic_t nus_notify_enabled;
 static uint8_t linkr_identity = BT_ID_DEFAULT;
 static atomic_t wifi_scan_request_id;
+#if LINKR_UART_AUTOBAUD
+/* Request ID of the Management command that started the current autobaud
+ * pass, or 0 for a pass started by the GPIO key. */
+static atomic_t autobaud_request_id;
+#endif
 /* NUS receive callbacks run serially on the Bluetooth workqueue.  Keep the
  * command scratch buffer out of that workqueue's small thread stack: placing
  * it in handle_control_command_complete() consumed more than half of the
@@ -160,6 +174,9 @@ static struct {
 	size_t len;
 	bool release_wifi_operation;
 	bool start_wifi_scan;
+	/* The immediate response is only an acknowledgement; a final
+	 * Management event follows on the same request ID. */
+	bool async_response;
 	char data[LINKR_MGMT_MAX_PAYLOAD];
 } mgmt_capture;
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
@@ -350,6 +367,28 @@ close_area:
 }
 #endif
 
+#if LINKR_UART_AUTOBAUD && DT_HAS_ALIAS(linkr_autobaud)
+static void autobaud_button_isr(const struct device *port,
+				struct gpio_callback *cb,
+				gpio_port_pins_t pins)
+{
+	uint32_t now = k_uptime_get_32();
+
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	/* Human-scale debounce. A press is a falling edge into the active-low
+	 * input; a held key produces no further edges. */
+	if (autobaud_button_last_ms != 0 &&
+	    (int32_t)(now - autobaud_button_last_ms) < 250) {
+		return;
+	}
+	autobaud_button_last_ms = now;
+	(void)linkr_uart_autobaud_request();
+}
+#endif
+
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_DIAG_MARKER)
 struct ble_diag_marker {
 	char magic[8];
@@ -398,9 +437,296 @@ static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LINKR_MGMT_SERVICE_VAL),
 };
 
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
+/*
+ * The advertised name is dynamic on every board. The default suffix is the
+ * last four hex digits of the factory hardware MAC, while @n can replace the
+ * whole string with a persisted custom name. The name is deliberately not
+ * CONFIG_BT_DEVICE_NAME: that string is the same on every board built from
+ * this tree, which makes two units side by side indistinguishable in a scan
+ * list.
+ *
+ * A complete legacy-advertising name has at most 29 UTF-8 bytes: the scan
+ * response payload is 31 bytes and the AD length/type octets take two.
+ */
+#define BLE_NAME_MAX 29
+#define BLE_NAME_SETTINGS_KEY "linkr/ble/name"
+BUILD_ASSERT(CONFIG_BT_DEVICE_NAME_MAX >= BLE_NAME_MAX,
+	     "BT_DEVICE_NAME_MAX must fit a complete legacy advertised name");
+static char ble_name[BLE_NAME_MAX + 1];
+static bool ble_name_custom;
+static struct bt_data sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, ble_name, 0),
+};
+#define ADVERTISED_NAME ble_name
+
+static bool ble_name_valid(const char *name, size_t len)
+{
+	size_t i = 0;
+
+	if (len == 0 || len > BLE_NAME_MAX) {
+		return false;
+	}
+
+	while (i < len) {
+		uint8_t c = (uint8_t)name[i];
+		uint32_t cp;
+		size_t extra;
+
+		/* Reject C0/C1 controls, DEL, and embedded NUL bytes. */
+		if (c < 0x20 || c == 0x7f) {
+			return false;
+		}
+		if (c < 0x80) {
+			i++;
+			continue;
+		}
+
+		if ((c & 0xe0) == 0xc0) {
+			extra = 1;
+			cp = c & 0x1f;
+		} else if ((c & 0xf0) == 0xe0) {
+			extra = 2;
+			cp = c & 0x0f;
+		} else if ((c & 0xf8) == 0xf0) {
+			extra = 3;
+			cp = c & 0x07;
+		} else {
+			return false;
+		}
+		if (i + extra >= len) {
+			return false;
+		}
+		for (size_t j = 1; j <= extra; j++) {
+			uint8_t continuation = (uint8_t)name[i + j];
+
+			if ((continuation & 0xc0) != 0x80) {
+				return false;
+			}
+			cp = (cp << 6) | (continuation & 0x3f);
+		}
+
+		/* Overlongs, surrogates, out-of-range code points, and the
+		 * UTF-8-encoded C1 controls are not displayable names. */
+		if ((extra == 1 && cp < 0x80) ||
+		    (extra == 2 && cp < 0x800) ||
+		    (extra == 3 && (cp < 0x10000 || cp > 0x10ffff)) ||
+		    (cp >= 0xd800 && cp <= 0xdfff) ||
+		    (cp >= 0x80 && cp <= 0x9f) ||
+		    cp == 0x2028 || cp == 0x2029) {
+			return false;
+		}
+		i += extra + 1;
+	}
+
+	return true;
+}
+
+static void ble_name_make_default(void)
+{
+	uint8_t hardware_id[6];
+	ssize_t len;
+
+	/* The suffix comes from the factory hardware ID, not from the BLE
+	 * identity: the latter is deliberately random and stored in settings,
+	 * so using it would make the name change with a factory reset and would
+	 * not match the MAC printed on the board. */
+	len = hwinfo_get_device_id(hardware_id, sizeof(hardware_id));
+	if (len == sizeof(hardware_id)) {
+		snprintk(ble_name, sizeof(ble_name), "Linkr Bee %02X%02X",
+			 hardware_id[4], hardware_id[5]);
+	} else {
+		bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+		size_t count = ARRAY_SIZE(addrs);
+
+		bt_id_get(addrs, &count);
+		if (count > 0 && !bt_addr_le_eq(&addrs[0], BT_ADDR_LE_ANY)) {
+			/* Last resort for a controller without a hardware ID.
+			 * bt_addr_t is little-endian, so the last two octets
+			 * are printed in MAC order. */
+			const uint8_t *addr = addrs[0].a.val;
+
+			snprintk(ble_name, sizeof(ble_name),
+				 "Linkr Bee %02X%02X", addr[1], addr[0]);
+		} else {
+			snprintk(ble_name, sizeof(ble_name), "Linkr Bee");
+			LOG_WRN("BLE name: hardware address unavailable");
+		}
+	}
+	ble_name_custom = false;
+}
+
+static int ble_name_apply(const char *name)
+{
+	size_t len = strlen(name);
+	int err;
+
+	if (!ble_name_valid(name, len)) {
+		return -EINVAL;
+	}
+	err = bt_set_name(name);
+	if (err) {
+		return err;
+	}
+	memcpy(ble_name, name, len + 1);
+	sd[0].data_len = (uint8_t)len;
+	return 0;
+}
+
+static int ble_name_settings_set(const char *name, size_t len,
+				 settings_read_cb read_cb, void *cb_arg)
+{
+	const char *next;
+	ssize_t read;
+
+	if (!settings_name_steq(name, "name", &next) || (next && *next)) {
+		return -ENOENT;
+	}
+	if (len == 0 || len > BLE_NAME_MAX) {
+		LOG_WRN("Ignoring invalid stored BLE name length %u",
+			(unsigned int)len);
+		return 0;
+	}
+	read = read_cb(cb_arg, ble_name, len);
+	if (read != (ssize_t)len) {
+		LOG_WRN("Ignoring unreadable stored BLE name: %d", (int)read);
+		return 0;
+	}
+	ble_name[len] = '\0';
+	if (!ble_name_valid(ble_name, len)) {
+		LOG_WRN("Ignoring invalid stored BLE name");
+		return 0;
+	}
+	ble_name_custom = true;
+	return 0;
+}
+
+enum ble_name_persist_result {
+	BLE_NAME_PERSIST_OK = 0,
+	BLE_NAME_PERSIST_INSTALL_FAILED,
+	BLE_NAME_PERSIST_SAVE_FAILED,
+};
+
+static enum ble_name_persist_result
+ble_name_install_and_save(const char *value, size_t len, int *err)
+{
+	char previous[BLE_NAME_MAX + 1];
+	bool previous_custom = ble_name_custom;
+	size_t previous_len = strlen(ble_name);
+	int ret;
+
+	memcpy(previous, ble_name, previous_len + 1);
+	/* Install first, then persist. A stored name that the stack refused
+	 * would answer @n? with the old one and come back as the new one after
+	 * a reboot. */
+	ret = ble_name_apply(value);
+	if (ret) {
+		*err = ret;
+		return BLE_NAME_PERSIST_INSTALL_FAILED;
+	}
+	ret = settings_save_one(BLE_NAME_SETTINGS_KEY, value, len);
+	if (ret) {
+		(void)ble_name_apply(previous);
+		ble_name_custom = previous_custom;
+		*err = ret;
+		return BLE_NAME_PERSIST_SAVE_FAILED;
+	}
+	ble_name_custom = true;
+	return BLE_NAME_PERSIST_OK;
+}
+
+static enum ble_name_persist_result
+ble_name_reset_and_delete(int *err)
+{
+	char previous[BLE_NAME_MAX + 1];
+	bool previous_custom = ble_name_custom;
+	uint8_t previous_sd_len = sd[0].data_len;
+	size_t previous_len = strlen(ble_name);
+	int ret;
+
+	memcpy(previous, ble_name, previous_len + 1);
+	ble_name_make_default();
+	/* The scan response length follows the buffer here, before the name
+	 * is handed to the stack: a failure below must not leave the old
+	 * length beside the new bytes, which would advertise a truncated
+	 * name. */
+	sd[0].data_len = (uint8_t)strlen(ble_name);
+	ret = bt_set_name(ble_name);
+	if (ret) {
+		memcpy(ble_name, previous, previous_len + 1);
+		sd[0].data_len = previous_sd_len;
+		ble_name_custom = previous_custom;
+		*err = ret;
+		return BLE_NAME_PERSIST_INSTALL_FAILED;
+	}
+	/* Persist only after the name is in effect: deleting the stored name
+	 * while the install fails would make @n? report one name and the next
+	 * boot another. */
+	ret = settings_delete(BLE_NAME_SETTINGS_KEY);
+	if (ret && ret != -ENOENT) {
+		(void)bt_set_name(previous);
+		memcpy(ble_name, previous, previous_len + 1);
+		sd[0].data_len = previous_sd_len;
+		ble_name_custom = previous_custom;
+		*err = ret;
+		return BLE_NAME_PERSIST_SAVE_FAILED;
+	}
+	return BLE_NAME_PERSIST_OK;
+}
+
+enum ble_name_command {
+	BLE_NAME_COMMAND_NONE = 0,
+	BLE_NAME_COMMAND_QUERY,
+	BLE_NAME_COMMAND_RESET,
+	BLE_NAME_COMMAND_SET,
+};
+
+/* Classify an @n / @linkr name request.  Kept separate from the handler so
+ * the spelling rules (`@n default` vs `@n=default` vs `@n  default`) are
+ * testable without a Bluetooth stack. */
+static enum ble_name_command ble_name_parse_command(const char *body,
+						    const char **value)
+{
+	if (!body) {
+		return BLE_NAME_COMMAND_NONE;
+	}
+	if (!strcmp(body, "name?") || !strcmp(body, "n?") ||
+	    !strcmp(body, "name") || !strcmp(body, "n")) {
+		return BLE_NAME_COMMAND_QUERY;
+	}
+	if (!strcmp(body, "name default") || !strcmp(body, "n default")) {
+		return BLE_NAME_COMMAND_RESET;
+	}
+	if (!value) {
+		return BLE_NAME_COMMAND_NONE;
+	}
+	if (!strncmp(body, "name=", 5)) {
+		*value = body + 5;
+		return BLE_NAME_COMMAND_SET;
+	}
+	if (!strncmp(body, "n=", 2)) {
+		*value = body + 2;
+		return BLE_NAME_COMMAND_SET;
+	}
+	if (!strncmp(body, "name ", 5)) {
+		*value = body + 5;
+		return BLE_NAME_COMMAND_SET;
+	}
+	if (!strncmp(body, "n ", 2)) {
+		*value = body + 2;
+		return BLE_NAME_COMMAND_SET;
+	}
+	return BLE_NAME_COMMAND_NONE;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(linkr_ble, "linkr/ble", NULL,
+			       ble_name_settings_set, NULL, NULL);
+#else
 static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
+#define ADVERTISED_NAME DEVICE_NAME
+#endif
 
 /* Use a settings-backed random-static identity instead of the controller's
  * fixed public address. Erasing settings therefore gives a factory-reset unit
@@ -446,7 +772,33 @@ static int linkr_identity_init(void)
 	return 0;
 }
 
-#if defined(ACTIVITY_LED_NODE)
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
+static int linkr_ble_name_init(void)
+{
+	int err;
+
+	if (!ble_name_custom) {
+		ble_name_make_default();
+	}
+
+	sd[0].data_len = (uint8_t)strlen(ble_name);
+	err = bt_set_name(ble_name);
+	if (err) {
+		/* The scan response still carries the name; the GATT Device Name
+		 * characteristic would just be stale. */
+		LOG_WRN("BLE Device Name characteristic update failed: %d", err);
+	}
+	LOG_INF("BLE name: %s%s", ble_name, ble_name_custom ? " (custom)" : "");
+	return 0;
+}
+#else
+static int linkr_ble_name_init(void)
+{
+	return 0;
+}
+#endif
+
+#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
 static void led_off(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -520,7 +872,7 @@ static void uart_rx_irq_enable(void)
 #endif
 }
 
-#if defined(ACTIVITY_LED_NODE) && \
+#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay) && \
 	IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
 static void blink_activity_led(int count, int delay_ms)
 {
@@ -545,7 +897,7 @@ static void indicate_loopback_result(bool ok)
 		return;
 	}
 
-#if defined(ACTIVITY_LED_NODE)
+#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
 	blink_activity_led(3, 80);
 #endif
 }
@@ -565,7 +917,7 @@ static int advertise_start(void)
 		return err;
 	}
 
-	LOG_INF("BLE advertising as \"%s\"", DEVICE_NAME);
+	LOG_INF("BLE advertising as \"%s\"", ADVERTISED_NAME);
 	return 0;
 }
 
@@ -574,6 +926,19 @@ static void advertise_retry(struct k_work *work)
 	int err;
 
 	ARG_UNUSED(work);
+
+	if (atomic_cas(&advertise_refresh_req, 1, 0)) {
+		err = bt_le_adv_stop();
+		if (err && err != -EINVAL && err != -EALREADY) {
+			LOG_WRN("BLE advertising stop failed: %d", err);
+			/* The old scan response is still on the air.
+			 * Leaving it there would advertise a name the board
+			 * no longer answers to, so ask for another try. */
+			atomic_set(&advertise_refresh_req, 1);
+			k_work_reschedule(&advertise_work, K_MSEC(500));
+			return;
+		}
+	}
 
 	err = advertise_start();
 	if (err && err != -EALREADY) {
@@ -585,6 +950,29 @@ static void advertise_schedule(k_timeout_t delay)
 {
 	k_work_reschedule(&advertise_work, delay);
 }
+
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
+/* The scan response is copied into the controller when advertising starts, so
+ * a board that was renamed keeps broadcasting its old name until the
+ * advertising is started again. The name a scanner shows is the only place a
+ * user can tell two boards apart at a glance, and a board that answers to one
+ * name on the air and another over the management channel is worse than one
+ * that was never renamed: the user cannot tell which board they are holding.
+ *
+ * Stopping and starting the advertising does not touch the connection — Zephyr
+ * keeps a connected link up while the advertising is cycled — and the new
+ * scan response carries the name the rename just installed.
+ */
+static void ble_name_advertise_refresh(void)
+{
+	/* Serialized with the advertising work. The refresh happens on the
+	 * BT RX workqueue while advertise_work runs on the system one, and
+	 * both touch the legacy advertising API; a request flag keeps the
+	 * stop/start pair in one place. */
+	atomic_set(&advertise_refresh_req, 1);
+	advertise_schedule(K_NO_WAIT);
+}
+#endif
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -618,6 +1006,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	k_mutex_unlock(&conn_lock);
 
 	atomic_clear(&nus_notify_enabled);
+#if LINKR_UART_AUTOBAUD
+	/* A pass belongs to the client that requested it. Drop the pending
+	 * request ID so a later connection cannot receive this pass's FINAL
+	 * event under an ID it never issued. The pass itself still runs and
+	 * logs its result. */
+	atomic_set(&autobaud_request_id, 0);
+#endif
 	linkr_mgmt_disconnected(conn);
 	linkr_uart_reliable_disconnected(conn);
 	/* A scan owned by this connection must not survive it: otherwise it keeps
@@ -847,6 +1242,75 @@ static void wifi_state_event(uint32_t operation_id,
 	}
 	bt_conn_unref(conn);
 }
+
+#if LINKR_UART_AUTOBAUD
+/*
+ * Runs on the system workqueue when a pass ends. A command-started pass gets
+ * a FINAL event on the request ID that started it; a GPIO-started pass has no
+ * client and is only logged.
+ */
+static void autobaud_result_event(enum linkr_uart_autobaud_result result,
+				  uint32_t old_baud, uint32_t new_baud)
+{
+	struct bt_conn *conn;
+	uint32_t request_id = (uint32_t)atomic_get(&autobaud_request_id);
+	const char *state;
+	char payload[128];
+	uint16_t flags = LINKR_MGMT_FLAG_FINAL;
+	int err;
+	int len;
+
+	switch (result) {
+	case LINKR_UART_AUTOBAUD_APPLIED:
+		state = "applied";
+		break;
+	case LINKR_UART_AUTOBAUD_UNCHANGED:
+		state = "unchanged";
+		break;
+	case LINKR_UART_AUTOBAUD_TIMEOUT:
+		state = "timeout";
+		break;
+	case LINKR_UART_AUTOBAUD_STOPPED:
+		state = "stopped";
+		break;
+	case LINKR_UART_AUTOBAUD_FAILED:
+		state = "error";
+		flags |= LINKR_MGMT_FLAG_ERROR;
+		break;
+	default:
+		state = "error";
+		flags |= LINKR_MGMT_FLAG_ERROR;
+		break;
+	}
+
+	LOG_INF("UART autobaud result: %s (%u -> %u)", state, old_baud,
+		new_baud);
+
+	if (request_id == 0) {
+		return; /* GPIO-triggered; nothing is waiting for an event */
+	}
+	atomic_set(&autobaud_request_id, 0);
+
+	k_mutex_lock(&conn_lock, K_FOREVER);
+	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	k_mutex_unlock(&conn_lock);
+	if (!conn) {
+		return;
+	}
+
+	len = snprintk(payload, sizeof(payload),
+		       "@event autobaud state=%s old=%u new=%u\r\n", state,
+		       old_baud, new_baud);
+	if (len > 0) {
+		err = linkr_mgmt_event(conn, request_id, flags, payload,
+				       MIN(len, (int)sizeof(payload) - 1));
+		if (err) {
+			LOG_WRN("Autobaud event queue failed: %d", err);
+		}
+	}
+	bt_conn_unref(conn);
+}
+#endif /* LINKR_UART_AUTOBAUD */
 
 static char *trim_spaces(char *s)
 {
@@ -1323,7 +1787,8 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 			short_ch = 'h';
 		} else if (len >= 2 && data[0] == '@' &&
 			   (data[1] == 'i' || data[1] == 'u' || data[1] == 'w' ||
-			    data[1] == 'd' || data[1] == 's') &&
+			    data[1] == 'd' || data[1] == 's' ||
+			    data[1] == 'a' || data[1] == 'n') &&
 			   (len == 2 || data[2] == '?' ||
 			    data[2] == '=' || data[2] == ' ')) {
 			short_ch = data[1];
@@ -1354,6 +1819,12 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	if (!strcmp(body, "help") || !strcmp(body, "h")) {
 		(void)send_control_response(conn,
 					    "OK cmds: @i? @u?|@u=baud,data,par,stop,flow "
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
+					    "@n?|@n=<name>|@n default "
+#endif
+#if LINKR_UART_AUTOBAUD
+					    "@a?|@a|@a stop "
+#endif
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
 					    "@w?|@w=ssid,pass|@w off|@w scan "
 #endif
@@ -1372,6 +1843,122 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		diagnostics_response(conn);
 		return true;
 	}
+
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
+	/* ---- BLE advertised name (@n / @linkr name) ---- */
+	{
+		const char *value = NULL;
+		enum ble_name_command command =
+			ble_name_parse_command(body, &value);
+
+		if (command == BLE_NAME_COMMAND_QUERY) {
+			(void)send_control_response(
+				conn, "OK name=%s custom=%s\r\n", ble_name,
+				ble_name_custom ? "yes" : "no");
+			return true;
+		}
+		if (command == BLE_NAME_COMMAND_RESET) {
+			enum ble_name_persist_result result;
+
+			result = ble_name_reset_and_delete(&err);
+			if (result != BLE_NAME_PERSIST_OK) {
+				(void)send_control_response(
+					conn,
+					result == BLE_NAME_PERSIST_SAVE_FAILED ?
+						"ERR name save=%d\r\n" :
+						"ERR name=%d\r\n",
+					err);
+				return true;
+			}
+			ble_name_advertise_refresh();
+			(void)send_control_response(conn, "OK name=%s\r\n",
+						    ble_name);
+			return true;
+		}
+		if (command == BLE_NAME_COMMAND_SET && value) {
+			enum ble_name_persist_result result;
+			size_t len;
+
+			value = trim_spaces((char *)value);
+			len = strlen(value);
+			if (!ble_name_valid(value, len)) {
+				(void)send_control_response(
+					conn,
+					"ERR name expected 1-%d UTF-8 bytes without controls\r\n",
+					BLE_NAME_MAX);
+				return true;
+			}
+			result = ble_name_install_and_save(value, len, &err);
+			if (result != BLE_NAME_PERSIST_OK) {
+				(void)send_control_response(
+					conn,
+					result == BLE_NAME_PERSIST_SAVE_FAILED ?
+						"ERR name save=%d\r\n" :
+						"ERR name=%d\r\n",
+					err);
+				return true;
+			}
+			ble_name_advertise_refresh();
+			(void)send_control_response(conn, "OK name=%s\r\n",
+						    ble_name);
+			return true;
+		}
+	}
+#endif /* CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC */
+
+#if LINKR_UART_AUTOBAUD
+	/* ---- Manual autobaud (@a / @linkr autobaud) ---- */
+	if (!strcmp(body, "autobaud?") || !strcmp(body, "a?")) {
+		(void)send_control_response(
+			conn, "OK autobaud state=%s baud=%u timeout_ms=%u\r\n",
+			linkr_uart_autobaud_running() ? "running" : "idle",
+			linkr_uart_config_current(),
+			linkr_uart_autobaud_timeout_ms());
+		return true;
+	}
+	if (!strcmp(body, "autobaud") || !strcmp(body, "a") ||
+	    !strcmp(body, "autobaud start") || !strcmp(body, "a start")) {
+		uint32_t request_id = mgmt_capture.active ?
+					      mgmt_capture.request_id : 0;
+		int ret;
+
+		if (linkr_uart_autobaud_running()) {
+			(void)send_control_response(conn,
+						    "ERR autobaud busy\r\n");
+			return true;
+		}
+		/* Set the ID before the request: the workqueue may start the
+		 * pass immediately. It is cleared again if the request loses a
+		 * race with the GPIO key. */
+		atomic_set(&autobaud_request_id, request_id);
+		ret = linkr_uart_autobaud_request();
+		if (ret) {
+			atomic_set(&autobaud_request_id, 0);
+			(void)send_control_response(conn,
+						    "ERR autobaud busy\r\n");
+			return true;
+		}
+		mgmt_capture.async_response = true;
+		(void)send_control_response(
+			conn,
+			"OK autobaud state=running baud=%u timeout_ms=%u\r\n",
+			linkr_uart_config_current(),
+			linkr_uart_autobaud_timeout_ms());
+		return true;
+	}
+	if (!strcmp(body, "autobaud stop") || !strcmp(body, "a stop")) {
+		if (linkr_uart_autobaud_stop()) {
+			(void)send_control_response(conn,
+						    "ERR autobaud idle\r\n");
+			return true;
+		}
+		/* The pass's own FINAL event follows on its request ID; this
+		 * response only confirms the stop was accepted. */
+		(void)send_control_response(conn,
+					    "OK autobaud state=stopping\r\n");
+		return true;
+	}
+#endif /* LINKR_UART_AUTOBAUD */
 
 	/* ---- UART (@u / @linkr uart) ---- */
 	if (!strcmp(body, "uart?") || !strcmp(body, "u?")) {
@@ -1635,6 +2222,11 @@ static void mgmt_request_received(struct bt_conn *conn, uint32_t request_id,
 	if (!strncmp(mgmt_capture.data, "ERR ", 4)) {
 		flags |= LINKR_MGMT_FLAG_ERROR;
 	}
+	if (mgmt_capture.async_response) {
+		/* The command accepted work that will report its result as a
+		 * separate FINAL event on the same operation ID. */
+		flags &= ~LINKR_MGMT_FLAG_FINAL;
+	}
 	err = linkr_mgmt_respond(conn, request_id, flags, mgmt_capture.data,
 				mgmt_capture.len);
 	if (err) {
@@ -1780,7 +2372,10 @@ static void ble_to_uart_thread(void)
 	k_sem_take(&bridge_start_sem, K_FOREVER);
 
 	for (;;) {
-		k_msgq_get(&ble_to_uart_queue, &packet, K_FOREVER);
+		linkr_watchdog_feed(LINKR_WDT_UART_TX);
+		if (k_msgq_get(&ble_to_uart_queue, &packet, K_SECONDS(1)) != 0) {
+			continue;
+		}
 
 #if LINKR_UART_BULK_TX
 		/*
@@ -1937,7 +2532,8 @@ static void uart_to_ble_thread(void)
 	k_sem_take(&bridge_start_sem, K_FOREVER);
 	LOG_INF("UART-to-BLE RX thread disabled during loopback verify");
 	for (;;) {
-		k_sleep(K_SECONDS(60));
+		linkr_watchdog_feed(LINKR_WDT_UART_RX);
+		k_sleep(K_SECONDS(1));
 	}
 #else
 	uint8_t buf[UART_RX_CHUNK];
@@ -1951,6 +2547,8 @@ static void uart_to_ble_thread(void)
 		uint32_t dropped;
 		uint32_t got;
 		unsigned int key;
+
+		linkr_watchdog_feed(LINKR_WDT_UART_RX);
 
 		dropped = atomic_set(&uart_rx_dropped, 0);
 		if (dropped) {
@@ -2160,14 +2758,48 @@ int main(void)
 	}
 
 	/* After the port, as uart_autobaud.h's contract says ("Must be called
-	 * once, after the port has been configured"). Arming first meant the
-	 * detector was already counting against a port nobody had programmed
-	 * yet, and a boot whose configure failed still armed a follower that
-	 * would later reprogram the port on its own. The first window is only
-	 * meaningful once there is a rate to measure against. */
+	 * once, after the port has been configured"). Initialising only
+	 * records the UART base and leaves the detector idle: it does not arm
+	 * the RMT receiver or schedule a window here. The first pass starts
+	 * later, from @a or the trigger input, against a port that is already
+	 * programmed. */
 	linkr_uart_autobaud_init(DT_REG_ADDR(LINKR_UART_NODE));
+#if LINKR_UART_AUTOBAUD
+	linkr_uart_autobaud_set_callback(autobaud_result_event);
+#endif
 
-#if defined(ACTIVITY_LED_NODE)
+#if LINKR_UART_AUTOBAUD && DT_HAS_ALIAS(linkr_autobaud)
+	if (!device_is_ready(autobaud_button.port)) {
+		LOG_WRN("Autobaud trigger GPIO is not ready");
+	} else {
+		err = gpio_pin_configure_dt(&autobaud_button, GPIO_INPUT);
+		if (err) {
+			LOG_WRN("Autobaud trigger configuration failed: %d", err);
+		} else {
+			gpio_init_callback(&autobaud_button_cb,
+					   autobaud_button_isr,
+					   BIT(autobaud_button.pin));
+			err = gpio_add_callback(autobaud_button.port,
+						&autobaud_button_cb);
+			if (err) {
+				LOG_WRN("Autobaud trigger callback failed: %d",
+					err);
+			} else {
+				err = gpio_pin_interrupt_configure_dt(
+					&autobaud_button, GPIO_INT_EDGE_TO_ACTIVE);
+				if (err) {
+					LOG_WRN("Autobaud trigger interrupt "
+						"failed: %d", err);
+				} else {
+					LOG_INF("UART autobaud trigger: GPIO%u "
+						"(active low)", autobaud_button.pin);
+				}
+			}
+		}
+	}
+#endif
+
+#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
 	if (!device_is_ready(activity_led.port)) {
 		LOG_ERR("Activity LED device is not ready");
 		return -ENODEV;
@@ -2193,6 +2825,7 @@ int main(void)
 	k_sem_give(&bridge_start_sem);
 	LOG_INF("Linkr UART loopback verify ready on %s", bridge_uart->name);
 	printk("Linkr UART loopback verify ready on %s\n", bridge_uart->name);
+	linkr_watchdog_boot_complete();
 	return 0;
 #endif
 
@@ -2236,6 +2869,8 @@ int main(void)
 		return err;
 	}
 
+	(void)linkr_ble_name_init();
+
 	err = linkr_mgmt_init(mgmt_request_received);
 	if (err) {
 		LOG_ERR("Management Service init failed: %d", err);
@@ -2274,6 +2909,7 @@ int main(void)
 	k_sem_give(&bridge_start_sem);
 #endif
 	LOG_INF("Linkr Bee UART bridge ready on %s", bridge_uart->name);
+	linkr_watchdog_boot_complete();
 
 	return 0;
 }
