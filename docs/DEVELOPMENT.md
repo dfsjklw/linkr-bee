@@ -1148,7 +1148,17 @@ firmware was restored without injection hooks, its bytes matched flash readback,
 and encrypted BLE diagnostics succeeded after more than 75 s of stable operation.
 BLE identity, bond keys, and the bound target record retained their original
 values; GATT cache metadata and new default settings were updated normally.
-C5 and WROOM reset behaviour still require physical verification.
+
+C5 hardware recovery is verified on the devkit. With a temporary hook that
+blocked the system workqueue 15 s after boot, the hardware watchdog reset the
+chip after about 13 s — the ROM reported `rst:0x7 (TG0_WDT_HPSYS)` and
+`PRO CPU has been reset by WDT`, and the application logged reset cause
+`0x00000010` (`RESET_WATCHDOG`). Four consecutive injections each came back to
+bridge-ready within 1.3 s with the same BLE identity, name and bond records.
+C5 reaches the hardware fallback before the 60 s task channel fires, so that
+task-watchdog path stays covered by the C3 run above. The released image was
+reflashed afterwards and ran 75 s without a reset. WROOM reset behaviour still
+requires physical verification.
 
 Simple-boot images now include the ROM-visible SHA-256 digest. Zephyr v4.4.1's
 `elf2image --ram-only-header` output omits it; Linkr's build module fills existing
@@ -1164,8 +1174,9 @@ in the [ESP image format](https://docs.espressif.com/projects/esptool/en/latest/
 this simple-boot digest covers the ROM-visible RAM image, not the hidden mapped
 Flash segments; release `SHA256SUMS` and flash readback still check the whole
 file. Do not apply the formatter alone to an old image without the matching
-loader. C3 startup and fault recovery are verified with the warning absent;
-the other supported boards have build and image-format verification only.
+loader. C3 and C5 startup and fault recovery are verified with the warning
+absent; the other supported boards have build and image-format verification
+only.
 
 ## Validation status
 
