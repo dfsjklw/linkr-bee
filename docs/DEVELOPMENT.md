@@ -359,6 +359,24 @@ when the check is enabled. The default is eight bonds with no automatic
 eviction. A full table requires factory reset before adding more hosts. See
 [pairing and recovery](BLE_PAIRING.md).
 
+C5 DevKitC uses an external button or jumper on GPIO1; its onboard BOOT and
+RST keys do not authorize pairing. Production builds keep the GPIO check on.
+For controlled C5 bench testing only, explicitly add the development fragment
+in a separate build directory:
+
+```sh
+west build -p always -d build-c5-open-pairing \
+  -b esp32c5_devkitc/esp32c5/hpcore linkr-bee -- \
+  -DEXTRA_CONF_FILE=dev_c5_open_pairing.conf
+```
+
+This image allows any nearby host to pair and then access the UART and
+management services. Encryption, Secure Connections and bonding remain
+required, but they do not identify an authorized owner. Do not distribute
+this image or leave it powered in a shared space. Normal builds and release
+CI do not load this fragment. Use the default build command without it for
+production, and do not reuse the development build directory.
+
 | Item | Default / persistence rule | Clear or transfer |
 | --- | --- | --- |
 | BLE bonds | Up to eight host key records persisted by `CONFIG_BT_SETTINGS` | Board-specific factory reset clears all bonds and other settings |

@@ -278,6 +278,21 @@ GPIO4；只有把该选项设为 `y` 时，GPIO4 才作为物理授权输入。�
 重连无需操作配对 GPIO。默认最多保存 8 台主机，不自动淘汰旧绑定；满后通过
 恢复出厂清空。接线、客户端操作和验收方法见[蓝牙配对](BLE_PAIRING.md)。
 
+C5 DevKitC 需要在 GPIO1 外接按钮或跳线；板载 BOOT 和 RST 不能用于配对授权。
+正式构建保留 GPIO 检查。仅在受控的 C5 台架测试中，才可显式加载独立开发配置，
+并使用单独的构建目录：
+
+```sh
+west build -p always -d build-c5-open-pairing \
+  -b esp32c5_devkitc/esp32c5/hpcore linkr-bee -- \
+  -DEXTRA_CONF_FILE=dev_c5_open_pairing.conf
+```
+
+此镜像允许附近任何主机配对后访问串口和管理服务。加密、Secure Connections 和
+绑定仍是必需的，但不能据此核验主机是否为授权所有者。不要分发此镜像，也不要
+将其留在共享环境中上电。普通构建和发布 CI 不加载该片段。正式固件请使用不带
+此片段的默认构建命令，且不要复用上述开发构建目录。
+
 | 项目 | 默认值 / 持久化规则 | 清除或移交方式 |
 | --- | --- | --- |
 | BLE 绑定 | `CONFIG_BT_SETTINGS` 在 NVS 中保留最多 8 台主机密钥 | 板级恢复出厂同时清除全部绑定和其他设置 |
