@@ -1636,6 +1636,8 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		!strcmp(body, "n?") || !strcmp(body, "name?") ||
 		!strcmp(body, "a?") || !strcmp(body, "autobaud?") ||
 		!strcmp(body, "w?") || !strcmp(body, "wifi?") ||
+		!strcmp(body, "d?") || !strcmp(body, "webdav?") ||
+		!strcmp(body, "s?") || !strcmp(body, "socket?") ||
 		!strcmp(body, "target?");
 	if (!readonly) {
 		if (!linkr_session_command_begin(conn, mgmt_capture.epoch)) {

@@ -221,3 +221,28 @@ ESP32-C5 DevKitC 上，SBC（`radxa-cubie-a5e`）登录后只要输出稍微多�
 > stream*。实测表明在 C5 上这条策略把「一次 `ls` 输出」直接变成「终端断开」，
 > 而断连后用户必须重新配对/重连才能继续，代价远大于丢几行输出。丢包策略与
 > ① ② 以及 `UART_RX_DROP_NO_CONN` 的既有取舍保持一致。
+
+### LAN（WebSocket）侧同一天的实测与调整
+
+同一台 C5 通过 LAN 连接时，第 ② 处（每客户端 `tx_ring`）暴露出同类问题，但性质
+不同——它**不会断连**，只是把输出丢光：
+
+| 场景（LAN，单客户端） | 1024 B（改前） | 说明 |
+|---|---|---|
+| `echo lan-claim-ok`（约 120 B） | 完整收到 | 小突发无压力 |
+| `ls -l /usr/bin \| head -200`（约 24 KB） | 收到 **37 B**，`@info ws … tx=1316 rx=47 dropped=10333` | ring 一直被覆盖，客户端几乎什么都看不到 |
+
+板级取值同时低于 Kconfig 默认：`WS_BRIDGE_CLIENT_BUFFER_SIZE=1024`（默认 2048）、
+`WS_BRIDGE_MAX_CLIENTS=1`（默认 2，与 `docs/DEVELOPMENT*.md` 的「默认 2」不符）。
+现改为默认值：每客户端 2048 B、两个客户端槽位，SRAM 从 96.83% → 97.10%。24 KB 级
+突发仍会丢（② 的策略是丢最旧、不背压），但几 KB 的突发可以完整过去，且文档描述的
+双客户端能力在这块板上成立。
+
+WebDAV、握手与令牌轮换实测正常（见对话记录）：错误令牌与 3 s 内不发令牌都会被断开、
+`@s token` 轮换后旧令牌失效、`@s token off` 后握手变成 `auth=none`、
+`@d=http://<host>/` 能在对端收到 `log-<boot>-<seq>-<uptime>.txt`（201）。
+
+同日还修掉一个与缓冲无关的会话缺陷：`@s?` / `@d?` 没有被算进 `src/main.c` 的只读
+命令表，因此一次**查询**就会通过 `linkr_session_command_begin()` 抢占串口写权，把
+另一条通道（例如 LAN 客户端）锁成 `mode=readonly` 并拒绝其写入（`ERR control=readonly`）。
+只读表已补上 `d?`/`webdav?` 与 `s?`/`socket?`。
