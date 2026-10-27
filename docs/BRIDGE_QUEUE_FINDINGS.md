@@ -232,11 +232,31 @@ ESP32-C5 DevKitC 上，SBC（`radxa-cubie-a5e`）登录后只要输出稍微多�
 | `echo lan-claim-ok`（约 120 B） | 完整收到 | 小突发无压力 |
 | `ls -l /usr/bin \| head -200`（约 24 KB） | 收到 **37 B**，`@info ws … tx=1316 rx=47 dropped=10333` | ring 一直被覆盖，客户端几乎什么都看不到 |
 
-板级取值同时低于 Kconfig 默认：`WS_BRIDGE_CLIENT_BUFFER_SIZE=1024`（默认 2048）、
-`WS_BRIDGE_MAX_CLIENTS=1`（默认 2，与 `docs/DEVELOPMENT*.md` 的「默认 2」不符）。
-现改为默认值：每客户端 2048 B、两个客户端槽位，SRAM 从 96.83% → 97.10%。24 KB 级
-突发仍会丢（② 的策略是丢最旧、不背压），但几 KB 的突发可以完整过去，且文档描述的
-双客户端能力在这块板上成立。
+板级取值 `WS_BRIDGE_CLIENT_BUFFER_SIZE=1024`（Kconfig 默认 2048）已改回默认值。
+
+`WS_BRIDGE_MAX_CLIENTS` 最终停在 1。改回 2 会多一个 2048 B ring **和**一个 3072 B
+线程栈，SRAM 从 96.34% 涨到 98.86%（只剩 4.4 KB）；`MAX_CLIENTS=1` 时同一份固件在
+BLE + LAN 流量下连续跑了 17 分钟。
+
+第二轮针对 2 做了带完整串口日志的对照（`read_serial.py` 改为边读边 flush，日志窗口
+60 分钟）：**2 也能稳定跑满 25 分钟**（uptime `1473624 → 1503959 ms` 单调递增，
+`Booting Zephyr`／`Reset cause` 计数为 0，期间 S1 单客户端、S3 串行重连 ×3、S4
+`@control claim` + `echo` 往返全部通过）。所以先前「数分钟内复位 4 次」**不能归因于
+这个配置**——那几次抓日志的脚本是先攒缓冲再落盘，崩溃窗口没有被记录下来，结论本就
+不成立。
+
+即使配成 2，第二个 `ws://` 连接也**在 TCP 层就被拒**（客户端 `ConnectionRefused`，
+固件里连 `linkr_ws_setup()` 都没进，没有 `[1] WS client connected`，也没有
+`Rejecting WS client; all %d slots busy`）。Zephyr 的
+`subsys/net/lib/http/http_server_core.c:653` 在 `service->data->num_clients >=
+concurrent` 时把监听 socket 的 `events` 置 0，等于停止 accept；`@s off` + `@s on`
+也救不回来（该路径只在服务首次初始化时把 `num_clients` 清零）。把
+`NET_MAX_CONTEXTS` 提到 8、`NET_MAX_CONN` 提到 6 均无效，排除 socket 耗尽。
+
+想开 `CONFIG_NET_LOG` + `NET_HTTP_SERVER_LOG_LEVEL_DBG` 抓 accept 细节时，SRAM 走到
+98.92%，固件**卡在启动**：串口停在 `net80211 rom version`，进不到
+`*** Booting Zephyr OS ***`，`libc heap size` 从 13 kB 掉到 4 kB。C5 的内存余量已经
+不够再做这层诊断。因此保留 `MAX_CLIENTS=1`：省 2 KB，而第二个客户端目前也用不了。
 
 WebDAV、握手与令牌轮换实测正常（见对话记录）：错误令牌与 3 s 内不发令牌都会被断开、
 `@s token` 轮换后旧令牌失效、`@s token off` 后握手变成 `auth=none`、
