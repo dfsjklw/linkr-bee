@@ -1549,6 +1549,11 @@ static void diagnostics_response(struct bt_conn *conn)
 	 * and the web parser, both key on the group name). */
 	(void)send_control_response(conn, "@info queue dropped=%u\r\n",
 				    (unsigned int)atomic_get(&uart_queue_dropped));
+	/* Fourth drop point: UART -> BLE output queues. Counted instead of
+	 * closing the peer, so a host slower than the SBC loses bytes and keeps
+	 * its terminal. */
+	(void)send_control_response(conn, "@info peer dropped=%u\r\n",
+				    linkr_ble_peer_dropped());
 	{
 		/* Whether the 40-92 ms handoff stalls come from the -EBUSY/-ENOMEM
 		 * retry backoff (slept_ms) or from waiting on the peer (wait_max_ms).

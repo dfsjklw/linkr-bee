@@ -1,8 +1,9 @@
 # 桥接队列丢包排查记录（固件侧）
 
-> 最后更新: 2026-10-11
+> 最后更新: 2026-10-27
 > 行号基准: 本文 `文件:行` 引用已按本 PR 的 HEAD 逐条重定位（以符号/字面量为锚点核对），不是写作当时的行号。
-> 范围: 本文只记录 **固件（板子）侧** 三处缓冲的丢包条件与影响，供上游与后续排障参考。
+> 范围: 本文记录 **固件（板子）侧** 四处缓冲的丢包条件与影响（第 ④ 处见文末
+> 2026-10-27 一节），供上游与后续排障参考。
 > 客户端侧的三个问题（LAN 重连、上行限流、粘贴卡住）不在此列，见代码提交与本次 PR。
 
 ## 2026-10-04 三处缓冲的丢包条件与影响
@@ -164,3 +165,59 @@ WS 发送侧停顿 ≥ 2048 ÷ 11520 ≈ 178 ms，且 SBC 在满速打印
   > 自适应到高波特率时缓冲等于变相缩小，再减半会直接开始丢数据。
   > 结论：**本板不靠改缓冲大小换吞吐**；要提速走 BLE 侧（写请求 → 免回复写），
   > 而且客户端写入速率必须始终 ≤ 最慢档的排空速率 11520 B/s。
+
+## 2026-10-27 第四处缓冲：BLE 输出队列（ESP32-C5 上会踢掉连接）
+
+上游多客户端共享（`feat(bridge): share serial output across clients with
+single-writer control`）新增了 `src/ble_peers.c`：每个 BLE 连接一个
+`k_msgq` 输出队列，`uart_to_ble_thread` 通过 `linkr_ble_feed()` 把 UART 数据
+按 232 B 一片入队，再由每连接一个 `ble_peer_tx` 线程发出去。这成为**第 ④ 处
+缓冲**，链路如下：
+
+```
+SBC 控制台 ──115200──▶ [① uart_rx_ring] ──232 B─▶ uart_forward_chunk()
+                                                    └─▶ linkr_ble_feed()
+                                                          └─▶ [④ 每 peer msgq]
+                                                                └─▶ linkr_nus_send() 232 B/包
+```
+
+| # | 缓冲 | 位置 | 大小 | 旧行为（≤ `fa407be`） | 现行为 |
+|---|---|---|---|---|---|
+| ④ | 每 peer `msgq` | `src/ble_peers.c`（`QUEUE_DEPTH` × `PAYLOAD_SIZE`） | Kconfig 默认 8 × 232 B = 1856 B；C5 板曾配成 **4 = 928 B** | 队列满 → 立刻 `bt_conn_disconnect(REMOTE_USER_TERM)`，**无任何日志** | 计数丢弃 + 限速 `LOG_WRN`，连接保留；`@i?` → `@info peer dropped=` |
+
+### 现象
+
+ESP32-C5 DevKitC 上，SBC（`radxa-cubie-a5e`）登录后只要输出稍微多一点的命令就会
+掉线。最小复现是 `ls -l /usr/bin | head -40`（约 3 KB、16 个 notification）：命令
+发出后链路断开，终端报废。固件日志只有 `BLE disconnected: 0x13`，**没有任何**警告
+说明是谁、为什么断的。
+
+`@i?` 当时没有任何 UART→BLE 方向的丢弃计数，因此第 ④ 处丢包/断连完全不可观测。
+`docs/` 的其余排障记录（`uart dropped`、`ws dropped`、`queue dropped`）也都看不到它。
+
+### 实测（C5 DevKitC，2026-10-27）
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `ls -l /usr/bin \| head -40`（约 3 KB） | **断连** | 保持连接，`peer dropped=0` |
+| `ls -l /usr/bin \| head -400`（约 24 KB） | **断连** | 保持连接，收到 18361 B，丢 6960 B |
+| 20 条命令 / 72 s（约 56 KB 输出，混合 `ls`、`dmesg`、`/proc/interrupts`） | 断连 | 保持连接，收到 56482 B，丢 13828 B |
+
+修复后 BLE 下行有效吞吐约 **780 B/s**（72 s 内送出 56 KB），仍明显低于 UART 的
+11520 B/s，因此突发时丢字节是预期结果——与 ① ② ③ 的取舍一致：**丢字节，不踢人**。
+
+### 改动
+
+- `src/ble_peers.c`：队列满时 `atomic_add(&peer_tx_dropped, len)` 并继续，
+  不再 `closing = true` + `bt_conn_disconnect()`；丢弃日志按 1 s 限速，避免日志
+  自身在丢包时刷屏。`peer_tx` 发送失败（`err && err != -ENOTCONN`）仍然断开，
+  但先打一条 `LOG_WRN`，不再静默。
+- `src/main.c`：`@i?` 增加 `@info peer dropped=`；TUI（`DESIGNED_GROUPS` 之外的
+  组会追加显示）与 web 解析器都按组名取行，未知组被容忍，因此不需要客户端改动。
+- `boards/esp32c5_devkitc_esp32c5_hpcore.conf`：`PEER_TX_QUEUE_DEPTH` 4 → 8
+  （928 B → 1856 B，约 160 ms 的 11520 B/s 突发），SRAM 从 96.34% 升到 96.83%。
+
+> 取舍说明：上游原注释是 *Close slow peers instead of silently corrupting their
+> stream*。实测表明在 C5 上这条策略把「一次 `ls` 输出」直接变成「终端断开」，
+> 而断连后用户必须重新配对/重连才能继续，代价远大于丢几行输出。丢包策略与
+> ① ② 以及 `UART_RX_DROP_NO_CONN` 的既有取舍保持一致。
