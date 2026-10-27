@@ -234,16 +234,11 @@ ESP32-C5 DevKitC 上，SBC（`radxa-cubie-a5e`）登录后只要输出稍微多�
 
 板级取值 `WS_BRIDGE_CLIENT_BUFFER_SIZE=1024`（Kconfig 默认 2048）已改回默认值。
 
-`WS_BRIDGE_MAX_CLIENTS` 最终停在 1。改回 2 会多一个 2048 B ring **和**一个 3072 B
-线程栈，SRAM 从 96.34% 涨到 98.86%（只剩 4.4 KB）；`MAX_CLIENTS=1` 时同一份固件在
-BLE + LAN 流量下连续跑了 17 分钟。
-
-第二轮针对 2 做了带完整串口日志的对照（`read_serial.py` 改为边读边 flush，日志窗口
-60 分钟）：**2 也能稳定跑满 25 分钟**（uptime `1473624 → 1503959 ms` 单调递增，
-`Booting Zephyr`／`Reset cause` 计数为 0，期间 S1 单客户端、S3 串行重连 ×3、S4
-`@control claim` + `echo` 往返全部通过）。所以先前「数分钟内复位 4 次」**不能归因于
-这个配置**——那几次抓日志的脚本是先攒缓冲再落盘，崩溃窗口没有被记录下来，结论本就
-不成立。
+`WS_BRIDGE_MAX_CLIENTS` 停在 1，原因是第二个客户端根本连不上，不是稳定性问题：
+配成 2 的镜像连续跑了 25 分钟（uptime `1473624 → 1503959 ms` 单调递增，
+`Booting Zephyr`／`Reset cause` 计数为 0），期间单客户端连接、串行重连 ×3、
+`@control claim` + `echo` 往返全部通过。而这个槽位要多占一个 2048 B ring **和**一个
+3072 B 线程栈，SRAM 从 96.34% 涨到 98.86%（只剩 4.4 KB）。
 
 即使配成 2，第二个 `ws://` 连接也**在 TCP 层就被拒**（客户端 `ConnectionRefused`，
 固件里连 `linkr_ws_setup()` 都没进，没有 `[1] WS client connected`，也没有
