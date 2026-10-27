@@ -3,6 +3,65 @@
 本文记录 AI（Agent）功能当前的能力边界、已确认的缺口和排期。实机验收记录见
 [AGENT_VALIDATION.zh-CN.md](AGENT_VALIDATION.zh-CN.md)。
 
+## 2026-10-26：MCP 服务器（Android）
+
+Android App 现在可作为局域网内的 MCP 服务器（`POST /mcp`、JSON-RPC 2.0、Bearer
+令牌），让 Claude Desktop、Cursor、Codex 等支持 Streamable HTTP 的客户端使用配件的
+串口与配件管理能力。协议与工具逻辑在共享的 `web/mcp_server.js`，Java 只负责认证、
+HTTP 传输与前台服务生命周期。
+
+- 原生传输：`McpHttpServer`（纯 Java，可在主机 JVM 上测试）、`McpServerManager`
+  （配置、64 个十六进制字符的令牌、请求转发与 180 秒超时）、`LinkrMcpService`
+  （`connectedDevice` 前台服务）、`LinkrMcpPlugin`（Capacitor 桥）。监听 `0.0.0.0`
+  或回环；带 `Origin` 的请求以 `403` 拒绝；请求头上限 16 KiB、请求体上限 1 MiB。
+- 工具：16 个，复用现有的串口执行闸门与配件管理通道，没有第二条串口写路径。6 个只读
+  工具（`get_device_status`、`read_serial_log`、`search_serial_log`、
+  `get_accessory_diagnostics`、`get_bee_status`、`get_execution_status`）；
+  `wifi_scan` 与 `scan_bee_devices` 只观察、不保存配置；8 个写入工具
+  （`send_serial_input`、`set_uart_config`、`set_wifi`、`set_webdav`、`connect_bee`、
+  `disconnect_bee`、`set_bee_name`、`set_lan_bridge`）。设备变更调用一次只允许一个。
+  连接工具（扫描/连接/断开）控制 App 自己的蓝牙会话，不是目标控制台；主机配置工具修改
+  广播名与局域网 WebSocket 监听。`send_serial_input` 支持
+  `trackExit`/`waitForCompletion`（追踪 POSIX shell 命令的完成令牌与退出码，退出码 0
+  不等于目标已验证），`get_execution_status` 可按 id 读取或等待执行状态。
+- 访问权限：四档，从限制最严到最宽松。**只读**不弹任何确认：读取与扫描直接执行，所有
+  写入工具拒绝。**每条命令**（默认）对每次写入和每次扫描都在手机上确认。**仅高危**只对
+  高危调用确认：`send_serial_input` 命中内置助手的破坏性命令规则（递归/强制删除、
+  `find -delete`/`-exec rm`、`shred`、`mkfs` 与分区/文件系统工具、`dd`、刷写/MTD/引导
+  工具、`sudo`/`su`、递归 `chmod`/`chown`/`chgrp`、`chattr`/`setfacl`、重定向到裸设备、
+  把下载内容管道给 shell 等）、`set_wifi` 的所有动作、`set_webdav` 开启、
+  `set_lan_bridge` 开启或轮换令牌、`disconnect_bee` 的 `forget:true`；其余写入、扫描与
+  读取直接执行。**完全授权**不弹任何确认（危险，仅限完全可信的客户端与网络）。高危分类
+  是尽力而为的规则，不是沙箱：通过脚本、变量或解释器间接执行无法识别。
+- 界面：AI 设置页新增“MCP 服务器”卡片（启用、访问权限四档：只读/每条命令/仅高危/
+  完全授权；端口、监听地址、令牌复制与轮换、客户端配置片段、最近 50 次调用审计）；
+  写入确认横幅在设置面板之外显示，参数打码。App 在前台时用应用内横幅确认；App 在后台
+  或锁屏时改为发布高优先级通知（Allow / Deny），可直接在通知栏确认，无需打开 App；
+  Android 13+ 在启用服务器时请求通知权限，拒绝则退回“仅前台确认”。
+- 证据纪律不变：串口输出是不可信设备数据，发送成功只代表投递。需要确认的调用在 App
+  前台时用横幅、在后台/锁屏时用通知栏确认；通知被禁用时后台确认会被拒绝、调用不会
+  执行。不需要确认的调用（读取、两种扫描、仅高危模式的普通写入、完全授权）在后台也能
+  执行。
+- 生命周期边界：仅 Android；没有 SSE / 服务端主动消息（`GET /mcp` 返回 `405`）；App
+  进程结束服务即停止，前台服务只保证 App 在后台时进程仍存活。
+- 测试：`mobile/test/mcp_server.test.mjs`（协议、四种访问权限与高危分类、审批与拒绝、
+  脱敏、单写入串行等）、`mobile/android/app/src/test/java/guru/linkr/ble/mcp/McpHttpServerTest.java`
+  （主机 JVM：路由、鉴权、`Origin` 优先级、大小限制、绑定失败与令牌轮换、停止语义）、
+  `mobile/browser-test/mcp_server.spec.mjs`（设置卡片与转发传输）、
+  `mobile/browser-test/mcp_ui.spec.mjs`（卡片可见性、四档访问权限、端口/监听地址、审计
+  列表、确认横幅的允许与拒绝）。
+- 验证边界：**主机 JVM 测试、构建、真机 + 真实配件的读取/确认/一次写入已验证；配置修改
+  与进程被杀未验证**。2026-10-26 在 StepX PZ261A（Android 16，BLE 连接 Linkr Bee 配件）
+  上验证：卡片启动服务、令牌与地址正确、同 WiFi 另一台机器可访问（`GET /`、
+  `initialize`、`tools/list`、鉴权与 `Origin` 拒绝）、`get_device_status` 返回真实配件、
+  `get_accessory_diagnostics` 返回固件/Zephyr/UART/WiFi 统计、`read_serial_log`/
+  `search_serial_log` 返回真实日志窗口、写入在手机上弹出确认（拒绝返回 `isError`，允许
+  后文本送达目标 shell 并回显）、`wifi_scan` 返回真实热点、`connectedDevice` 前台服务
+  常驻通知、退后台后端点仍可达。以上真机验证使用默认的「每条命令」模式。未验证：
+  `set_uart_config`/`set_wifi`/`set_webdav`、仅高危模式的高危分类与只读模式的无确认
+  行为（由测试覆盖，未在真机验证）、进程被杀、多客户端并发。
+- 使用与安全说明见 [MCP.zh-CN.md](MCP.zh-CN.md)（[English](MCP.md)）。
+
 ## 2026-10-23：上下文与工具加载优化
 
 Web、Capacitor 和 HarmonyOS ArkWeb 共用的 Pi runtime 默认改为 `focused`：
@@ -393,5 +452,6 @@ token）：保留四态语义与证据纪律，删掉模型可自行推断的重
   `match` / `mismatch` / `indeterminate` / `observed`，并守住两条区别：`observed`
   （没给预期，只是测量）不等于 `match`，`indeterminate`（答不了 / 回答不可用）不等于
   任一结果。不要另造一套说法，也不要把"退出码 0"或某一行的出现升级成"已验证"。
-- 当前应用未接入 MCP、子代理和向量记忆，不要按“现成可用”的应用能力排期。
+- 当前应用已内置 Android 端 MCP 服务器（见 [MCP.zh-CN.md](MCP.zh-CN.md)）；仍未接入
+  子代理和向量记忆，后两者不要按“现成可用”的应用能力排期。
 - 助手不应越过"下载后等用户指示"的界线，自动安装、刷写不在计划内。

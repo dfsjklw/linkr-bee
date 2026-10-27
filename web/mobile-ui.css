@@ -70,7 +70,10 @@
     max-height: calc(var(--terminal-viewport-height, 100vh) - 190px);
     min-height: 0;
   }
-  .agent-settings-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: 3px; }
+  /* When the inner form scroll reaches its end the swipe must continue to the
+   * drawer, otherwise the pinned Save/Clear row stays below the drawer viewport
+   * and cannot be reached (it is only reachable by scrolling the drawer). */
+  .agent-settings-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior-y: auto; padding-right: 3px; }
   .agent-settings-actions { flex: 0 0 auto; position: relative; padding-bottom: 6px; }
   html.soft-keyboard-open #agentSettings > .card-title { display: none; }
   html.soft-keyboard-open .app-shell.sidebar-open .controls .settings-tabs { display: none; }
@@ -109,6 +112,17 @@
   .agent-advanced-settings > summary { min-height: 48px; box-sizing: border-box; }
 }
 
+/* The phone drawer is full width and carries the status/navigation insets, so
+ * the form height budget from the 190 px constant is too generous there: the
+ * pinned Save/Clear row ended up below the drawer viewport and looked missing.
+ * Subtract the real insets on a phone; the keyboard-open rule above already
+ * sizes the form against the reduced viewport. */
+@media (max-width: 600px) {
+  html:not(.soft-keyboard-open) #agentSettingsForm {
+    max-height: calc(var(--terminal-viewport-height, 100dvh) - 190px - var(--safe-top) - var(--safe-bottom));
+  }
+}
+
 @media (min-width: 360px) {
   .terminal-key-choices { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 8px; }
 }
@@ -142,3 +156,79 @@
   .terminal-selection-handle-start::after { top: calc(50% + 10px); }
   .terminal-selection-handle-end::after { bottom: calc(50% + 10px); }
 }
+
+/* ---------- MCP server (Android app only) ---------- */
+/* .field-hint sets display:block, which defeats the hidden attribute. */
+.mcp-settings [hidden] { display: none; }
+/* The no-confirmation access mode is a security decision: make it visibly red. */
+.mcp-settings select.is-danger { color: var(--danger); border-color: var(--danger); }
+.mcp-settings .password-row { display: flex; align-items: center; gap: 6px; }
+.mcp-settings .password-row input { flex: 1 1 auto; min-width: 0; }
+.mcp-settings .password-row .btn { flex: 0 0 auto; }
+.mcp-settings .mcp-warning { color: var(--danger); }
+.mcp-settings .mcp-snippet {
+  margin: 8px 0 0;
+  padding: 10px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+.mcp-settings .mcp-client-config,
+.mcp-settings .mcp-audit { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+.mcp-settings .mcp-client-config > summary,
+.mcp-settings .mcp-audit > summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.mcp-settings .mcp-audit-list { max-height: 220px; overflow-y: auto; }
+.mcp-settings .mcp-audit-row { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.mcp-settings .mcp-audit-row:last-child { border-bottom: 0; }
+.mcp-settings .mcp-audit-head { margin: 0; font-size: 12px; font-weight: 600; }
+.mcp-settings .mcp-audit-row .field-hint { margin: 2px 0 0; }
+
+/* Approval is requested by an external client, so it must stay reachable no
+ * matter which settings tab or terminal view the user has open. */
+.mcp-approval {
+  position: fixed;
+  left: 50%;
+  bottom: max(16px, var(--safe-bottom));
+  z-index: 60;
+  width: min(92vw, 460px);
+  transform: translateX(-50%);
+  padding: 14px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+.mcp-approval[hidden] { display: none; }
+.mcp-approval-title { margin: 0 0 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.mcp-approval-tool { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+.mcp-approval-args-label { margin: 0 0 4px; font-size: 12px; color: var(--muted); }
+.mcp-approval-args {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (pointer: coarse), (max-width: 900px) {
+  .mcp-settings .password-row { flex-wrap: wrap; }
+  .mcp-approval { width: calc(100vw - 24px); }
+}
+
+/* Import shares the existing settings controls and scroll area. */
+.cliproxy-import { margin-bottom: 14px; }
+.cliproxy-import [hidden] { display: none; }
+.cliproxy-import .btn { width: 100%; margin-top: 8px; white-space: normal; }
+.cliproxy-import select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.cliproxy-import #cliproxyStatus:empty { display: none; }
