@@ -309,6 +309,17 @@ The application code in `src/wifi.c` uses the standard `net_mgmt` /
 and starts DHCPv4 itself on connect, so no `CONFIG_NET_CONFIG_AUTO_INIT` is
 needed.
 
+The `@w scan` watchdog bound is `CONFIG_LINKR_BLE_BRIDGE_WIFI_SCAN_TIMEOUT_MS`.
+ESP32-C5 is dual-band and its WiFi driver ignores the band bitmap in the
+request, so a full sweep (measured: 16–18 APs, 5 GHz channels included) takes a
+steady ~19.7 s. Asking for 2.4 GHz only and a 60–100 ms per-channel dwell does
+not shorten it, and neither does dropping the BLE link, so this is not
+coexistence scheduling. The C5 board configuration raises the bound to 30 s; the
+15 s default released every scan 4–5 s before the driver reported completion,
+which surfaced as `@scan error`. ESP32-C3 sweeps faster and keeps the default.
+The host CLI already waits `WIFI_SCAN_TIMEOUT = 35` s, which brackets the 30 s
+firmware bound.
+
 ### UART over WebSocket (LAN bridge)
 
 When WiFi holds an IP address, the firmware also serves the bridge UART over a
