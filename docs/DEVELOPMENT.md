@@ -317,8 +317,10 @@ not shorten it, and neither does dropping the BLE link, so this is not
 coexistence scheduling. The C5 board configuration raises the bound to 30 s; the
 15 s default released every scan 4–5 s before the driver reported completion,
 which surfaced as `@scan error`. ESP32-C3 sweeps faster and keeps the default.
-The host CLI already waits `WIFI_SCAN_TIMEOUT = 35` s, which brackets the 30 s
-firmware bound.
+Both the Python CLI (`WIFI_SCAN_TIMEOUT`) and Rust CLI/TUI
+(`device::SCAN_TIMEOUT`) wait 35 s, allowing the 30 s firmware watchdog plus
+queued results to arrive. The Rust limit was previously 20 s. Custom firmware
+with a longer scan watchdog must also increase the client wait.
 
 ### UART over WebSocket (LAN bridge)
 
