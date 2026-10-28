@@ -1,62 +1,10 @@
 cmake_minimum_required(VERSION 3.20.0)
 
-# ---------------------------------------------------------------------------
-# Patches applied to the west-managed Zephyr tree.
-#
-# They live here rather than in the checkout so that `west update` cannot drop
-# them silently and so that everyone building this repository gets the same
-# image. Each patch is applied once and only if it is not already present,
-# which keeps repeat builds and in-place checkouts idempotent.
-# ---------------------------------------------------------------------------
-function(linkr_apply_zephyr_patch patch_rel)
-  if(NOT EXISTS "${ZEPHYR_BASE}/.git")
-    message(WARNING "Zephyr tree at ${ZEPHYR_BASE} is not a git checkout; "
-                    "cannot verify ${patch_rel}. Applying unconditionally.")
-    execute_process(
-      COMMAND git -C "${ZEPHYR_BASE}" apply "${CMAKE_CURRENT_SOURCE_DIR}/${patch_rel}"
-      RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
-    if(NOT rc EQUAL 0)
-      message(FATAL_ERROR "Failed to apply ${patch_rel}: ${out}")
-    endif()
-    return()
-  endif()
-
-  execute_process(
-    COMMAND git -C "${ZEPHYR_BASE}" apply --reverse --check
-            "${CMAKE_CURRENT_SOURCE_DIR}/${patch_rel}"
-    RESULT_VARIABLE already OUTPUT_QUIET ERROR_QUIET)
-  if(already EQUAL 0)
-    message(STATUS "Zephyr patch already applied: ${patch_rel}")
-    return()
-  endif()
-
-  execute_process(
-    COMMAND git -C "${ZEPHYR_BASE}" apply "${CMAKE_CURRENT_SOURCE_DIR}/${patch_rel}"
-    RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
-  if(NOT rc EQUAL 0)
-    message(FATAL_ERROR
-      "Failed to apply ${patch_rel} to ${ZEPHYR_BASE}: ${out}\n"
-      "Restore the tree (git -C <zephyr> checkout .) and rebuild.")
-  endif()
-  message(STATUS "Applied Zephyr patch: ${patch_rel}")
-endfunction()
-
 # The module runs after the SoC is configured, before Zephyr collects its
 # post-build commands.
 list(APPEND EXTRA_ZEPHYR_MODULES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/esp_simpleboot")
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(linkr_ble_bridge)
-
-# Serialize shared_multi_heap: sys_heap has no locking of its own and the
-# Espressif WiFi stack calls the PSRAM allocator from both ISR and thread
-# context. Applied here, after find_package() has resolved ZEPHYR_BASE -- doing
-# it any earlier relies on a cached variable from a previous configure.
-set(LINKR_ZEPHYR_PATCHES
-  patches/zephyr/0001-shared-multi-heap-serialize-access-with-a-spinlock.patch
-)
-foreach(patch IN LISTS LINKR_ZEPHYR_PATCHES)
-  linkr_apply_zephyr_patch("${patch}")
-endforeach()
 
 if(CONFIG_SOC_SERIES_ESP32C3)
   include(cmake/esp32c3_hci_order.cmake)
