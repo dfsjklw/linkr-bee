@@ -16,6 +16,10 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/gatt.h>
+#if defined(CONFIG_BT_HCI_VS)
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/hci_vs.h>
+#endif
 #include "ble_nus.h"
 #include "ble_security.h"
 #include <zephyr/device.h>
@@ -28,6 +32,7 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/ring_buffer.h>
 #if IS_ENABLED(CONFIG_SYS_HEAP_RUNTIME_STATS)
 #include <zephyr/sys/sys_heap.h>
@@ -717,6 +722,81 @@ static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 #define ADVERTISED_NAME DEVICE_NAME
+#endif
+
+/*
+ * The ESP32 controller powers BLE up at a level of its own choosing: on the C5
+ * the advertisement measured -86 dBm at 30 cm, which an actively scanning
+ * tablet could still pick up but Android system scans and Windows could not.
+ * Their scan windows are far shorter, so a device has to be several dB louder
+ * to be found at the same range. Set the scanning and default link power
+ * explicitly instead of inheriting the controller default; the advertisement
+ * inherits the default bucket as well (see below).
+ *
+ * This uses the controller's vendor-specific HCI command, which the in-tree
+ * ESP32 HCI driver forwards to esp_ble_tx_power_set[_enhanced](); the reply
+ * carries the level the controller actually selected, so a clamp (the C5 tops
+ * out at 20 dBm, the C3 at 9 dBm) is visible in the log instead of silent.
+ */
+#if defined(CONFIG_BT_HCI_VS)
+static void ble_tx_power_write(uint8_t handle_type, uint16_t handle, int8_t dbm)
+{
+	struct bt_hci_cp_vs_write_tx_power_level *cp;
+	struct bt_hci_rp_vs_write_tx_power_level *rp;
+	struct net_buf *buf;
+	struct net_buf *rsp = NULL;
+	int err;
+
+	buf = bt_hci_cmd_alloc(K_FOREVER);
+	if (!buf) {
+		LOG_WRN("BLE TX power: no command buffer");
+		return;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle_type = handle_type;
+	cp->handle = sys_cpu_to_le16(handle);
+	cp->tx_power_level = dbm;
+
+	err = bt_hci_cmd_send_sync(BT_HCI_OP_VS_WRITE_TX_POWER_LEVEL, buf, &rsp);
+	if (err) {
+		LOG_WRN("BLE TX power: request failed (type %u): %d", handle_type, err);
+		return;
+	}
+
+	rp = (struct bt_hci_rp_vs_write_tx_power_level *)rsp->data;
+	if (rp->status) {
+		LOG_WRN("BLE TX power: rejected (type %u): status 0x%02x", handle_type,
+			rp->status);
+	} else {
+		LOG_INF("BLE TX power: type %u requested %d dBm, selected %d dBm", handle_type,
+			dbm, rp->selected_tx_power);
+	}
+
+	net_buf_unref(rsp);
+}
+
+/* 0xFF is not a link handle: the driver maps an unknown handle type to the
+ * controller's "default" power bucket, which is what a new link inherits. That
+ * bucket is also what the advertisement inherits, which is why advertising is
+ * not addressed on its own here: the advertising power can only be set for an
+ * existing advertising set (handle 0 is rejected with EINVAL before
+ * bt_le_adv_start() runs), and the default bucket already covers it. Measured
+ * on the C5: 20 dBm in the default bucket moved the advertisement from
+ * -86 dBm to -64 dBm at the same distance. */
+#define BLE_TX_POWER_HANDLE_DEFAULT 0x00FF
+
+static void ble_tx_power_apply(void)
+{
+	const int8_t dbm = CONFIG_LINKR_BLE_BRIDGE_BLE_TX_POWER_DBM;
+
+	ble_tx_power_write(BT_HCI_VS_LL_HANDLE_TYPE_SCAN, 0, dbm);
+	ble_tx_power_write(BLE_TX_POWER_HANDLE_DEFAULT, 0, dbm);
+}
+#else
+static void ble_tx_power_apply(void)
+{
+}
 #endif
 
 /* Use a settings-backed random-static identity instead of the controller's
@@ -2602,6 +2682,7 @@ int main(void)
 		LOG_ERR("Bluetooth init failed: %d", err);
 		return err;
 	}
+	ble_tx_power_apply();
 	bt_gatt_cb_register(&gatt_callbacks);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
