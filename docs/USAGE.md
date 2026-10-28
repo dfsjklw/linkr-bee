@@ -26,6 +26,26 @@ Only one BLE host can connect at a time. If another client owns the connection,
 disconnect it before selecting the accessory here. Use the
 [pairing and recovery guide (Chinese)](BLE_PAIRING.md) for lost bonds or a full bond list.
 
+If a live BLE or LAN link drops unexpectedly (the board goes out of range,
+reboots, or loses power), the terminal redials on its own with a bounded
+backoff of 1, 2, 4, 8, 16 and 30 seconds, six attempts in total. The status line
+shows the attempt and countdown and the Connect button becomes **Cancel
+reconnect**; a successful redial keeps the transcript and appends a
+`[reconnect]` line, and no input or command is replayed. A deliberate disconnect
+is never retried. After six failures the client stops and asks you to press
+Reconnect; the TUI has `--no-auto-reconnect` for the opposite behaviour.
+TUI BLE retries use the actual connected device ID, not a fresh name search.
+Cancellation also applies during dialing: if the system Bluetooth call is still
+pending, the client waits for it and closes its result without restoring the session.
+
+If the browser reports that the Bee is no longer in range, it first tries to
+watch that device's advertisements for up to 8 seconds. If watching is unsupported
+or discovery still fails, automatic retries stop and the button becomes
+**Reselect device**. Keep the Bee powered on and select the original device.
+Its browser device ID is checked, so a different Bee with the same name is not
+adopted; use **Switch device** to change devices intentionally. Existing pairing
+is preserved, and background retries never open the device chooser.
+
 ## Interface tour
 
 ![English desktop terminal preview](../assets/screenshots/linkr-bee-terminal-desktop-en.jpg)
@@ -36,7 +56,7 @@ retained-transcript view. They do not represent a live hardware session.*
 | Area | Purpose |
 | --- | --- |
 | Top bar | Connection state, connect/disconnect, settings visibility, theme, and language |
-| Left rail | Connection, serial, network, assistant, and About sections |
+| Left rail | Connection, serial, network, board, assistant, and About sections |
 | Terminal | Target output, direct input when connected, selection, and scrollback |
 | Terminal toolbar | Assistant workspace, font size, fullscreen, scroll-to-bottom, and copy |
 | Accessory keys | Esc, Tab, modifiers, navigation, paste, Enter, and control combinations |
@@ -57,9 +77,44 @@ retained-transcript view. They do not represent a live hardware session.*
 - **Terminal font** uses fonts installed on the host. A Nerd Font must be installed
   locally before its extra symbols can render.
 
-Close settings when finished to return the space to the terminal. Serial settings
-and bridge diagnostics use BLE management; they are not sent as commands to the
-target shell and are not available over a LAN-only session.
+Every settings card collapses from the chevron in its header; the state is
+remembered for the next visit. Close settings when finished to return the space
+to the terminal. Serial settings and bridge diagnostics use BLE management; they
+are not sent as commands to the target shell and are not available over a
+LAN-only session.
+
+### Board panel (Linkr Bee X1.0)
+
+The **Board** section appears for the Linkr Bee X1.0 accessory. It drives the
+board's own hardware over the same encrypted management channel as the serial
+settings; nothing here is written to the target's UART.
+
+- **Status LED** sets the single-wire RGB LED. Pick a swatch or a custom colour
+  and press **Apply**; **Off** turns it dark. The status line shows the colour
+  the board reported back.
+- **Isolated contact (J5)** closes or opens the optocoupler contact — useful as
+  a remote reset or power key — or pulses it for a chosen number of
+  milliseconds.
+- **Infrared remote & learning** sends one NEC frame from an address, command
+  and optional repeat count, and shows the receiver's counters and last decoded
+  frame. It also learns arbitrary remotes: choose a slot, press **Learn**, then
+  press the remote key. The frame closes about 60 ms after the key is released
+  and is stored in the board's NVS, so it survives reboots. **Saved signals**
+  lists every stored slot as a callable row: **Play** sends that signal again
+  without touching the slot picker, **Delete** clears it, and **Rename** gives
+  the row a name in any language. Both the waveform and its name are stored in
+  the board's NVS, so they survive reboots and travel with the board to another
+  phone or browser. Long protocols that do not fit the firmware's edge budget
+  are rejected instead of truncated.
+
+Firmware builds for other boards answer `ERR ... unsupported`; the section then
+replaces the controls with a note. Boards without the hardware simply do not
+have the tab.
+
+To look at the panel without hardware, open `/?demo=board`: a mock Linkr Bee
+X1.0 answers the management channel, the Board section opens itself, and LED,
+contact, remote and learning controls all behave as they would on the board.
+Normal use without the query parameter is unchanged.
 
 ### Phones and tablets
 
@@ -137,9 +192,28 @@ command and subsequent output; sending input or seeing a prompt is not proof of
 success. **Stop** cancels pending assistant work, but cannot recall transmitted
 bytes. Use terminal Ctrl-C to interrupt the target when appropriate.
 
+### Board-stored AI configuration
+
+AI settings save automatically when a field loses focus; the small **Save
+now** button is only a fallback for retries and for a plaintext endpoint, whose
+key needs an explicit confirmation. When connected over
+Bluetooth, **Save to board** keeps the current configuration (endpoint, model,
+protocol, token limits) in the board's NVS; **Load from board** fills the form
+and applies it on this device. The API key
+and extra headers are written only when **Include API key and extra headers**
+is ticked: the blob is plaintext in NVS, so any paired host can read it. Tick
+it only for a board you control.
+
+The AI page also has an **On-board AI prompt** card: one piece of custom
+instructions kept in the board's NVS. Load or edit it, then **Save to board**;
+the assistant reads it once when a conversation starts, so it follows the board
+to another phone or browser. **Clear** removes it.
+
 ### Import from CLIProxyAPI
 
-In AI settings, expand **Import from CLIProxyAPI**, enter the server URL
+Advanced options and the importer are inline disclosures under the model card;
+target binding and storage notes are collapsed cards at the bottom. In AI
+settings, expand **Import from CLIProxyAPI**, enter the server URL
 (default `http://127.0.0.1:8317`) and temporary management key, then click
 **Connect and import**. Bee reads the client key list through the v8 management
 API, then fetches models using a client key. A single key and model are saved
