@@ -41,21 +41,22 @@ function(linkr_apply_zephyr_patch patch_rel)
   message(STATUS "Applied Zephyr patch: ${patch_rel}")
 endfunction()
 
+# The module runs after the SoC is configured, before Zephyr collects its
+# post-build commands.
+list(APPEND EXTRA_ZEPHYR_MODULES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/esp_simpleboot")
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(linkr_ble_bridge)
+
 # Serialize shared_multi_heap: sys_heap has no locking of its own and the
 # Espressif WiFi stack calls the PSRAM allocator from both ISR and thread
-# context.
+# context. Applied here, after find_package() has resolved ZEPHYR_BASE -- doing
+# it any earlier relies on a cached variable from a previous configure.
 set(LINKR_ZEPHYR_PATCHES
   patches/zephyr/0001-shared-multi-heap-serialize-access-with-a-spinlock.patch
 )
 foreach(patch IN LISTS LINKR_ZEPHYR_PATCHES)
   linkr_apply_zephyr_patch("${patch}")
 endforeach()
-
-# The module runs after the SoC is configured, before Zephyr collects its
-# post-build commands.
-list(APPEND EXTRA_ZEPHYR_MODULES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/esp_simpleboot")
-find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(linkr_ble_bridge)
 
 if(CONFIG_SOC_SERIES_ESP32C3)
   include(cmake/esp32c3_hci_order.cmake)
