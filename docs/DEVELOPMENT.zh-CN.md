@@ -108,6 +108,15 @@ ESP32-C5 DevKitC：
 west build -b esp32c5_devkitc/esp32c5/hpcore linkr-bee
 ```
 
+这套镜像默认启用模块上的 8 MB PSRAM，所有能离开内部 RAM 的缓冲都放进去；
+哪些搬、哪些必须留在 DRAM、原因是什么，见 [PSRAM.md](PSRAM.md)（英文）。
+CI 同时构建的「纯内部 SRAM」变体只多一个 fragment：
+
+```sh
+west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
+  -DEXTRA_CONF_FILE=c5_pure_sram.conf
+```
+
 ### GitHub Actions 构建与刷写
 
 `.github/workflows/build.yml` 使用矩阵构建五块板的默认 WiFi + BLE 配置：

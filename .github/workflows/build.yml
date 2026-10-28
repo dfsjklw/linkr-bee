@@ -227,6 +227,21 @@ jobs:
             toolchain: riscv64-zephyr-elf
             flash_address: "0x2000"
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
+            expect_psram: "y"
+          # The same board with the module's PSRAM compiled out: the internal
+          # SRAM only image has to keep building, because everything that can
+          # go to PSRAM is conditional (src/ext_ram.h) and the configuration
+          # under it has to stay linkable. Build-only, not released.
+          - name: ESP32-C5 DevKitC (internal SRAM only)
+            board: esp32c5_devkitc/esp32c5/hpcore
+            slug: esp32c5-devkitc-sram
+            chip: esp32c5
+            toolchain: riscv64-zephyr-elf
+            flash_address: "0x2000"
+            factory_reset: GPIO28 BOOT to GND for two seconds during boot
+            extra_conf: c5_pure_sram.conf
+            expect_psram: "n"
+            no_package: true
           - name: ESP32-WROOM-32 DevKitC
             board: esp32_devkitc/esp32/procpu
             slug: esp32-wroom-32
@@ -281,8 +296,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          conf=()
+          if [ -n "${{ matrix.extra_conf }}" ]; then
+            conf+=("-DEXTRA_CONF_FILE=${{ matrix.extra_conf }}")
+          fi
           west build -p always -b "${{ matrix.board }}" \
-            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
+            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app" \
+            -- "${conf[@]}"
 
       - name: Verify default feature set
         shell: bash
@@ -359,8 +379,26 @@ jobs:
           if grep -qx 'CONFIG_SOC_SERIES_ESP32=y' "${config}"; then
             grep -qx 'CONFIG_ESP32_BT_CTLR_LE_SECURITY_ENABLE=y' "${config}"
           fi
+          # PSRAM layout. The released C5 image runs with the module's 8 MB
+          # part enabled and must keep the WiFi heap, the WiFi packet buffers
+          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it; the
+          # SRAM-only variant must have none of it compiled in.
+          if [ "${{ matrix.expect_psram }}" = "y" ]; then
+            grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
+            grep -qx 'CONFIG_ESP_SPIRAM_SIZE=8388608' "${config}"
+            grep -qx 'CONFIG_SPIRAM_TYPE_ESPPSRAM64=y' "${config}"
+            grep -qx 'CONFIG_SPIRAM_SPEED_80M=y' "${config}"
+            grep -qx '# CONFIG_ESP_SPIRAM_MEMTEST is not set' "${config}"
+            grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
+            grep -qx '# CONFIG_ESP_WIFI_HEAP_SPIRAM is not set' "${config}"
+            grep -qx '# CONFIG_ESP32_WIFI_NET_ALLOC_SPIRAM is not set' "${config}"
+          elif [ "${{ matrix.expect_psram }}" = "n" ]; then
+            grep -qx '# CONFIG_ESP_SPIRAM is not set' "${config}"
+            grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
+          fi
 
       - name: Package firmware
+        if: ${{ !matrix.no_package }}
         shell: bash
         run: |
           set -euo pipefail
@@ -409,6 +447,7 @@ jobs:
           EOF
 
       - name: Upload firmware
+        if: ${{ !matrix.no_package }}
         uses: actions/upload-artifact@v4
         with:
           name: linkr-bee-${{ matrix.slug }}
