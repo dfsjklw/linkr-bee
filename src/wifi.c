@@ -16,6 +16,7 @@
  */
 
 #include "wifi.h"
+#include "ext_ram.h"
 
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
 
@@ -74,11 +75,14 @@ LOG_MODULE_REGISTER(linkr_wifi, CONFIG_LOG_DEFAULT_LEVEL);
 /* Leaves room for the completion marker in the control-response queue. */
 #define WIFI_SCAN_MAX_RESULTS 12
 
-static char wifi_ssid[SSID_MAX + 1];
-static char wifi_psk[PSK_MAX + 1];
-static char webdav_url[URL_MAX + 1];
-static char webdav_user[CRED_MAX + 1];
-static char webdav_pass[CRED_MAX + 1];
+/* Credentials and the scan cache are pure data touched only from thread
+ * context (settings load, management requests, the upload thread), so on the
+ * C5 PSRAM build they live there and cost no internal SRAM. */
+static char wifi_ssid[SSID_MAX + 1] LINKR_EXT_RAM_BSS;
+static char wifi_psk[PSK_MAX + 1] LINKR_EXT_RAM_BSS;
+static char webdav_url[URL_MAX + 1] LINKR_EXT_RAM_BSS;
+static char webdav_user[CRED_MAX + 1] LINKR_EXT_RAM_BSS;
+static char webdav_pass[CRED_MAX + 1] LINKR_EXT_RAM_BSS;
 
 static struct k_mutex cfg_lock;
 static struct net_mgmt_event_callback wifi_mgmt_cb;
@@ -142,10 +146,19 @@ struct wifi_scan_cache_entry {
     enum wifi_security_type security;
 };
 
-static struct wifi_scan_cache_entry scan_cache[WIFI_SCAN_MAX_RESULTS];
+static struct wifi_scan_cache_entry scan_cache[WIFI_SCAN_MAX_RESULTS]
+    LINKR_EXT_RAM_BSS;
 static size_t scan_cache_count;
 
-RING_BUF_DECLARE(log_ring, LOG_RING_SIZE);
+/* RING_BUF_DECLARE would put the backing array in __noinit (DRAM1) as well.
+ * This keeps the same ring_buf initializer but places the payload in PSRAM:
+ * linkr_log_feed() runs on the uart_to_ble thread and the drain happens on the
+ * upload thread, both under log_lock. The ring_buf structure itself stays in
+ * DRAM, as kernel-adjacent structures must. */
+BUILD_ASSERT(LOG_RING_SIZE <= RING_BUFFER_MAX_SIZE,
+	     "log_ring exceeds RING_BUFFER_MAX_SIZE");
+static uint8_t log_ring_storage[LOG_RING_SIZE] __aligned(4) LINKR_EXT_RAM_BSS;
+struct ring_buf log_ring = RING_BUF_INIT(log_ring_storage, LOG_RING_SIZE);
 static struct k_mutex log_lock;
 /* Serializes a configuration change with an in-flight HTTP PUT. */
 static struct k_mutex upload_lock;
@@ -173,13 +186,13 @@ struct linkr_webdav_settings {
 } __packed;
 
 /* The old, per-field keys are only used once to migrate existing devices. */
-static char legacy_wifi_ssid[SSID_MAX + 1];
-static char legacy_wifi_psk[PSK_MAX + 1];
-static char legacy_webdav_url[URL_MAX + 1];
-static char legacy_webdav_user[CRED_MAX + 1];
-static char legacy_webdav_pass[CRED_MAX + 1];
-static struct linkr_wifi_settings loaded_wifi_settings;
-static struct linkr_webdav_settings loaded_webdav_settings;
+static char legacy_wifi_ssid[SSID_MAX + 1] LINKR_EXT_RAM_BSS;
+static char legacy_wifi_psk[PSK_MAX + 1] LINKR_EXT_RAM_BSS;
+static char legacy_webdav_url[URL_MAX + 1] LINKR_EXT_RAM_BSS;
+static char legacy_webdav_user[CRED_MAX + 1] LINKR_EXT_RAM_BSS;
+static char legacy_webdav_pass[CRED_MAX + 1] LINKR_EXT_RAM_BSS;
+static struct linkr_wifi_settings loaded_wifi_settings LINKR_EXT_RAM_BSS;
+static struct linkr_webdav_settings loaded_webdav_settings LINKR_EXT_RAM_BSS;
 static bool wifi_settings_seen;
 static bool wifi_settings_valid;
 static bool webdav_settings_seen;
@@ -1596,7 +1609,7 @@ static int http_put(const struct webdav_url *u, const uint8_t *payload,
         goto out;
     }
 
-    static uint8_t recv_buf[512];
+    static uint8_t recv_buf[512] LINKR_EXT_RAM_BSS;
     struct http_request req = {
         .method = HTTP_PUT,
         .url = u->path,
@@ -1643,7 +1656,7 @@ static void upload_thread(void *a, void *b, void *c)
     ARG_UNUSED(b);
     ARG_UNUSED(c);
 
-    static uint8_t chunk[WEBDAV_UPLOAD_CHUNK];
+    static uint8_t chunk[WEBDAV_UPLOAD_CHUNK] __aligned(4) LINKR_EXT_RAM_BSS;
     size_t pending_total = 0;
     atomic_val_t pending_generation = 0;
     uint32_t pending_sequence = 0;
