@@ -334,42 +334,6 @@ config LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC
 	  Firmware that predates the service keeps its fixed
 	  "Linkr BLE UART..." name as a compatibility discovery signal.
 
-config LINKR_BLE_BRIDGE_BLE_TX_POWER_DBM
-	int "BLE transmit power in dBm"
-	depends on BT && BT_HCI_VS
-	default 9
-	range -15 20
-	help
-	  Transmit power applied to scanning and the default link once the
-	  Bluetooth stack is up, instead of inheriting whatever the controller
-	  powered up with. The advertisement inherits the default bucket too.
-
-	  The ESP32-C5 controller default measured -86 dBm with a tablet 30 cm
-	  away, which left the device visible to an actively scanning host but
-	  invisible to Windows and Android system scans: their scan windows are
-	  a small fraction of the time, and at that level even the scan
-	  response (which carries the name) is lost. Setting the power
-	  explicitly is what fixes that; 9 dBm is the shipped value.
-
-	  9 dBm keeps 9 + 2-3 dBi antenna gain at ~11-12 dBm EIRP, well inside
-	  the 20 dBm EIRP ceiling CE and China's SRRC allow for 2.4 GHz, and
-	  costs about 175 mA of BLE peak current against 319 mA at 19 dBm
-	  (ESP32-C5-WROOM-1 datasheet). It is a link-budget knob: raise it per
-	  deployment when the site is noisy or the range is long, and check the
-	  EIRP budget first (20 dBm lands at roughly 22-23 dBm EIRP).
-
-	  Bench note, worth re-measuring before raising it: on the test board,
-	  with a Windows host whose WiFi was active, 9 dBm was found in 0 of 3
-	  scans at a moment when the same position measured -81 dBm, while
-	  15 dBm and 20 dBm were found 3 of 3 and 4 of 4 at -76 ~ -80 and
-	  -71 ~ -77 dBm. Part of that spread was the room, not the firmware:
-	  moving the board and putting it back changed the reading by ~7 dB.
-	  If a site reports "device not found", try 15 dBm before suspecting
-	  the stack.
-
-	  The controller clamps to its own maximum: 20 dBm on the C5, 9 dBm on
-	  the C3, where a higher value maps to the highest level available.
-
 config LINKR_BLE_BRIDGE_TEST_UART_ECHO
 	bool "Echo received UART bytes back to UART"
 	help

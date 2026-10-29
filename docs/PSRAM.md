@@ -143,31 +143,6 @@ stay in DRAM.
 | WiFi adapter heap and packet buffers | see the scan measurements above |
 | BLE controller data, `net_buf` pools, `http_server` contexts | owned by the wireless stacks and the network dataplane |
 
-## Zephyr patch: shared multi-heap locking
-
-`shared_multi_heap` sits on top of `sys_heap`, which provides no
-synchronization of its own — all locking must come from the caller. The
-Espressif WiFi stack calls `esp_wifi_malloc_func()` from both thread and ISR
-context, so with PSRAM enabled the allocator needs a lock:
-
-`patches/zephyr/0001-shared-multi-heap-serialize-access-with-a-spinlock.patch`
-adds one global ISR-safe `k_spinlock` around
-alloc/free/realloc/aligned_alloc and heap registration.
-
-`CMakeLists.txt` applies it idempotently after `find_package(Zephyr)` resolves
-`ZEPHYR_BASE`, so `west update` cannot silently drop it and every machine
-builds the same image. It is applied for every board (not only PSRAM ones),
-because the Zephyr tree is shared and one extra uncontended spinlock is
-harmless. A clean tree therefore shows exactly one modified file:
-
-```sh
-git -C $ZEPHYR_BASE status --short
-#  M lib/heap/shared_multi_heap.c
-```
-
-If the patch was applied by hand and later reverted, the next build re-applies
-it; if it is already applied, the build says so and skips it.
-
 ## Building both variants
 
 ```sh
