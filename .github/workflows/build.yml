@@ -289,13 +289,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          conf=()
-          if [ -n "${{ matrix.extra_conf }}" ]; then
-            conf+=("-DEXTRA_CONF_FILE=${{ matrix.extra_conf }}")
-          fi
           west build -p always -b "${{ matrix.board }}" \
-            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app" \
-            -- "${conf[@]}"
+            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
 
       - name: Verify default feature set
         shell: bash
@@ -374,9 +369,7 @@ jobs:
           fi
           # PSRAM layout. The released C5 image runs with the module's 8 MB
           # part enabled and must keep the WiFi heap, the WiFi packet buffers
-          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it. The
-          # internal-SRAM-only C5 variant is no longer built here; the caveat
-          # and its limits are recorded in docs/C5_PSRAM.md.
+          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it.
           if [ "${{ matrix.expect_psram }}" = "y" ]; then
             grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
             grep -qx 'CONFIG_ESP_SPIRAM_SIZE=8388608' "${config}"
@@ -389,7 +382,6 @@ jobs:
           fi
 
       - name: Package firmware
-        if: ${{ !matrix.no_package }}
         shell: bash
         run: |
           set -euo pipefail
@@ -438,7 +430,6 @@ jobs:
           EOF
 
       - name: Upload firmware
-        if: ${{ !matrix.no_package }}
         uses: actions/upload-artifact@v4
         with:
           name: linkr-bee-${{ matrix.slug }}
