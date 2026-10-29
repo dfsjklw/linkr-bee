@@ -92,7 +92,12 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 > 以及把 30 s 看门狗从 system workqueue 挪到内核时钟定时器 + 独立队列 —— 原先那个
 > 看门狗和被它看守的扫描排在同一条队列上，扫描卡住时它自己也被卡住，永远不会触发。
 > 修复后实测：BLE 连接下扫描 22–27 s 完成（空闲时 19.7 s，修复前 60–75 s 且常常不完成），
-> 5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。详见工作笔记 §14。
+> 5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。
+>
+> **两处改动都只在 C5 上编译**（`#if defined(CONFIG_SOC_SERIES_ESP32C5)`）：C3 与
+> ESP32-WROOM-32 没有观察到这种行为，它们保留原来的 delayable-work 看门狗，也不为
+> 此各付一个 768 B 栈 + 独立队列。若其他板子上出现同样的「扫描卡住而看门狗不响」，
+> 把同一个 `LINKR_SCAN_WD_OWN_QUEUE` 开关放开即可。
 | `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
 ## 5. 构建
