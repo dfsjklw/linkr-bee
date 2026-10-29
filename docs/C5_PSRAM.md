@@ -81,6 +81,13 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 | 只占 `.bss` 尾 4.5 KB（`0x4085E610`） | 关联 30 s 超时并无限重试 |
 | `CONFIG_SPIRAM_SPEED_40M` | 启动即进 `CPU_LOCKUP` 复位循环，只能 80 MHz |
 | `ESP_WIFI_HEAP_SPIRAM` 或 `ESP32_WIFI_NET_ALLOC_SPIRAM` | 2.4 GHz 扫描 40 s 无结果，且超时看门狗也不触发 |
+
+> **别把这个症状当作单一证据。** `@w scan` 卡死（`WiFi scan started` 之后再无输出，
+> 连超时告警都没有）在**配置正确**的镜像上也会出现：只要 BLE 处于连接状态，扫描在共存
+> 调度下会比空闲时慢得多，而扫描超时 work 与 `esp_wifi_scan_start()` 排在同一条 system
+> workqueue，一旦超时本身也被卡住，整条队列连同后续的 `@w=` 配网请求都会一起失效，
+> 只有复位能恢复。判断「WiFi 堆是否被放进 PSRAM」要看 `.config` 里的
+> `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，不要看扫描是否卡住。
 | `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
 ## 5. 两套构建
