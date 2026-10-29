@@ -110,6 +110,44 @@ static struct k_mutex scan_cache_lock;
 static struct k_work_delayable wifi_retry_work;
 static struct k_work_delayable wifi_scan_timeout_work;
 static struct k_work_delayable wifi_operation_timeout_work;
+
+/*
+ * The scan watchdog cannot live on the system workqueue. A WiFi operation that
+ * owns that queue is exactly the condition the watchdog exists to break out of,
+ * so a delayable work item queued there can never police it: measured on the
+ * C5, a sweep with a BLE link up took 60-75 s against 19.7 s idle, and the
+ * 30 s watchdog never fired because it sat behind the very scan it was meant
+ * to time out. The timer below runs from the kernel clock interrupt, which no
+ * thread can block, and hands the job to a dedicated preemptible queue so the
+ * error still reaches the host.
+ */
+static struct k_work_q scan_wq;
+static struct k_timer scan_watchdog;
+/* The handler only formats a <=96 B line and hands it to linkr_mgmt_send(),
+ * which allocates and queues without touching BLE, so the stack stays small;
+ * SRAM is the binding constraint on this target. */
+K_THREAD_STACK_DEFINE(scan_wq_stack, 768);
+
+/* BLE and WiFi share one radio on this part. With the default balance policy a
+ * connected BLE link starves a sweep, so bias the coexistence arbiter towards
+ * WiFi while a scan is in flight and restore the default once it ends. */
+#if defined(CONFIG_SOC_SERIES_ESP32C5) && defined(CONFIG_ESP32_SW_COEXIST_ENABLE)
+#include <esp_coexist.h>
+/*
+ * esp_coex_preference_set() is a one-line wrapper in esp_coex/src/coexist.c,
+ * but this build only compiles lib_printf.c and esp_coex_adapter.c from that
+ * component, so the wrapper is absent while the blob export it forwards to is
+ * linked. Call the blob entry directly; esp_coex_prefer_t and coex_prefer_t
+ * carry identical values (WIFI=0, BT=1, BALANCE=2).
+ */
+extern int coex_preference_set(esp_coex_prefer_t prefer);
+#define LINKR_SCAN_COEX_BIAS 1
+#else
+#define LINKR_SCAN_COEX_BIAS 0
+#endif
+
+#define SCAN_WQ_PRIO 5
+
 static int wifi_scan_emit(const char *line);
 static atomic_t wifi_connected;
 static atomic_t wifi_ip_ready;
@@ -1030,6 +1068,7 @@ static void wifi_scan_release(void)
 {
     struct bt_conn *conn;
 
+    k_timer_stop(&scan_watchdog);
     (void)k_work_cancel_delayable(&wifi_scan_timeout_work);
 
     k_mutex_lock(&scan_lock, K_FOREVER);
@@ -1041,6 +1080,23 @@ static void wifi_scan_release(void)
     if (conn) {
         bt_conn_unref(conn);
     }
+
+#if LINKR_SCAN_COEX_BIAS
+    /* Back to the default arbiter policy: the bias only exists to get the
+     * sweep through, and leaving it on would starve BLE for everything that
+     * follows. */
+    (void)coex_preference_set(ESP_COEX_PREFER_BALANCE);
+#endif
+}
+
+/* Clock-ISR half of the watchdog: no workqueue involved, so a WiFi operation
+ * holding the system workqueue cannot delay it. Hand the reporting to the
+ * dedicated queue. */
+static void scan_watchdog_expiry(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+
+    (void)k_work_submit_to_queue(&scan_wq, &wifi_scan_timeout_work.work);
 }
 
 /* Watchdog: a driver that never reports NET_EVENT_WIFI_SCAN_DONE (cancel or
@@ -1075,6 +1131,13 @@ static void wifi_scan_work_handler(struct k_work *work)
     params.bands = BIT(WIFI_FREQ_BAND_2_4_GHZ);
     params.max_bss_cnt = 0;
 
+#if LINKR_SCAN_COEX_BIAS
+    /* Bias the radio arbiter towards WiFi for the duration of the sweep: with
+     * the default policy a connected BLE link stretched it from 19.7 s to
+     * 60-75 s. wifi_scan_release() restores the default on every exit path. */
+    (void)coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
+
     /* esp_wifi_start()/esp_wifi_scan_start() can consume more stack than the
      * Bluetooth RX workqueue owns. Start the scan on the 4 KiB system
      * workqueue; result callbacks remain asynchronous. */
@@ -1088,9 +1151,10 @@ static void wifi_scan_work_handler(struct k_work *work)
     }
 
     /* Arm the watchdog so a driver that never reports completion cannot wedge
-     * the scan state. */
-    (void)k_work_reschedule(&wifi_scan_timeout_work,
-                            K_MSEC(WIFI_SCAN_TIMEOUT_MS));
+     * the scan state. The timer runs from the clock ISR and re-queues the
+     * handler on its own queue, so a WiFi operation holding the system
+     * workqueue cannot postpone it. */
+    k_timer_start(&scan_watchdog, K_MSEC(WIFI_SCAN_TIMEOUT_MS), K_NO_WAIT);
     LOG_INF("WiFi scan started");
 }
 
@@ -1870,6 +1934,13 @@ int linkr_wifi_init(void)
 			      wifi_operation_timeout_handler);
     k_work_init(&wifi_scan_work, wifi_scan_work_handler);
     k_work_init_delayable(&wifi_scan_timeout_work, wifi_scan_timeout_handler);
+    k_timer_init(&scan_watchdog, scan_watchdog_expiry, NULL);
+    k_work_queue_start(&scan_wq, scan_wq_stack,
+                       K_THREAD_STACK_SIZEOF(scan_wq_stack),
+                       K_PRIO_PREEMPT(SCAN_WQ_PRIO), NULL);
+    if (IS_ENABLED(CONFIG_THREAD_NAME)) {
+        (void)k_thread_name_set(&scan_wq.thread, "scan_watchdog");
+    }
     atomic_set(&wifi_state, LINKR_WIFI_STATE_OFF);
 
     k_thread_create(&wifi_connect_thread, wifi_connect_stack,

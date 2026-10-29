@@ -84,10 +84,15 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 
 > **别把这个症状当作单一证据。** `@w scan` 卡死（`WiFi scan started` 之后再无输出，
 > 连超时告警都没有）在**配置正确**的镜像上也会出现：只要 BLE 处于连接状态，扫描在共存
-> 调度下会比空闲时慢得多，而扫描超时 work 与 `esp_wifi_scan_start()` 排在同一条 system
-> workqueue，一旦超时本身也被卡住，整条队列连同后续的 `@w=` 配网请求都会一起失效，
-> 只有复位能恢复。判断「WiFi 堆是否被放进 PSRAM」要看 `.config` 里的
-> `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，不要看扫描是否卡住。
+> 调度下会比空闲时慢得多。判断「WiFi 堆是否被放进 PSRAM」要看 `.config` 里的
+> `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，不要看扫描快慢。
+>
+> 这条共存慢路径本身已经处理过，`src/wifi.c` 里有两处配套改动：扫描期间把射频仲裁
+> 偏向 WiFi（`coex_preference_set(ESP_COEX_PREFER_WIFI)`，结束恢复 `BALANCE`），
+> 以及把 30 s 看门狗从 system workqueue 挪到内核时钟定时器 + 独立队列 —— 原先那个
+> 看门狗和被它看守的扫描排在同一条队列上，扫描卡住时它自己也被卡住，永远不会触发。
+> 修复后实测：BLE 连接下扫描 22–27 s 完成（空闲时 19.7 s，修复前 60–75 s 且常常不完成），
+> 5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。详见工作笔记 §14。
 | `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
 ## 5. 两套构建
