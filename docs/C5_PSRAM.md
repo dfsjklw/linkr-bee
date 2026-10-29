@@ -95,23 +95,41 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 > 5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。详见工作笔记 §14。
 | `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
-## 5. 两套构建
+## 5. 构建
 
 ```sh
-# 默认：启用 PSRAM（CI 发布的镜像）。
 west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-psram linkr-bee
+```
 
-# 纯内部 SRAM，用于回归：上述配置全部关闭，缓冲回到能塞进
-# DRAM_SHARED_BUFFERS_END 以下的尺寸。
+`build.yml` 断言 PSRAM 配置项，因此“悄悄丢掉 PSRAM”或“镜像开始使用
+WiFi-in-PSRAM 选项”都会在打包前失败。
+
+改过板级 `*.conf`、`*.overlay` 或 `CMakeLists.txt` 后必须从零配置
+（`rm -rf build/<dir>`）：缓存的配置曾在一次全新检出上掩盖过一个构建中断的缺陷。
+
+### 内部 SRAM only 变体：保留文件，但不再维护
+
+`c5_pure_sram.conf` 仍然留在仓库里，但**不在 CI 构建、不保证能链接**。
+需要时手工指定：
+
+```sh
 west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
   -DEXTRA_CONF_FILE=c5_pure_sram.conf
 ```
 
-CI 两种都构建（纯 SRAM 变体只构建、不发布），`build.yml` 按变体断言 PSRAM 配置，
-因此“悄悄丢掉 PSRAM”或“PSRAM 镜像开始使用 WiFi-in-PSRAM 选项”都会在打包前失败。
+停止维护的原因：
 
-改过板级 `*.conf`、`*.overlay` 或 `CMakeLists.txt` 后必须从零配置
-（`rm -rf build/<dir>`）：缓存的配置曾在一次全新检出上掩盖过一个构建中断的缺陷。
+- **本项目只支持 `esp32c5_devkitc/esp32c5/hpcore`**（WROOM-1-N8R4，带 PSRAM）。
+  存在无 PSRAM 的 C5 模块（Zephyr 的 `esp32c5_lpcore_wroom_n8.dtsi` 就没有
+  `psram0` 节点），但它从未进入本项目的支持矩阵，没有对应的板级配置与实测。
+- **余量已经不够了。** 该变体在 99.67 %（余 1264 B），每加一个功能就要重新平衡
+  两套配置的裁剪表；而它的收益只剩「配置集能链接」这一条。
+- **它独占的验证价值有限。** `src/ext_ram.h` 的宏在无 PSRAM 时展开为空 —— 这条路径
+  仍被 C3 supermini / devkitm / devkitc 与 Linkr Bee X1.0 四个 CI job 覆盖（它们都
+  不启用 `CONFIG_ESP_SPIRAM`）。
+
+保留 `c5_pure_sram.conf` 而不删除，是因为它记录了把每个尺寸压回 DRAM 预算的完整
+映射，紧急排查或需要纯 SRAM 实验时是现成的起点。**它是一份参考，不是受支持的配置。**
 
 ## 6. 怎么量，怎么自检
 
@@ -142,5 +160,4 @@ riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep uart_rx_storage
 全部生效，并确认 `_ext_ram_bss` 真的落在外部 RAM 段（而不是静默退回内部 SRAM）。
 加缓冲或改板级配置后跑一次即可。
 
-> 纯 SRAM 变体（`c5_pure_sram.conf`）目前只在 CI 的 `.github/workflows/build.yml`
-> 里构建与断言，`tools/verify.sh` 不构建它 —— 本地手动回归请照第 5 节跑一次那条命令。
+> 纯 SRAM 变体不在 CI、也不在 `tools/verify.sh` 里，见第 5 节最后一段。

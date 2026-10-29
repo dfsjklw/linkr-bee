@@ -235,20 +235,6 @@ jobs:
             flash_address: "0x2000"
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
             expect_psram: "y"
-          # The same board with the module's PSRAM compiled out: the internal
-          # SRAM only image has to keep building, because everything that can
-          # go to PSRAM is conditional (src/ext_ram.h) and the configuration
-          # under it has to stay linkable. Build-only, not released.
-          - name: ESP32-C5 DevKitC (internal SRAM only)
-            board: esp32c5_devkitc/esp32c5/hpcore
-            slug: esp32c5-devkitc-sram
-            chip: esp32c5
-            toolchain: riscv64-zephyr-elf
-            flash_address: "0x2000"
-            factory_reset: GPIO28 BOOT to GND for two seconds during boot
-            extra_conf: c5_pure_sram.conf
-            expect_psram: "n"
-            no_package: true
           - name: ESP32-WROOM-32 DevKitC
             board: esp32_devkitc/esp32/procpu
             slug: esp32-wroom-32
@@ -388,8 +374,9 @@ jobs:
           fi
           # PSRAM layout. The released C5 image runs with the module's 8 MB
           # part enabled and must keep the WiFi heap, the WiFi packet buffers
-          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it; the
-          # SRAM-only variant must have none of it compiled in.
+          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it. The
+          # internal-SRAM-only C5 variant is no longer built here; the caveat
+          # and its limits are recorded in docs/C5_PSRAM.md.
           if [ "${{ matrix.expect_psram }}" = "y" ]; then
             grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
             grep -qx 'CONFIG_ESP_SPIRAM_SIZE=8388608' "${config}"
@@ -399,9 +386,6 @@ jobs:
             grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
             grep -qx '# CONFIG_ESP_WIFI_HEAP_SPIRAM is not set' "${config}"
             grep -qx '# CONFIG_ESP32_WIFI_NET_ALLOC_SPIRAM is not set' "${config}"
-          elif [ "${{ matrix.expect_psram }}" = "n" ]; then
-            grep -qx '# CONFIG_ESP_SPIRAM is not set' "${config}"
-            grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
           fi
 
       - name: Package firmware
