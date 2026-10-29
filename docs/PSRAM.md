@@ -21,7 +21,7 @@ Zephyr's memory:
 
 The WiFi/PHY code runs from there. Handing it to Zephyr makes association hang
 or the chip lock up (`rst:0x1a CPU_LOCKUP`), and `soc/espressif/esp32c5/memory.h`
-must stay at its upstream value. That is why the pure-SRAM image sat at 99.06 %
+must stay at its upstream value. That is why the pure-SRAM image sat above 99 %
 of `sram0_0_seg` and why its buffers had been cut to fit.
 
 ## What the default configuration does
@@ -54,8 +54,8 @@ Build output for the two configurations on this board:
 
 | Image | `sram0_0_seg` | `ext_dram_seg` |
 |---|---|---|
-| PSRAM default | 376032 B / 378384 B (99.38 %) | 5131568 B / 8 MB (61.17 %) |
-| Internal SRAM only (`c5_pure_sram.conf`) | 374816 B / 378384 B (99.06 %) | — |
+| PSRAM default | 377008 B / 378384 B (99.64 %) | 5197216 B / 8 MB (61.96 %) |
+| Internal SRAM only (`c5_pure_sram.conf`) | 375888 B / 378384 B (99.34 %) | — |
 
 ## SRAM headroom re-evaluation
 
@@ -87,10 +87,16 @@ Two values stay where they are:
   used up, so the second `ws://` is refused at the TCP layer and
   `linkr_ws_setup()` never runs.
 
-The image sits at 99.38 % with 2352 B free. `NET_BUF_*_COUNT` going back to 28
-is the first knob to turn if a future feature needs more room (98.72 %,
-4848 B free); every one of these numbers is a link-time constant, so the
-percentage reflects reserve, not runtime pressure.
+The image sits at 99.64 % with **1376 B free**. `NET_BUF_*_COUNT` going back to
+28 is the first knob to turn if a future feature needs more room; it frees about
+2.5 KB. Every one of these numbers is a link-time constant, so the percentage
+reflects reserve, not runtime pressure.
+
+Those figures are from the image that also carries the upstream import (Linkr
+Bee X1.0, the `@l`/`@o`/`@r` commands). Their sources compile to stubs on the
+C5 but still occupy DRAM, so both variants link about 1 KB larger than they did
+before that import -- which is why the PSRAM default is down to 1.3 KB of
+headroom instead of the 2.3 KB recorded earlier.
 
 
 ## What lives in PSRAM
@@ -114,7 +120,7 @@ Nothing placed there may carry data across a warm reset; use
 The macro expands to nothing on the C3, which has no PSRAM support and whose
 linker script has no such section, so the same sources build for both.
 
-Buffers moved there on the C5 (19760 B in total, `_ext_ram_bss_start` to
+Buffers moved there on the C5 (19744 B in total, `_ext_ram_bss_start` to
 `_ext_ram_bss_end`):
 
 | Buffer | Bytes | Producer / consumer |

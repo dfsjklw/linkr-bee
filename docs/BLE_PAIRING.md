@@ -83,50 +83,6 @@ Management、Reliable UART 和兼容 NUS 的特征值及 CCC 均要求加密访�
 实现使用 Zephyr 的同步 `pairing_accept` 回调在收到请求时决定是否继续，接口说明见
 [Zephyr authentication callbacks](https://docs.zephyrproject.org/latest/doxygen/html/structbt__conn__auth__cb.html)。
 
-## Windows 主机实测（2026-10-28，C5 + `dev_c5_open_pairing.conf`）
-
-Windows 11 + Intel 无线网卡，`bleak` 3.0.2 / `tools/linkr_ble_terminal.py`：
-
-| 项目 | 结果 |
-|---|---|
-| 扫描发现 | -61 ~ -66 dBm，12 次采样 0 丢失，标准差 1.8 dB |
-| 配对 | 正式镜像要求 GPIO1 接地（`Insufficient Authentication`）；bench 镜像 `BleakClient.pair()` 直接成功 |
-| GATT | GAP、GATT、Linkr Management（`4c4b0001-…`）、NUS（`6e400001-…`）、Reliable UART（`4c4b0010-…`） |
-| 管理通道 | `@n?`/`@i?`/`@u?`/`@w?`/`@c?` 全通，`security=2`，`@c?` 报 `peers=1 ble_max=2` |
-| 串口桥 | 写 `echo probe-ok\r\n` → 收到 111 B 带 bracketed-paste 的 radxa shell 回显 |
-| 大流量 | `ls -R … | head -2200` → 40134 B / 8.1 s，`uart/queue/peer dropped` 全 0 |
-| 断连重连 | 连续 3 次，每次 MTU 247，绑定生效、无需重新配对 |
-| 长连接 | 85 s / 76 次心跳全通，0 断连 |
-| WiFi 扫描（BLE 保持连接） | `@w scan` 扫到 10 个 AP，BLE 链路未断 |
-| WiFi 配网（BLE 保持连接） | `@w=b601_a` → `phase=ready ip=192.168.31.99`，BLE 全程不断 |
-| 改名 | `@n=Linkr Bee T1` 立即出现在广播、`@n?` 报 `custom=yes`；`@n default` 恢复 |
-
-两个 Windows 侧注意事项（都不是固件问题）：
-
-- `WinError -2147023673`（"操作已被用户取消"）偶发率约 1/2，重试即可，见下节。
-- `tools/linkr_ble_terminal.py --timeout N` 会被传给 `BleakClient(timeout=N)`。给
-  `--wifi-scan` 顺手加 `--timeout 55` 会让连接在管理通道建立前被取消，看起来像
-  WiFi 扫描把 BLE 打掉了，实际是参数用错。扫 WiFi 不要动 `--timeout`。
-
-多主机共存也测过了（Windows + Android 平板上的 Linkr Bee App 同时连接）：
-
-```
-[win] t=9s  @c? -> self=10 owner=10 mode=control epoch=10 peers=1 ble_max=2
-[win] t=27s @c? -> self=10 owner=10 mode=control epoch=10 peers=2 ble_max=2   ← 平板接入
-[win] t=46s @c? -> peers=2
-[win] t=64s @c? -> peers=2
-[win] t=83s @c? -> peers=2
-```
-
-Windows 侧五轮采样里心跳全部正常、没有掉线，控制权始终在 Windows 手上；平板
-App 同时把 `@i?`/`@w?`/`@s?`/`@n?` 都查了一遍（`security=2`），并且能看到
-UART 侧输出（`radxa@radxa-cubie-a5e:~$`）。也就是说 `BT_MAX_CONN=2` 的两条链路
-和"只允许一个控制者"的仲裁都是按设计工作的。
-
-平板侧的操作提示：nRF Connect 的 `CONNECT` 按钮对 `adb shell input tap` 注入的
-点击不响应（扫描中点到的是别的设备详情），用平板上的 Linkr Bee App 点「重新连接」
-（顶部绿色按钮，中心约 `(1017, 179)`）最省事。
-
 ## 实机验收（构建与主机测试不能替代）
 
 下表针对启用配对授权的配置（C3/C5，或手工开启的 WROOM）。WROOM 默认

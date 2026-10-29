@@ -121,16 +121,6 @@ For ESP32-C5 DevKitC:
 west build -b esp32c5_devkitc/esp32c5/hpcore linkr-bee
 ```
 
-That image runs with the module's 8 MB PSRAM enabled and moves every buffer that
-can leave internal RAM into it; see [PSRAM.md](PSRAM.md) for what moves, what
-deliberately stays in DRAM, and why. The internal-SRAM-only variant, which CI
-also builds, is one extra fragment:
-
-```sh
-west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
-  -DEXTRA_CONF_FILE=c5_pure_sram.conf
-```
-
 For the Linkr Bee X1.0 production board (MV013). The board definition lives in
 this repository under `boards/radxa/linkr_bee_x1_0`, and `CMakeLists.txt`
 registers the application root as a `BOARD_ROOT`, so no extra CMake argument is
