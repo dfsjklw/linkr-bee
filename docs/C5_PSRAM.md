@@ -1,13 +1,14 @@
 # ESP32-C5 PSRAM 与内部 SRAM 布局
 
 > 依据 ESP32-C5 DevKitC（**WROOM-1-N8R4** 模块，8 MB QSPI PSRAM）的实机测量，并对照
-> 本仓库 `boards/esp32c5_devkitc_esp32c5_hpcore.conf`、`boards/esp32c5_devkitc_esp32c5_hpcore.overlay`
-> 与 `src/ext_ram.h` 的实现整理。
+> `boards/esp32c5_devkitc_esp32c5_hpcore.{conf,overlay}` 与 `src/ext_ram.h` 的实现整理。
 > 本文只描述 **C5 目标**：C3 与 ESP32-WROOM-32 没有 PSRAM，`src/ext_ram.h` 的宏在这些
 > 板子上展开为空，全部缓冲留在内部 RAM。
-> 文中内存数字都是链接期常量，反映的是预留而不是运行时压力。
+>
+> 本文**不记录具体的字节数与占用百分比**，那些数字随功能增减而变，写在这里只会过时。
+> 需要时按下文第 6 节自己量，或用 `tools/verify.sh` 断言。
 
-## 1. 为什么需要它
+## 1. 硬边界：ROM 区间不可占
 
 C5 镜像里 Zephyr 能链接的一切都必须落在 `DRAM_SHARED_BUFFERS_END = 0x4085C610` 以下。
 这个地址之上的 12.8 KB **不属于 Zephyr**：
@@ -18,123 +19,71 @@ C5 镜像里 Zephyr 能链接的一切都必须落在 `DRAM_SHARED_BUFFERS_END =
 | `0x4085E610` – `0x4085F800` | 4.5 KB | ROM 的 `.bss`/`.data` 尾部 |
 
 WiFi/PHY 代码运行在这两段里。把它划给 Zephyr 会让关联挂死，或直接锁死芯片
-（`rst:0x1a CPU_LOCKUP`），所以 `soc/espressif/esp32c5/memory.h` 必须保持上游原值。
-这也是纯 SRAM 镜像当时卡在 `sram0_0_seg` 99 % 以上、缓冲被一路压缩的原因。
+（`rst:0x1a CPU_LOCKUP`），因此 `soc/espressif/esp32c5/memory.h` 必须保持上游原值。
+这也是纯 SRAM 镜像曾卡在 `sram0_0_seg` 99 % 以上、缓冲被一路压缩的原因。
 
-## 2. 默认配置做了什么
+## 2. 放置规则
 
-上游 `esp32c5_wroom_n8r4.dtsi` 只声明 4 MB，因此
-`boards/esp32c5_devkitc_esp32c5_hpcore.overlay` 先修正容量：
+`src/ext_ram.h` 的 `LINKR_EXT_RAM_BSS` 把对象放进 `.ext_ram.bss`，仅在
+`CONFIG_ESP_SPIRAM && CONFIG_SOC_SERIES_ESP32C5` 下生效，其余板子展开为空。
+该段由 Espressif 链接脚本提供，位于 `.ext_ram.data` 内、`_ext_ram_heap_start` 之前，
+不会与 shared multi-heap 重叠，并由 `soc/espressif/common/esp_psram.c` 在 PSRAM
+初始化时清零 —— 所以放在这里的对象**不能**携带需要跨越热复位的状态（若确实需要，
+用 `.ext_ram_noinit.*`）。
 
-```dts
-&psram0 {
-        size = <DT_SIZE_M(8)>;
-};
-```
+能搬的判据是三条，缺一不可：
 
-`CONFIG_ESP_SPIRAM_SIZE` 由该节点推导，且只有 8 MB 才会选中 `SPIRAM_TYPE_ESPPSRAM64`，
-所以这个 overlay 不能省。
+1. **纯数据** —— 不含内核对象本体（`k_mutex`/`k_sem`/`k_msgq`/`ring_buf` 结构）。
+2. **无 ISR 访问** —— 中断上下文里走一次 QSPI 往返不可接受，`uart_rx_storage` 就因此
+   留在 DRAM。
+3. **允许在 PSRAM 初始化时被清零**，而不是在加载时。
 
-`boards/esp32c5_devkitc_esp32c5_hpcore.conf` 随后启用以下配置：
+线程栈**永远不能**放进来：Zephyr 不支持把栈放在外部 RAM（异常与上下文切换路径会访问它）。
 
-| 配置 | 取值 | 原因 |
-|---|---|---|
-| `CONFIG_ESP_SPIRAM` | `y` | 启用外部 RAM |
-| `CONFIG_SPIRAM_MODE_QUAD` | `y` | 模块上的器件是四线 SPI |
-| `CONFIG_SPIRAM_SPEED_80M` | `y` | 40 MHz 会进入 `rst:0x1a CPU_LOCKUP` 复位循环 |
-| `CONFIG_ESP_SPIRAM_HEAP_SIZE` | 4 MB | 供 shared multi-heap 使用；8 MB 的其余部分留作备用 |
-| `CONFIG_ESP_SPIRAM_MEMTEST` | `n` | 每 MB 约 100 ms 启动开销，运行时证明不了什么 |
-| `CONFIG_ESP_WIFI_HEAP_SYSTEM` | `y` | WiFi 适配器堆必须由内部 RAM 供给 |
-| `CONFIG_ESP_WIFI_HEAP_SPIRAM`、`CONFIG_ESP32_WIFI_NET_ALLOC_SPIRAM` | `n` | 任一项打开后 2.4 GHz 扫描永不完成（40 s 无结果，正常为 19.7 s） |
+C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与命令缓冲、`ble_peers.c`
+的每 peer 队列 payload、`ws_bridge.c` 的每客户端 ring 与握手缓冲、`wifi.c` 的日志环/
+扫描缓存/WiFi 与 WebDAV 凭据/上传暂存、`ble_mgmt.c` 的 `rx_states`。
+逐项字节数与生产者/消费者见各文件定义处的注释。
 
-本板两套配置的构建输出：
+> GCC 不允许对结构体成员加 `section` 属性，所以原本作为成员的 payload 必须提成顶层数组
+> （`peer_storage`、`ws_tx_bufs`），结构体里只留指针/索引。
 
-| 镜像 | `sram0_0_seg` | `ext_dram_seg` |
-|---|---|---|
-| PSRAM 默认 | 377008 B / 378384 B（99.64 %） | 5197216 B / 8 MB（61.96 %） |
-| 纯内部 SRAM（`c5_pure_sram.conf`） | 375888 B / 378384 B（99.34 %） | — |
+## 3. 默认配置与 WiFi 的取舍
 
-## 3. SRAM 余量再分配
+`boards/esp32c5_devkitc_esp32c5_hpcore.overlay` 把 `psram0` 修正为 8 MB（上游
+`esp32c5_wroom_n8r4.dtsi` 只声明 4 MB）；`CONFIG_ESP_SPIRAM_SIZE` 由该节点推导，
+且只有 8 MB 才会选中 `SPIRAM_TYPE_ESPPSRAM64`，所以这个 overlay 不能省。
 
-`db53605`（“perf(board): trim ESP32-C5 SRAM footprint”）砍掉的那批尺寸是纯 SRAM 时代的
-权宜之计——当时该变体占到 `sram0_0_seg` 的 99.66 %。数据缓冲搬进 PSRAM 后预算重新空出来，
-板级 conf 把大部分还给上游默认值，`c5_pure_sram.conf` 再把它们压回能塞进 DRAM 的旧值：
+`CONFIG_ESP_SPIRAM_HEAP_SIZE=4194304` 供 shared multi-heap 使用，8 MB 的其余部分留作
+备用。板级 conf 里还有两条与 PSRAM 直接相关的约束（详见该文件注释）：
 
-| 配置项 | 纯 SRAM 裁剪值 | 现在（PSRAM 默认） | 还回去的代价 |
-|---|---|---|---|
-| `HTTP_SERVER_STACK_SIZE`、`SYSTEM_WORKQUEUE_STACK_SIZE`、`WIFI_CONNECT_STACK` | 3072 | 3584 | 1536 B |
-| `MAIN_STACK_SIZE`、`LOG_UPLOAD_STACK` | 3072 | 4096 | 2048 B |
-| `NET_BUF_RX_COUNT` / `NET_BUF_TX_COUNT` | 20 | 36（上游默认） | 每组约 2.5 KB |
-| `NET_PKT_RX_COUNT` / `NET_PKT_TX_COUNT` | 10 | 14（上游默认） | 与下一项合计约 500 B |
-| `ESP32_WIFI_RX_MGMT_BUF_NUM_DEF` | 2 | 3 | 同上 |
-| `ESP32_WIFI_MGMT_SBUF_NUM` | 6 | 6（保持） | 默认 32 会吃掉约 40 KB |
-| `LINKR_BLE_BRIDGE_WS_BRIDGE_MAX_CLIENTS` | 1 | 1（保持） | 不是内存限制，见下 |
+- `CONFIG_SPIRAM_SPEED_80M=y` —— 40 MHz 会进入 `rst:0x1a CPU_LOCKUP` 复位循环。
+- `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，且 `ESP_WIFI_HEAP_SPIRAM` 与
+  `ESP32_WIFI_NET_ALLOC_SPIRAM` 必须为 `n` —— 任一项打开后 2.4 GHz 扫描永不完成
+  （40 s 无结果，正常约 19.7 s）。
 
-有两项刻意不动：
+`CONFIG_ESP_SPIRAM_MEMTEST=n`：每 MB 约 100 ms 启动开销，运行时证明不了什么。
 
-- **`ESP32_WIFI_MGMT_SBUF_NUM=6`**。SBUF 环是 WiFi 驱动的发送队列，每项约 1.6 KB，
-  上游默认的 32 需要约 40 KB DRAM。无论用 6 还是 3 个 RX 管理缓冲，都从未观察到限制住
-  一次“扫描 + 连接 + DHCP”的突发。
-- **`LINKR_BLE_BRIDGE_WS_BRIDGE_MAX_CLIENTS=1`**。第二个客户端要多占一个 2048 B 环和
-  一个 3072 B 线程栈，但它根本连不上：Zephyr 的 `http_server` 在客户端额度用尽后就不再
-  轮询监听套接字，第二个 `ws://` 在 TCP 层即被拒，`linkr_ws_setup()` 从不执行。
+> **`shared_multi_heap` 目前没有锁，这是安全的但边界明确。** Zephyr 的该分配器自身
+> 不做并发保护；本配置之所以不需要，是因为 `ESP_WIFI_HEAP_SYSTEM=y` 让
+> `esp_wifi_malloc_func` 展开为 `k_malloc`，而本分支迁移的缓冲是静态放置、不经过分配器，
+> 运行时无人从该池分配，只在启动早期单线程注册一次。
+> **一旦启用 `ESP_WIFI_HEAP_SPIRAM` 或 video 驱动，必须先加回一把全局 ISR-safe
+> `k_spinlock`。**
 
-镜像现在停在 **99.64 %，余 1376 B**。后续加功能时第一个可回退的旋钮是
-`NET_BUF_*_COUNT` 回到 28（约省 2.5 KB）。
+## 4. 负面知识：别再试
 
-> 以上数字来自同时包含上游导入内容（Linkr Bee X1.0、`@l`/`@o`/`@r` 命令组）的镜像。
-> 那些源文件在 C5 上编译成桩，但仍占静态 DRAM，所以两套变体都比导入前大约 1 KB——
-> PSRAM 默认的余量因此从早先记录的 2.3 KB 降到 1.3 KB。
+以下路径都已实测排除，改动前先读这一节：
 
-## 4. 哪些缓冲放进 PSRAM
-
-`src/ext_ram.h` 只提供一个宏：
-
-```c
-#if defined(CONFIG_ESP_SPIRAM) && defined(CONFIG_SOC_SERIES_ESP32C5)
-#define LINKR_EXT_RAM_BSS __attribute__((section(".ext_ram.bss")))
-#else
-#define LINKR_EXT_RAM_BSS
-#endif
-```
-
-`.ext_ram.bss` 由 Espressif 的 SoC 链接脚本提供：它位于 `.ext_ram.data` 内、
-`_ext_ram_heap_start` 之前，不会与 shared multi-heap 重叠，并由
-`soc/espressif/common/esp_psram.c` 在 PSRAM 初始化时清零。放在这里的对象**不能**携带
-需要跨越热复位的状态；若确实需要，用 `.ext_ram_noinit.*`。
-
-该宏在 C3 上展开为空（C3 没有 PSRAM 支持，链接脚本也没有这个段），因此同一份源码可以
-同时服务两种板子。
-
-C5 上搬到该段的缓冲合计 **19744 B**（`_ext_ram_bss_start` 到 `_ext_ram_bss_end`）：
-
-| 缓冲 | 字节 | 生产者 / 消费者 |
-|---|---|---|
-| `ble_to_uart_storage`（`main.c`） | ~2000 | GATT 与 WebSocket 接收回调 → UART worker 线程 |
-| `control_command_data`、`mgmt_capture`（`main.c`） | ~1050 | 蓝牙 workqueue |
-| `peer_storage`（`ble_peers.c`） | 3840 | UART→BLE 线程 → 每 peer TX 线程 |
-| `ws_tx_bufs`、`ws_rx_buf`、`ws_handshake_buf`（`ws_bridge.c`） | ~3600 | UART→BLE 线程 → 每客户端线程；HTTP server 线程 |
-| `log_ring_storage`、`scan_cache`、WiFi/WebDAV 凭据、WebDAV 暂存（`wifi.c`） | ~8200 | 上传线程、net_mgmt 回调、管理请求 |
-| `rx_states`（`ble_mgmt.c`） | ~1070 | GATT 命令回调 → mgmt_request 线程 |
-
-GCC 不允许对结构体成员加 `section` 属性，所以两个原本把 payload 作为成员的队列——每 peer
-的 BLE 队列与每客户端的 WebSocket 环——把 payload 提成了顶层数组（`peer_storage`、
-`ws_tx_bufs`）。`k_msgq` 与 `ring_buf` 对象本体仍留在 DRAM。
-
-## 5. 哪些必须留在 DRAM，为什么
-
-| 对象 | 原因 |
+| 尝试 | 结果 |
 |---|---|
-| `uart_rx_storage`（`main.c`） | 由 UART 中断处理程序写入；在 ISR 里为每个字节走一次 QSPI 往返不可接受 |
-| 全部线程栈 | Zephyr 不支持把线程栈放在外部 RAM（异常与上下文切换路径会访问它） |
-| 内核对象本体（`k_mutex`、`k_sem`、`k_msgq`、`ring_buf` 结构） | 每个上下文（含 ISR）都会访问 |
-| `request_queue`（`ble_mgmt.c`） | 两个 512 B 槽位约 1 KB；`tests/test_ble_multipeer.py` 会把该段源码编进 host harness，而 harness 期望的是原生 `K_MSGQ_DEFINE` 展开 |
-| WiFi 适配器堆与包缓冲 | 见第 2 节的扫描测量 |
-| BLE 控制器数据、`net_buf` 池、`http_server` 上下文 | 由无线协议栈与网络数据面拥有 |
+| 把 `DRAM_USER_END` 提到 `0x4085F800`（占 ROM 栈 + `.bss` 尾） | WiFi 关联约 20 s 后 `rst:0x1a CPU_LOCKUP` |
+| 只占 `.bss` 尾 4.5 KB（`0x4085E610`） | 关联 30 s 超时并无限重试 |
+| `CONFIG_SPIRAM_SPEED_40M` | 启动即进 `CPU_LOCKUP` 复位循环，只能 80 MHz |
+| `ESP_WIFI_HEAP_SPIRAM` 或 `ESP32_WIFI_NET_ALLOC_SPIRAM` | 2.4 GHz 扫描 40 s 无结果，且超时看门狗也不触发 |
+| `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
-判断标准是三条：**是不是纯数据**、**有没有 ISR 访问**、**是不是内核对象**。
-
-## 6. 两套构建命令
+## 5. 两套构建
 
 ```sh
 # 默认：启用 PSRAM（CI 发布的镜像）。
@@ -146,21 +95,40 @@ west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
   -DEXTRA_CONF_FILE=c5_pure_sram.conf
 ```
 
-CI 两种都构建（纯 SRAM 变体只构建、不发布）。`build.yml` 会按变体断言 PSRAM 配置，
+CI 两种都构建（纯 SRAM 变体只构建、不发布），`build.yml` 按变体断言 PSRAM 配置，
 因此“悄悄丢掉 PSRAM”或“PSRAM 镜像开始使用 WiFi-in-PSRAM 选项”都会在打包前失败。
 
 改过板级 `*.conf`、`*.overlay` 或 `CMakeLists.txt` 后必须从零配置
 （`rm -rf build/<dir>`）：缓存的配置曾在一次全新检出上掩盖过一个构建中断的缺陷。
 
-## 7. 已知边界
+## 6. 怎么量，怎么自检
 
-- **`.ext_ram` 必须装得下。** 链接脚本会断言
-  `(_ext_ram_end - _ext_ram_start) <= CONFIG_ESP_SPIRAM_SIZE`，而该段 =
-  XIP placeholder（约 1 MB）+ `.ext_ram.bss` + `CONFIG_ESP_SPIRAM_HEAP_SIZE`。
-  4 MB 的 `psram0` 声明配 4 MB heap 会溢出 917504 B；声明 8 MB 才有余量。
-- **只能 80 MHz。** 40 MHz 在这颗器件上起不来。
-- **启动日志自检。** PSRAM 初始化会在 `*** Booting Zephyr OS ***` 之前打印
-  `I (esp_psram): Found 8MB PSRAM device` 与 `I (esp_psram): Speed: 80MHz`。
-  若第一行缺失，说明 overlay 没生效，`.ext_ram.bss` 的写入正落在未映射内存上。
-- **`@i?` 没有 PSRAM 计数器。** 放置情况只能从链接映射（`_ext_ram_bss_start` /
-  `_ext_ram_bss_end`）或 `riscv64-zephyr-elf-nm --size-sort` 核对，不能从设备侧读取。
+**启动日志**是 overlay 是否生效的第一道检查。PSRAM 初始化会在
+`*** Booting Zephyr OS ***` 之前打印：
+
+```
+I (esp_psram): Found 8MB PSRAM device
+I (esp_psram): Speed: 80MHz
+```
+
+若第一行缺失，说明 overlay 没生效，`.ext_ram.bss` 的写入正落在未映射内存上。
+
+**放置情况**只能从链接产物核对，`@i?` 里没有 PSRAM 计数器：
+
+```sh
+# 该段总大小与起止地址（应落在外部 RAM 段，形如 0x42xxxxxx）
+riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep _ext_ram_bss
+
+# 某个缓冲到底在不在 PSRAM 里
+riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep uart_rx_storage
+```
+
+内存占用看构建日志末尾的 `sram0_0_seg` 与 `ext_dram_seg` 两行；链接期常量，反映的是
+预留，不是运行时压力。
+
+`tools/verify.sh` 已把默认构建可断言的部分固化：构建 C5 后检查 PSRAM 配置项是否
+全部生效，并确认 `_ext_ram_bss` 真的落在外部 RAM 段（而不是静默退回内部 SRAM）。
+加缓冲或改板级配置后跑一次即可。
+
+> 纯 SRAM 变体（`c5_pure_sram.conf`）目前只在 CI 的 `.github/workflows/build.yml`
+> 里构建与断言，`tools/verify.sh` 不构建它 —— 本地手动回归请照第 5 节跑一次那条命令。
