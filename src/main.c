@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "bond_manager.h"
 #include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -1615,8 +1616,12 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		!strcmp(body, "w?") || !strcmp(body, "wifi?") ||
 		!strcmp(body, "d?") || !strcmp(body, "webdav?") ||
 		!strcmp(body, "s?") || !strcmp(body, "socket?") ||
+		!strcmp(body, "bonds?") || !strcmp(body, "bonds names?") ||
 		!strcmp(body, "target?") || linkr_aux_is_readonly(body);
-	if (!readonly) {
+	/* bonds name only ever writes the caller's own bond label, so it does not
+	 * need the console ownership the other mutations require. */
+	bool own_bond = !strcmp(body, "bonds name") || !strncmp(body, "bonds name ", 11);
+	if (!readonly && !own_bond) {
 		if (!linkr_session_command_begin(conn, mgmt_capture.epoch)) {
 			(void)send_control_response(conn, "ERR control=readonly\r\n");
 			return true;
@@ -1635,6 +1640,13 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		}
 	}
 
+	/* Header + eight maximal NAME lines + NUL fit in 512 bytes. */
+	char bond_response[512];
+	if (linkr_bond_command(conn, body, bond_response, sizeof(bond_response))) {
+		(void)send_control_response(conn, "%s", bond_response);
+		return true;
+	}
+
 	char target_response[80];
 	if (linkr_target_command(body, target_response, sizeof(target_response))) {
 		(void)send_control_response(conn, "%s", target_response);
@@ -1646,7 +1658,7 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 
 		linkr_aux_help(aux_help_text, sizeof(aux_help_text));
 		(void)send_control_response(conn,
-					     "OK cmds: @c?|@c claim|@c release|@c yield <peer> @i? @u?|@u=baud,data,par,stop,flow "
+					     "OK cmds: @linkr bonds?|@linkr bonds names?|@linkr bonds name <label>|@linkr bonds remove <type>/<address> @c?|@c claim|@c release|@c yield <peer> @i? @u?|@u=baud,data,par,stop,flow "
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
 					    "@n?|@n=<name>|@n default "
 #endif
