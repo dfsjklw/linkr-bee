@@ -6,7 +6,7 @@
 > 板子上展开为空，全部缓冲留在内部 RAM。
 >
 > 本文**不记录具体的字节数与占用百分比**，那些数字随功能增减而变，写在这里只会过时。
-> 需要时按下文第 6 节自己量，或用 `tools/verify.sh` 断言。
+> 需要时按下文第 7 节自己量，或用 `tools/verify.sh` 断言。
 
 ## 1. 硬边界：ROM 区间不可占
 
@@ -48,7 +48,60 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 > GCC 不允许对结构体成员加 `section` 属性，所以原本作为成员的 payload 必须提成顶层数组
 > （`peer_storage`、`ws_tx_bufs`），结构体里只留指针/索引。
 
-## 3. 默认配置与 WiFi 的取舍
+## 3. 共享堆与外部 BSS：应用 Kconfig 补齐默认值
+
+这是本页最容易踩错的一处，放在默认配置之前说。
+
+`.ext_ram.bss` 与共享堆**在链接期是不重叠的**：链接脚本里 `_ext_ram_bss_end` 之后才是
+`_ext_ram_heap_start`。但运行时并不看这个符号 —— `esp_psram_smh_init()` 用的是
+`esp_psram_get_mapped_region()` 返回的 `regions_to_heap[].vaddr_start`，默认是**映射区
+起点**，与 `.ext_ram.bss` 的起点同一个地址。
+
+正常情况下这不成问题，因为 `esp_psram.c` 会在
+`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y` 时把 bss 段长度从堆里扣掉
+（`vaddr_start += ext_section_size`）。而 `hal_espressif` 模块只给 ESP32 / S2 / S3 打开了
+这个开关，**C5 没有**：
+
+```kconfig
+config SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+	bool
+	default y if SOC_SERIES_ESP32
+	default y if SOC_SERIES_ESP32S2
+	default y if SOC_SERIES_ESP32S3
+```
+
+于是 `sys_heap_init()` 会在启动时把它的头部写到 `.ext_ram.bss` 的第一个对象上，而且是
+双向的：堆初始化覆盖我们的缓冲，我们的缓冲清零也破坏堆元数据。
+
+本仓库在应用 `Kconfig` 中扩展同一个符号的默认值：
+
+```kconfig
+config SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+	default y if SOC_SERIES_ESP32C5 && ESP_SPIRAM
+```
+
+它随当前构建选中的 HAL 一起解析，首次配置即生效，不修改外部源码树。
+`ZEPHYR_MODULES` 自定义路径以及不带 `.git` 的源码包都无需特殊处理。
+CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺失则停止构建。
+其它 SoC 不满足新增默认值的条件，继续使用 HAL 原有默认值。
+
+补齐后运行时堆起点正好落在 `_ext_ram_bss_end`，零重叠。
+
+> **曾试过的替代方案**：在 `.ext_ram.bss` 最前面放一个 256 B 的 padding 数组吸收
+> `sys_heap_init()` 的头部（`src/a_ext_ram_guard.c`）。它能工作，实测三条收尾路径无异常，
+> 但只是规避而非修复：
+>
+> - 依赖链接顺序（该段按 `SORT_BY_ALIGNMENT` 解析）、依赖 GCC 不重排同一编译单元的顶层
+>   变量（`-ftoplevel-reorder` 在 `-Os` 下默认开启，所以它必须独立成一个文件）、
+>   `used` 与 `retain` 缺一个就会被编译器或 `--gc-sections` 丢掉。
+> - 只在该池**永不分配**的前提下安全；一旦启用 `ESP_WIFI_HEAP_SPIRAM`，padding 之外
+>   就是真实数据。
+> - 多占 256 B PSRAM、43 行代码和一节文档。
+>
+> 两方案实测差异：Kconfig 方案 `ext_dram_seg` 5197216 B、运行时堆起点 `0x420f4da0`；
+> barrier 方案 5197472 B、堆起点 `0x420f0000`。
+
+## 4. 默认配置与 WiFi 的取舍
 
 `boards/esp32c5_devkitc_esp32c5_hpcore.overlay` 把 `psram0` 修正为 8 MB（上游
 `esp32c5_wroom_n8r4.dtsi` 只声明 4 MB）；`CONFIG_ESP_SPIRAM_SIZE` 由该节点推导，
@@ -71,7 +124,7 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 > **一旦启用 `ESP_WIFI_HEAP_SPIRAM` 或 video 驱动，必须先加回一把全局 ISR-safe
 > `k_spinlock`。**
 
-## 4. 负面知识：别再试
+## 5. 负面知识：别再试
 
 以下路径都已实测排除，改动前先读这一节：
 
@@ -100,7 +153,7 @@ C5 上已搬进去的对象集中在五处：`main.c` 的 BLE→UART 队列与�
 > 把同一个 `LINKR_SCAN_WD_OWN_QUEUE` 开关放开即可。
 | `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
-## 5. 构建
+## 6. 构建
 
 ```sh
 west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-psram linkr-bee
@@ -136,7 +189,7 @@ west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
 保留 `c5_pure_sram.conf` 而不删除，是因为它记录了把每个尺寸压回 DRAM 预算的完整
 映射，紧急排查或需要纯 SRAM 实验时是现成的起点。**它是一份参考，不是受支持的配置。**
 
-## 6. 怎么量，怎么自检
+## 7. 怎么量，怎么自检
 
 **启动日志**是 overlay 是否生效的第一道检查。PSRAM 初始化会在
 `*** Booting Zephyr OS ***` 之前打印：
@@ -165,4 +218,4 @@ riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep uart_rx_storage
 全部生效，并确认 `_ext_ram_bss` 真的落在外部 RAM 段（而不是静默退回内部 SRAM）。
 加缓冲或改板级配置后跑一次即可。
 
-> 纯 SRAM 变体不在 CI、也不在 `tools/verify.sh` 里，见第 5 节最后一段。
+> 纯 SRAM 变体不在 CI、也不在 `tools/verify.sh` 里，见第 6 节最后一段。

@@ -108,7 +108,14 @@ static struct k_work wifi_scan_work;
 static struct k_mutex scan_lock;
 static struct k_mutex scan_cache_lock;
 static struct k_work_delayable wifi_retry_work;
-static struct k_work_delayable wifi_scan_timeout_work;
+#if defined(CONFIG_SOC_SERIES_ESP32C5)
+/* Plain work, not delayable: the clock timer below submits it, and
+ * k_work_cancel() asserts when the object carries K_WORK_DELAYABLE_BIT --
+ * submitting a delayable object's embedded .work does not clear that flag. */
+static struct k_work scan_timeout_work;
+#else
+static struct k_work_delayable scan_timeout_work;
+#endif
 static struct k_work_delayable wifi_operation_timeout_work;
 
 /*
@@ -136,8 +143,11 @@ static struct k_work_q scan_wq;
 static struct k_timer scan_watchdog;
 /* The handler only formats a <=96 B line and hands it to linkr_mgmt_send(),
  * which allocates and queues without touching BLE, so the stack stays small;
- * SRAM is the binding constraint on this target. */
-K_THREAD_STACK_DEFINE(scan_wq_stack, 768);
+ * SRAM is the binding constraint on this target. 1024 rather than the 768 that
+ * survives a normal build: with CONFIG_ASSERT=y the same handler overflowed
+ * 768 and rebooted the board from this very thread, so that was too close to
+ * the edge to ship. */
+K_THREAD_STACK_DEFINE(scan_wq_stack, 1024);
 #define SCAN_WQ_PRIO 5
 #endif
 
@@ -1082,11 +1092,9 @@ static void wifi_scan_release(void)
 
 #if LINKR_SCAN_WD_OWN_QUEUE
     k_timer_stop(&scan_watchdog);
-    /* The timer submits the plain work, so cancel that rather than the
-     * delayable wrapper. */
-    (void)k_work_cancel(&wifi_scan_timeout_work.work);
+    (void)k_work_cancel(&scan_timeout_work);
 #else
-    (void)k_work_cancel_delayable(&wifi_scan_timeout_work);
+    (void)k_work_cancel_delayable(&scan_timeout_work);
 #endif
 
     k_mutex_lock(&scan_lock, K_FOREVER);
@@ -1115,7 +1123,7 @@ static void scan_watchdog_expiry(struct k_timer *timer)
 {
     ARG_UNUSED(timer);
 
-    (void)k_work_submit_to_queue(&scan_wq, &wifi_scan_timeout_work.work);
+    (void)k_work_submit_to_queue(&scan_wq, &scan_timeout_work);
 }
 #endif
 
@@ -1177,8 +1185,7 @@ static void wifi_scan_work_handler(struct k_work *work)
      * workqueue can postpone neither. */
     k_timer_start(&scan_watchdog, K_MSEC(WIFI_SCAN_TIMEOUT_MS), K_NO_WAIT);
 #else
-    (void)k_work_reschedule(&wifi_scan_timeout_work,
-                            K_MSEC(WIFI_SCAN_TIMEOUT_MS));
+    (void)k_work_reschedule(&scan_timeout_work, K_MSEC(WIFI_SCAN_TIMEOUT_MS));
 #endif
     LOG_INF("WiFi scan started");
 }
@@ -1958,7 +1965,11 @@ int linkr_wifi_init(void)
 	k_work_init_delayable(&wifi_operation_timeout_work,
 			      wifi_operation_timeout_handler);
     k_work_init(&wifi_scan_work, wifi_scan_work_handler);
-    k_work_init_delayable(&wifi_scan_timeout_work, wifi_scan_timeout_handler);
+#if LINKR_SCAN_WD_OWN_QUEUE
+    k_work_init(&scan_timeout_work, wifi_scan_timeout_handler);
+#else
+    k_work_init_delayable(&scan_timeout_work, wifi_scan_timeout_handler);
+#endif
 #if LINKR_SCAN_WD_OWN_QUEUE
     k_timer_init(&scan_watchdog, scan_watchdog_expiry, NULL);
     k_work_queue_start(&scan_wq, scan_wq_stack,

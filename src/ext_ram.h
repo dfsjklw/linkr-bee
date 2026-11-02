@@ -34,4 +34,15 @@
 #define LINKR_EXT_RAM_BSS
 #endif
 
+/*
+ * Ask the runtime where the PSRAM shared heap actually starts and compare it
+ * against the end of .ext_ram.bss. Link-time checks cannot see this: the pool
+ * is registered at the mapped region start, which only clears the section when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set (see src/ext_ram.c).
+ *
+ * Returns 0 when clear or when the target has no PSRAM; -EFAULT when the pool
+ * overlaps the section; -EIO when the region cannot be queried.
+ */
+int linkr_ext_ram_verify_heap(void);
+
 #endif /* LINKR_EXT_RAM_H */
