@@ -113,7 +113,9 @@ Browser / desktop / mobile / Linkr
 ```
 
 - A Linkr Bee accessory: Linkr Bee X1.0 (MV013), ESP32-C3 Super Mini,
-  ESP32-C3 DevKitM, ESP32-C3 DevKitC, or ESP32-C5 DevKitC.
+  ESP32-C3 DevKitM, ESP32-C3 DevKitC, ESP32-C5 DevKitC, or a Waveshare
+  ESP32-C5-Touch-LCD-2.8 running the panel build (see
+  [the panel guide](docs/WAVESHARE_C5_LCD.md)).
 - A target with a UART console, and three wires: target TX to accessory RX, target RX
   to accessory TX, and a shared ground.
 - A host running a compatible browser, a desktop terminal client, or a phone app

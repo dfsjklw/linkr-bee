@@ -46,6 +46,20 @@ ESP32-C5 DevKitC 差异：
 | 恢复出厂 | 28 | in | BOOT，启动时接地保持 2 秒 |
 | Console / 烧录 | 板载 USB | — | USB Serial/JTAG，不占用桥接 UART1 |
 
+Waveshare ESP32-C5-Touch-LCD-2.8 面板（`boards/linkr_c5_touch_lcd.*`，同一
+`esp32c5_devkitc/esp32c5/hpcore` 目标加 conf/overlay）：
+
+| 功能 | GPIO | 方向 | 说明 |
+|------|------|------|------|
+| 面板 SPI（SCLK/MOSI/CS/DC） | 6/7/… | out | ST7789V 240×320，MIPI DBI 四线 |
+| 板载 I2C（SDA/SCL） | 0/1 | 双向 | CH32V003 扩展器 0x24、CST3530 触摸 |
+| 触摸中断/复位 | 见 overlay | in | CST3530 由 LVGL 指针回调轮询，不占输入子系统 |
+| 背光 | 扩展器 PWM | — | 默认占空比 200，`LINKR_LCD_BACKLIGHT_DEFAULT` |
+| 桥接 UART / 恢复出厂 / Console | 同 DevKitC | — | 11/12、28、板载 USB |
+
+该板 GPIO1 是触摸 I2C 时钟，配对改由屏幕 PAIR 按钮授权（见
+[Waveshare C5 LCD 面板](WAVESHARE_C5_LCD.md)）。
+
 ## 4. 桥接 UART 电气
 
 - **电平**：3.3V TTL（非 RS232；需接 RS232 电平请外挂收发器）

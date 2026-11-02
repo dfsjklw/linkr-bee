@@ -10,7 +10,13 @@
 | ESP32-C3 DevKitC / DevKitM / Super Mini | GPIO1 | `PAIRING_GPIO_AUTH=y` |
 | ESP32-C5 DevKitC | GPIO1 | `PAIRING_GPIO_AUTH=y` |
 | **Linkr Bee X1.0（MV013）** | **GPIO3**（USER_KEY） | `PAIRING_GPIO_AUTH=y` |
+| Waveshare ESP32-C5-Touch-LCD-2.8（面板构建） | 无（屏幕 PAIR 按钮） | `PAIRING_GPIO_AUTH=n` + `PAIRING_AUTH_TOUCH=y` |
 | ESP32-WROOM-32 DevKitC | GPIO4（可选） | `PAIRING_GPIO_AUTH=n` |
+
+面板构建的 GPIO1 是触摸屏的 I2C 时钟，不能作配对门禁，因此 board conf 显式关掉
+GPIO 授权，改由屏幕上的 **PAIR** 按钮打开授权窗口（默认 60 s，配对成功后立即
+关闭）：点一下 PAIR，再在客户端发起配对即可。详见
+[Waveshare C5 LCD 面板](WAVESHARE_C5_LCD.md)。
 
 C5 DevKitC 正式固件仍需在 GPIO1 外接按钮或跳线。受控台架测试可显式加载
 `dev_c5_open_pairing.conf`，但该开发镜像允许附近任何主机配对，不适合正式使用；

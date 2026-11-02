@@ -78,8 +78,9 @@ RISC-V 64 位和 LoongArch64 Linux 的 CLI/TUI 移植具备基础条件，尚未
         SBC 或嵌入式设备
 ```
 
-- 一台 Linkr Bee 配件：Linkr Bee X1.0（MV013）、ESP32-C3 Super Mini、ESP32-C3 DevKitM、ESP32-C3 DevKitC
-  或 ESP32-C5 DevKitC。
+- 一台 Linkr Bee 配件：Linkr Bee X1.0（MV013）、ESP32-C3 Super Mini、ESP32-C3 DevKitM、ESP32-C3 DevKitC、
+  ESP32-C5 DevKitC，或运行面板构建的 Waveshare ESP32-C5-Touch-LCD-2.8（见
+  [面板说明](docs/WAVESHARE_C5_LCD.md)）。
 - 一台带 UART 控制台的目标设备，三根线：目标 TX 接配件 RX、目标 RX 接配件 TX、共地。
 - 一台运行兼容浏览器、桌面终端客户端或手机 App 的主机，按上表选择。
 
