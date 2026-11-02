@@ -1,0 +1,188 @@
+/*
+ * Waveshare ESP32-C5-Touch-LCD-2.8 devicetree overlay.
+ *
+ * Passed with -DEXTRA_DTC_OVERLAY_FILE=boards/linkr_c5_touch_lcd.overlay and
+ * applied on top of esp32c5_devkitc_hpcore.dts.
+ *
+ * Panel wiring (from the board schematic / vendor BSP):
+ *   LCD  SCLK=GPIO6  MOSI=GPIO7  DC=GPIO9  CS=GPIO10
+ *        RST -> CH32V003 EXIO1, backlight -> CH32V003 PWM (I2C 0x24)
+ *   Touch SDA=GPIO0  SCL=GPIO1  INT=GPIO5  RST -> CH32V003 EXIO0
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/esp32c5-pinctrl.h>
+#include <zephyr/dt-bindings/pinctrl/esp32c5-gpio-sigmap.h>
+
+/ {
+	chosen {
+		zephyr,display = &st7789v;
+	};
+
+	/*
+	 * 2.8" IPS panel, 240x320, ST7789 controller on 4-wire SPI.
+	 * spi2 already carries the right pinmux on this board family
+	 * (SCLK=GPIO6, MOSI=GPIO7, CS=GPIO10 from spim2_default), so only the
+	 * DC line has to be described here.
+	 */
+	mipi_dbi {
+		compatible = "zephyr,mipi-dbi-spi";
+		spi-dev = <&spi2>;
+		dc-gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+		write-only;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		st7789v: st7789v@0 {
+			compatible = "sitronix,st7789v";
+			reg = <0>;
+
+			/* 80 MHz, matching the vendor reference project
+			 * (14_wireless_serial_webserver sets pclk_hz = 80 MHz on
+			 * the same panel and flex cable). A full 240x320 RGB565
+			 * frame is 153600 bytes: 15.4 ms here versus 61 ms at
+			 * 20 MHz, i.e. a 65 fps ceiling instead of 16 fps.
+			 *
+			 * The earlier "40 MHz shows ghosting" note was written
+			 * while the panel init parameters were still being
+			 * validated; the reference BSP proves the link itself is
+			 * fine at 80 MHz. If ghosting or colour fringing does
+			 * appear, step down to 60, then 40 MHz.
+			 */
+			mipi-max-frequency = <DT_FREQ_M(80)>;
+
+			width = <240>;
+			height = <320>;
+			x-offset = <0>;
+			y-offset = <0>;
+			vcom = <0x35>;
+			gctrl = <0x35>;
+			vrhs = <0x12>;
+			vdvs = <0x20>;
+			mdac = <0x00>;
+			gamma = <0x01>;
+			colmod = <0x55>;
+			lcm = <0x2c>;
+			porch-param = [0c 0c 00 33 33];
+			cmd2en-param = [5a 69 02 01];
+			pwctrl1-param = [a4 a1];
+			pvgam-param = [d0 08 11 08 0c 15 39 33 50 36 13 14 29 2d];
+			nvgam-param = [d0 08 11 08 0c 15 39 33 50 36 13 14 29 2d];
+			ram-param = [00 c0];
+			rgb-param = [00 00 00];
+			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+			/* The vendor BSP calls esp_lcd_panel_invert_color(true),
+			 * so the driver's default inversion stays enabled here:
+			 * do NOT add "inversion-off".
+			 */
+		};
+	};
+};
+
+/* 8 MB PSRAM populated on the module (devkit dtsi declares 4 MB). */
+&psram0 {
+	size = <DT_SIZE_M(8)>;
+};
+
+/*
+ * No devicetree memory-region for PSRAM: the ESP32-C5 linker script never
+ * calls LINKER_DT_REGIONS(), so 'zephyr,memory-region' nodes generate no
+ * MEMORY area and their sections would become orphans.
+ *
+ * That is fine here, because the C5 linker script already carries the two
+ * Zephyr LVGL sections inside .ext_ram.data, before the shared multi heap:
+ *
+ *   KEEP(*(.lvgl_buf*))    LVGL rendering buffers
+ *   KEEP(*(.lvgl_heap*))   LVGL object heap
+ *
+ * so CONFIG_LV_Z_MEMORY_POOL_CUSTOM_SECTION=y is all the placement the object
+ * heap needs, and application data uses the same .ext_ram.bss window through
+ * LINKR_EXT_RAM_BSS (src/ext_ram.h). The heap start follows whichever of them
+ * is largest, and src/ext_ram.c verifies that at runtime.
+ *
+ * The rendering buffer deliberately stays in internal SRAM: see the VDB
+ * measurements in boards/linkr_c5_touch_lcd.conf.
+ */
+
+/*
+ * The shared C5 board overlay defines two gpio-keys nodes: pairing on GPIO1
+ * and factory reset on GPIO28. Nothing on this board consumes them, so the
+ * "disabled" overrides that used to sit here were removed:
+ *
+ *   - CONFIG_INPUT is off, so input-gpio-keys is not built and no driver
+ *     binds to either node; the overrides had no effect;
+ *   - the pairing key is physically unreachable here (GPIO1 is the touch
+ *     I2C clock), and pairing is authorized from the panel's PAIR button
+ *     instead (CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH);
+ *   - the factory-reset pin is read directly by main.c's GPIO code, not
+ *     through the input subsystem.
+ *
+ * The nodes themselves must stay: their linkr-pairing / linkr-factory-reset
+ * aliases are compiled unconditionally into ble_security.c and main.c.
+ *
+ * Re-enabling CONFIG_INPUT would make input-gpio-keys demand a zephyr,code
+ * property on both keys -- add one, or disable the two nodes again.
+ */
+
+/*
+ * Board I2C bus: SDA=GPIO0, SCL=GPIO1.
+ * The devkit pinmux defaults to GPIO6/GPIO7, which the LCD uses for SPI, so
+ * the bus must be moved before any device (touch, sensors, expander) is added.
+ */
+&pinctrl {
+	i2c0_board: i2c0_board {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO0>, <I2C0_SCL_GPIO1>;
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	pinctrl-0 = <&i2c0_board>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	status = "okay";
+
+	/* Capacitive touch controller. Its reset line is driven by the
+	 * CH32V003 expander (board_io.c), not by a GPIO.
+	 */
+	touch: touch@58 {
+		compatible = "hynitron,cst3530";
+		reg = <0x58>;
+		irq-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+		x-max = <240>;
+		y-max = <320>;
+		status = "okay";
+	};
+
+	/* Sensirion SHTC3 temperature/humidity sensor. */
+	shtc3: humidity@70 {
+		compatible = "sensirion,shtc3", "sensirion,shtcx";
+		reg = <0x70>;
+		/* Required by the binding; SHTC3 supports both modes. */
+		measure-mode = "normal";
+		status = "okay";
+	};
+
+	/* NXP PCF85063A real-time clock. */
+	rtc: rtc@51 {
+		compatible = "nxp,pcf85063a";
+		reg = <0x51>;
+		status = "okay";
+	};
+
+	/* QST QMI8658A 6-axis IMU. The board straps the address select high
+	 * (vendor BSP uses QMI8658_ADDRESS_HIGH = 0x6b) and wires INT1 to
+	 * GPIO4, while the binding defaults to INT2 (int-pin = 2).
+	 */
+	imu: imu@6b {
+		compatible = "qst,qmi8658a";
+		reg = <0x6b>;
+		int-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+		int-pin = <1>;
+		status = "okay";
+	};
+};

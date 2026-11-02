@@ -10,6 +10,10 @@ manifest:
       import:
         name-allowlist:
           - hal_espressif
+          # LVGL for the ESP32-C5-Touch-LCD-2.8 panel (Waveshare branch).
+          # Only built when CONFIG_LVGL is enabled, so the C3/ESP32 targets
+          # are unaffected by the extra worktree.
+          - lvgl
           - mbedtls
           - tf-psa-crypto
           # The ESP32-C5 controller implements its Security Manager crypto with

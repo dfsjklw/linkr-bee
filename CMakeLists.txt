@@ -59,5 +59,18 @@ target_sources(app PRIVATE
 )
 target_sources_ifdef(CONFIG_LINKR_BLE_BRIDGE_WATCHDOG app PRIVATE src/watchdog.c)
 
+# Waveshare ESP32-C5-Touch-LCD-2.8 panel: the CH32V003 rail sequencing, the
+# ST7789 bring-up, the CST3530 touch sampling and the LVGL pages. Every file
+# compiles to a stub when CONFIG_LINKR_LCD is off, so the shared sources stay
+# board-agnostic; the generated fonts are pure LVGL data and are only built
+# when LVGL itself is.
+if(CONFIG_LINKR_LCD)
+  target_sources(app PRIVATE
+    src/board_io.c
+    src/linkr_display.c
+    src/linkr_touch.c
+  )
+endif()
+
 # HTTP service resources live in named iterable sections (WebSocket bridge).
 zephyr_linker_sources(SECTIONS sections-rom.ld)
