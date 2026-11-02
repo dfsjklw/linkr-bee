@@ -16,9 +16,10 @@ class BondLabelTests(unittest.TestCase):
                 ('bond_label_production.inc', 'src/bond_label.c'),
                 ('bond_production.inc', 'src/bond_manager.c'),
             ):
-                text = (ROOT / source).read_text()
+                text = (ROOT / source).read_text(encoding="utf-8")
                 (path / name).write_text(
-                    re.sub(r'^#include[^\n]*\n', '', text, flags=re.M)
+                    re.sub(r'^#include[^\n]*\n', '', text, flags=re.M),
+                    encoding="utf-8",
                 )
             binary = path / 'test'
             subprocess.run(
