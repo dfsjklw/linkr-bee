@@ -83,9 +83,9 @@ class ReleaseAssemblyTests(unittest.TestCase):
                 with zipfile.ZipFile(root / "out/linkr-bee-v0.1.2-web.zip") as archive:
                     readme = archive.read("linkr-bee-v0.1.2-web/README.txt").decode()
                 self.assertIn(f"Source: {expected}/tree/v0.1.2", readme)
-                self.assertEqual(len(list((root / "out").iterdir())), 38)
+                self.assertEqual(len(list((root / "out").iterdir())), 39)
                 manifest = json.loads((root / "out/release-manifest.json").read_text())
-                self.assertEqual(len(manifest["assets"]), 36)
+                self.assertEqual(len(manifest["assets"]), 37)
                 for asset in manifest["assets"]:
                     self.assertEqual(asset["sha256"], hashlib.sha256(
                         (root / "out" / asset["name"]).read_bytes()).hexdigest())
