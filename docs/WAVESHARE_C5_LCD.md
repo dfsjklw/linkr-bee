@@ -376,6 +376,38 @@ I (esp_psram): Speed: 80MHz
 | 实际 flash | ⚠️ ROM 报告 **32 MB**，二进制头仍声明 8 MB（32 MB 分区待做） |
 | ROM SHA-256 校验 | ⚠️ Zephyr 镜像未附加摘要，ROM 打印 `Attempting to boot anyway` 后正常启动 |
 
+### 7.1 LVGL 与射频的优先级（上板踩过）
+
+面板构建必须给 LVGL 的 workqueue 定一个**低于射频线程**的优先级：
+
+```conf
+CONFIG_LV_Z_LVGL_WORKQUEUE_PRIORITY=10   # 默认 0
+```
+
+默认优先级 0 高于 ESP32 的 WiFi 线程（`CONFIG_ESP32_WIFI_MAX_THREAD_PRIORITY=7`）与
+BT 控制器任务（2）。表现不是"WiFi 慢"，而是**彻底不可用**：
+
+```
+<inf> linkr_wifi: WiFi scan started
+<wrn> linkr_wifi: WiFi scan timed out; releasing      ← 30 s 后，SCAN_DONE 从未到达
+<dbg> esp32_wifi: esp_wifi_handle_sta_disconnect_event: Disconnect reason: 3   ← AUTH_EXPIRE
+<wrn> linkr_wifi: WiFi connecting timed out            ← 关联 30 s 超时，每次都一样
+```
+
+定位过程（供以后排类似问题时复用）：
+
+| 变体 | WiFi 结果 | 结论 |
+|---|---|---|
+| devkit 镜像烧到同一块板 | ✅ 秒连 | 硬件射频没问题 |
+| 面板 conf + `LINKR_LCD=n` / `LVGL=n` | ✅ 连上 | conf 的裁剪（NET_BUF/NET_PKT/栈）不是原因 |
+| 面板全量镜像 | ❌ 扫描无 SCAN_DONE、关联 AUTH_EXPIRE | 面板子系统引入 |
+| 只降 LVGL 优先级到 5 | ❌ | 5 仍高于 WiFi 的 7 |
+| 只把刷新周期放到 100 ms | ❌ | 负载变小但抢占关系不变 |
+| **优先级 10 + 15 ms 刷新** | ✅ 首次关联即成功 | **正解**，且触摸手感不变 |
+
+所以：**不要**为了给 WiFi 让路去牺牲 `LV_DEF_REFR_PERIOD`（15 ms 是触摸手感的来源），
+调整抢占关系就够。
+
 ## 8. 已知风险
 
 | 风险 | 说明 |
