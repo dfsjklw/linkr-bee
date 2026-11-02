@@ -72,6 +72,15 @@ int linkr_uart_config_reconfigure(uint32_t baudrate);
  */
 void linkr_uart_autobaud_init(uintptr_t reg_addr);
 
+/**
+ * @brief True while the current line rate is considered trustworthy.
+ *
+ * False while a pass is probing, and after this module applied a rate that
+ * nothing has measured yet; that is what the panel shows as "autobaud
+ * probing". Always false when autobaud is compiled out.
+ */
+bool linkr_uart_autobaud_verified(void);
+
 /** Install the completion callback (optional). */
 void linkr_uart_autobaud_set_callback(linkr_uart_autobaud_callback_t callback);
 
@@ -113,6 +122,11 @@ static inline int linkr_uart_config_reconfigure(uint32_t baudrate)
 static inline void linkr_uart_autobaud_init(uintptr_t reg_addr)
 {
 	(void)reg_addr;
+}
+
+static inline bool linkr_uart_autobaud_verified(void)
+{
+	return false;
 }
 
 static inline void linkr_uart_autobaud_set_callback(

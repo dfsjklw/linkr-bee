@@ -50,6 +50,15 @@ bool linkr_wifi_is_connected(void);
 /* True once the WiFi interface holds a usable IPv4 address. */
 bool linkr_wifi_has_ip(void);
 
+/**
+ * @brief Read the live link quality of the current association.
+ *
+ * @param rssi    Filled with the RSSI in dBm (negative), may be NULL.
+ * @param channel Filled with the primary channel, may be NULL.
+ * @return 0 on success, -ENODATA when not associated, negative errno otherwise.
+ */
+int linkr_wifi_link_info(int *rssi, unsigned int *channel);
+
 /* One-shot connect / disconnect (RAM only, not persisted). */
 int linkr_wifi_connect(const char *ssid, const char *psk);
 int linkr_wifi_disconnect(void);
@@ -97,6 +106,7 @@ void linkr_wifi_scan_abort(void);
 static inline int  linkr_wifi_init(void) { return 0; }
 static inline bool linkr_wifi_is_connected(void) { return false; }
 static inline bool linkr_wifi_has_ip(void) { return false; }
+static inline int  linkr_wifi_link_info(int *rssi, unsigned int *channel) { (void)rssi; (void)channel; return -ENODATA; }
 static inline int  linkr_wifi_connect(const char *ssid, const char *psk) { (void)ssid; (void)psk; return -ENOTSUP; }
 static inline int  linkr_wifi_disconnect(void) { return -ENOTSUP; }
 static inline int  linkr_wifi_set_config(const char *ssid, const char *psk) { (void)ssid; (void)psk; return -ENOTSUP; }

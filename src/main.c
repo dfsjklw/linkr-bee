@@ -48,6 +48,10 @@
 #include "watchdog.h"
 #include "linkr_aux.h"
 #include "linkr_status_led.h"
+#include "linkr_bridge_stats.h"
+#if defined(CONFIG_LINKR_LCD)
+#include "linkr_terminal.h"
+#endif
 
 LOG_MODULE_REGISTER(linkr_ble_bridge, LOG_LEVEL_INF);
 
@@ -130,6 +134,10 @@ static const struct gpio_dt_spec autobaud_button =
 static struct gpio_callback autobaud_button_cb;
 static uint32_t autobaud_button_last_ms;
 #endif
+/* The panel shows one link at a time; this tracks the most recent peer. The
+ * bridge itself is multi-connection (ble_peers.c owns the per-peer state), so
+ * this is display-only. */
+static struct bt_conn *current_conn;
 static struct bt_conn *wifi_operation_conn;
 static struct bt_conn *wifi_scan_conn;
 #if LINKR_UART_AUTOBAUD
@@ -177,6 +185,11 @@ static atomic_t uart_reliable_drop_no_conn;
  * was a LOG_WRN that the board's ERR-only log level swallowed, so upstream
  * loss was completely unobservable on this board. */
 static atomic_t uart_queue_dropped;
+/* Throughput counters for the panel. These accumulate *increments* only: the
+ * 1 Hz panel sampler drains them into 64-bit totals (see linkr_panel.c), so a
+ * long session cannot wrap the displayed value. */
+static atomic_t bridge_rx_delta;
+static atomic_t bridge_tx_delta;
 static struct uart_config active_uart_config = {
 	.baudrate = CONFIG_LINKR_BLE_BRIDGE_UART_BAUD_RATE,
 	.parity = DEFAULT_UART_PARITY,
@@ -821,6 +834,21 @@ static void uart_rx_irq_callback(const struct device *dev, void *user_data)
 			atomic_add(&uart_rx_dropped, rx_len - written);
 		}
 
+		/* Panel throughput counter: only what actually made it into the
+		 * ring, so the number matches what a host could receive. */
+		if (written > 0U) {
+			atomic_add(&bridge_rx_delta, (atomic_val_t)written);
+		}
+
+#if defined(CONFIG_LINKR_LCD)
+		/* Mirror the bridge traffic on the panel. linkr_terminal_feed()
+		 * only copies into a spinlock-protected ring of its own, so it is
+		 * safe from this ISR; the scrollback itself is parsed by a work
+		 * item in thread context.
+		 */
+		linkr_terminal_feed((const uint8_t *)buf, (size_t)rx_len);
+#endif
+
 		k_sem_give(&uart_rx_sem);
 	}
 }
@@ -933,6 +961,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	linkr_mgmt_connected(conn);
 	advertise_schedule(K_MSEC(100));
 
+	k_mutex_lock(&conn_lock, K_FOREVER);
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+	}
+	current_conn = bt_conn_ref(conn);
+	k_mutex_unlock(&conn_lock);
+
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_DIAG_MARKER)
 	ble_diag.connected_count++;
 	schedule_ble_diag_marker_write();
@@ -945,6 +980,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	if (linkr_ble_peer_disconnected(conn)) atomic_dec(&ble_connection_count);
 	k_mutex_lock(&conn_lock, K_FOREVER);
+	if (current_conn == conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+	}
 	if (wifi_operation_conn == conn) {
 		bt_conn_unref(wifi_operation_conn);
 		wifi_operation_conn = NULL;
@@ -1466,6 +1505,154 @@ int linkr_uart_config_reconfigure(uint32_t baudrate)
 	return apply_uart_config(&cfg);
 }
 #endif /* LINKR_UART_AUTOBAUD */
+
+/* ---------------------------------------------------------------------- */
+/* Panel accessors (declared in linkr_bridge_stats.h)                      */
+/* ---------------------------------------------------------------------- */
+/* Compiled on every board: the panel is the only caller today, but keeping
+ * the implementation next to the state it reports avoids a second copy of the
+ * UART configuration and the connection bookkeeping. */
+
+uint32_t linkr_bridge_rx_delta(void)
+{
+	/* atomic_set returns the previous value, which is exactly the "drain and
+	 * reset" the 1 Hz panel sampler needs. */
+	return (uint32_t)atomic_set(&bridge_rx_delta, 0);
+}
+
+uint32_t linkr_bridge_tx_delta(void)
+{
+	return (uint32_t)atomic_set(&bridge_tx_delta, 0);
+}
+
+int linkr_bridge_uart_format(char *buf, size_t len)
+{
+	struct uart_config cfg;
+
+	k_mutex_lock(&uart_config_lock, K_FOREVER);
+	cfg = active_uart_config;
+	k_mutex_unlock(&uart_config_lock);
+
+	return snprintk(buf, len, "%u %s%s%s %s", (unsigned int)cfg.baudrate,
+			uart_data_bits_name(cfg.data_bits),
+			uart_parity_name(cfg.parity),
+			uart_stop_bits_name(cfg.stop_bits),
+			uart_flow_ctrl_name(cfg.flow_ctrl));
+}
+
+uint32_t linkr_bridge_uart_baud(void)
+{
+	uint32_t baudrate;
+
+	k_mutex_lock(&uart_config_lock, K_FOREVER);
+	baudrate = active_uart_config.baudrate;
+	k_mutex_unlock(&uart_config_lock);
+
+	return baudrate;
+}
+
+int linkr_bridge_uart_set_baud(uint32_t baudrate)
+{
+	struct uart_config cfg;
+
+	/* Snapshot under the lock, then let apply_uart_config() take it again for
+	 * the write: it owns the disable/configure/reset/enable sequence and must
+	 * not be called with uart_config_lock already held.
+	 */
+	k_mutex_lock(&uart_config_lock, K_FOREVER);
+	cfg = active_uart_config;
+	k_mutex_unlock(&uart_config_lock);
+
+	cfg.baudrate = baudrate;
+
+	return apply_uart_config(&cfg);
+}
+
+int linkr_bridge_health_format(char *buf, size_t len)
+{
+	/* uart_queue_dropped is a true running total; uart_rx_dropped is
+	 * deliberately reset by the UART-to-BLE thread after it logs, so it would
+	 * make the panel tick down to zero for no reason.
+	 */
+	uint32_t dropped = (uint32_t)atomic_get(&uart_queue_dropped);
+
+	return snprintk(buf, len, "drop %u  buf %u/%u", dropped,
+			ring_buf_size_get(&uart_rx_ring), UART_RX_BUFFER_SIZE);
+}
+
+int linkr_bridge_ble_format(char *buf, size_t len)
+{
+	struct bt_conn *conn;
+	const char *level;
+	int n;
+
+	k_mutex_lock(&conn_lock, K_FOREVER);
+	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	k_mutex_unlock(&conn_lock);
+
+	if (conn == NULL) {
+		return snprintk(buf, len, "advertising");
+	}
+
+	switch (bt_conn_get_security(conn)) {
+	case BT_SECURITY_L4:
+		level = "enc auth L4";
+		break;
+	case BT_SECURITY_L3:
+		level = "enc auth L3";
+		break;
+	case BT_SECURITY_L2:
+		level = "enc L2";
+		break;
+	default:
+		level = "open";
+		break;
+	}
+
+	n = snprintk(buf, len, "connected %s", level);
+	bt_conn_unref(conn);
+	return n;
+}
+
+uint32_t linkr_bridge_drop_count(void)
+{
+	return (uint32_t)atomic_get(&uart_queue_dropped);
+}
+
+bool linkr_bridge_ble_connected(void)
+{
+	struct bt_conn *conn;
+	bool connected;
+
+	k_mutex_lock(&conn_lock, K_FOREVER);
+	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	k_mutex_unlock(&conn_lock);
+
+	connected = (conn != NULL);
+	if (conn != NULL) {
+		bt_conn_unref(conn);
+	}
+
+	return connected;
+}
+
+static void bond_count_cb(const struct bt_bond_info *info, void *user_data)
+{
+	ARG_UNUSED(info);
+
+	(*(uint8_t *)user_data)++;
+}
+
+uint8_t linkr_bridge_bond_count(void)
+{
+	uint8_t count = 0U;
+
+	/* Uses the identity this build actually advertises, not BT_ID_DEFAULT:
+	 * linkr_identity_init() created a random-address identity and switched to
+	 * it, and bonds are stored per identity. */
+	bt_foreach_bond(linkr_identity, bond_count_cb, &count);
+	return count;
+}
 
 /* Heap headroom. The system heap is the largest single RAM allocation here and
  * nothing reported it before, so its size could not be justified from real
@@ -2278,6 +2465,9 @@ static void ble_to_uart_thread(void)
 			uart_poll_out(bridge_uart, packet.data[i]);
 		}
 #endif
+
+		/* Panel throughput counter: bytes actually handed to the port. */
+		atomic_add(&bridge_tx_delta, (atomic_val_t)packet.len);
 
 		signal_uart_activity();
 	}

@@ -834,4 +834,9 @@ void linkr_uart_autobaud_init(uintptr_t reg_addr)
 	LOG_INF("UART autobaud: idle (start with @a or the trigger input)");
 }
 
+bool linkr_uart_autobaud_verified(void)
+{
+	return autobaud_verified;
+}
+
 #endif /* LINKR_UART_AUTOBAUD */

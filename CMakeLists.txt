@@ -69,7 +69,16 @@ if(CONFIG_LINKR_LCD)
     src/board_io.c
     src/linkr_display.c
     src/linkr_touch.c
+    src/linkr_terminal.c
+    src/linkr_panel.c
+    src/linkr_ui.c
   )
+  if(CONFIG_LVGL)
+    target_sources(app PRIVATE
+      src/fonts/lv_font_consola_10.c
+      src/fonts/lv_font_consola_14.c
+    )
+  endif()
 endif()
 
 # HTTP service resources live in named iterable sections (WebSocket bridge).
