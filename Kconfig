@@ -348,6 +348,31 @@ config LINKR_BLE_BRIDGE_PAIRING_GRACE_MS
 	  authorize it. Set 0 to require the key low during the pairing request,
 	  which is the behaviour before this option existed.
 
+config LINKR_BLE_PAIRING_AUTH_TOUCH
+	bool "Authorize BLE pairing from the on-screen panel"
+	depends on LINKR_LCD
+	default n
+	help
+	  Add a time-limited authorization window that the operator opens by
+	  tapping PAIR on the panel. It is the touch-screen equivalent of the
+	  pairing GPIO, and the two gates are OR-ed: a board that has both
+	  accepts either source.
+
+	  The window is single use. A successful pairing closes it immediately,
+	  so a forgotten tap cannot keep the device pairable, and the security
+	  property stays "somebody touched the board shortly before this host
+	  paired".
+
+config LINKR_BLE_PAIRING_WINDOW_MS
+	int "On-screen pairing authorization window (ms)"
+	depends on LINKR_BLE_PAIRING_AUTH_TOUCH
+	default 60000
+	range 5000 300000
+	help
+	  How long a tap on PAIR keeps the device pairable. Longer windows are
+	  more convenient and less safe: while the window is open any central
+	  in radio range can pair.
+
 config LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC
 	bool "Dynamic BLE name with hardware-MAC suffix and runtime override"
 	depends on BT && SETTINGS

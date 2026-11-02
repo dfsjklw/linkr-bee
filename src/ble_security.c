@@ -101,6 +101,54 @@ static bool pairing_gpio_authorizes(void)
 	return authorized;
 }
 
+/* On-screen authorization window (CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH).
+ *
+ * Holds a k_uptime_get_32() deadline; 0 means "no window". The 32-bit
+ * millisecond counter wraps after ~49 days, so every comparison uses signed
+ * subtraction and stays correct across the rollover.
+ */
+static atomic_t pairing_deadline;
+
+#define PAIRING_WINDOW_MAX_MS 300000U
+
+/* Safe to call on builds without the on-screen gate: always false then. */
+static bool pairing_window_open(void)
+{
+	uint32_t deadline;
+
+	if (!IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+		return false;
+	}
+	deadline = (uint32_t)atomic_get(&pairing_deadline);
+	if (deadline == 0U) {
+		return false;
+	}
+	return (int32_t)(deadline - k_uptime_get_32()) > 0;
+}
+
+/* Every authorization source is an independent proof that someone is standing
+ * at the device: the pairing GPIO on the production boards, the on-screen PAIR
+ * button on the Waveshare panel. They are OR-ed, so a board that has both
+ * accepts either, and a build with neither (development images) accepts all.
+ */
+static bool pairing_authorized(void)
+{
+	bool any_gate = false;
+	bool gpio_ok = false;
+	bool touch_ok = false;
+
+	if (IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH)) {
+		any_gate = true;
+		gpio_ok = pairing_gpio_authorizes();
+	}
+	if (IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+		any_gate = true;
+		touch_ok = pairing_window_open();
+	}
+
+	return !any_gate || gpio_ok || touch_ok;
+}
+
 static enum bt_security_err pairing_accept(
 	struct bt_conn *conn, const struct bt_conn_pairing_feat *const feat)
 {
@@ -108,8 +156,8 @@ static enum bt_security_err pairing_accept(
 	ARG_UNUSED(feat);
 	/* Applies to every new key exchange, including replacement of a bond.
 	 * Existing LTK encryption does not invoke this callback. */
-	if (!pairing_gpio_authorizes()) {
-		LOG_WRN("Pairing denied: press the pairing GPIO, then request pairing again");
+	if (!pairing_authorized()) {
+		LOG_WRN("Pairing denied: press the pairing GPIO or tap PAIR on the panel");
 		return BT_SECURITY_ERR_PAIR_NOT_ALLOWED;
 	}
 	LOG_INF("Pairing authorized");
@@ -122,6 +170,15 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
 		LOG_ERR("Pairing completed without a bond; disconnecting");
 		(void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 		return;
+	}
+	/* Single use: a window that has done its job closes immediately, so a
+	 * forgotten tap cannot keep the device pairable. The GPIO gate needs no
+	 * equivalent -- its window is derived from the press time and expires on
+	 * its own.
+	 */
+	if (pairing_window_open()) {
+		atomic_set(&pairing_deadline, 0);
+		LOG_INF("Pairing window closed after successful pairing");
 	}
 	/* Zephyr BT_SETTINGS persists the negotiated keys; never log them. */
 	LOG_INF("BLE pairing complete (bonded)");
@@ -193,7 +250,12 @@ void linkr_ble_security_connected(struct bt_conn *conn)
 	if (!err && !bt_le_bond_exists(info.id, bt_conn_get_dst(conn))) {
 		/* The host initiates its first pairing explicitly or in response to
 		 * an encrypted GATT access. Avoid racing Android createBond(). */
-		if (IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH)) {
+		if (IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH) &&
+		    IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+			LOG_INF("Unbonded host: waiting for the pairing GPIO or PAIR");
+		} else if (IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+			LOG_INF("Unbonded host: waiting for PAIR on the panel");
+		} else if (IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH)) {
 			LOG_INF("Unbonded host: waiting for GPIO-authorized pairing");
 		} else {
 			LOG_INF("Unbonded host: pairing allowed without GPIO check");
@@ -207,4 +269,59 @@ void linkr_ble_security_connected(struct bt_conn *conn)
 		LOG_WRN("Cannot request BLE encryption: %d", err);
 		(void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 	}
+}
+
+int linkr_ble_pairing_authorize(uint32_t duration_ms)
+{
+	uint32_t deadline;
+
+	if (!IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+		return -ENOTSUP;
+	}
+	if (duration_ms == 0U) {
+		linkr_ble_pairing_cancel();
+		return 0;
+	}
+	if (duration_ms > PAIRING_WINDOW_MAX_MS) {
+		return -EINVAL;
+	}
+
+	deadline = k_uptime_get_32() + duration_ms;
+	/* 0 encodes "closed", and a deadline equal to the current tick would
+	 * read as already expired; nudge either case forward by a millisecond.
+	 */
+	if (deadline == 0U || deadline == k_uptime_get_32()) {
+		deadline = k_uptime_get_32() + 1U;
+	}
+
+	atomic_set(&pairing_deadline, (atomic_val_t)deadline);
+	LOG_INF("Pairing window open for %u ms", (unsigned int)duration_ms);
+	return 0;
+}
+
+void linkr_ble_pairing_cancel(void)
+{
+	if (!IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+		return;
+	}
+	if (atomic_get(&pairing_deadline) != 0) {
+		atomic_set(&pairing_deadline, 0);
+		LOG_INF("Pairing window closed");
+	}
+}
+
+int32_t linkr_ble_pairing_remaining_ms(void)
+{
+	uint32_t deadline;
+	int32_t remaining;
+
+	if (!IS_ENABLED(CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH)) {
+		return -1;
+	}
+	deadline = (uint32_t)atomic_get(&pairing_deadline);
+	if (deadline == 0U) {
+		return -1;
+	}
+	remaining = (int32_t)(deadline - k_uptime_get_32());
+	return remaining > 0 ? remaining : -1;
 }
