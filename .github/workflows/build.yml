@@ -236,6 +236,15 @@ jobs:
             flash_address: "0x2000"
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
             expect_psram: "y"
+          - name: ESP32-C5 Waveshare Touch LCD 2.8
+            board: esp32c5_devkitc/esp32c5/hpcore
+            slug: esp32c5-waveshare-lcd
+            chip: esp32c5
+            toolchain: riscv64-zephyr-elf
+            flash_address: "0x2000"
+            factory_reset: GPIO28 BOOT to GND for two seconds during boot
+            extra_conf: boards/linkr_c5_touch_lcd.conf
+            extra_overlay: boards/linkr_c5_touch_lcd.overlay
           - name: ESP32-WROOM-32 DevKitC
             board: esp32_devkitc/esp32/procpu
             slug: esp32-wroom-32
@@ -290,8 +299,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          west build -p always -b "${{ matrix.board }}" \
-            -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
+          # Builds that need an out-of-tree conf/overlay (the Waveshare panel)
+          # pass both through EXTRA_*_FILE; every other board keeps the plain
+          # invocation.
+          build_args=()
+          if [ -n "${{ matrix.extra_conf }}" ]; then
+            build_args+=("-DEXTRA_CONF_FILE=${GITHUB_WORKSPACE}/app/${{ matrix.extra_conf }}")
+            build_args+=("-DEXTRA_DTC_OVERLAY_FILE=${GITHUB_WORKSPACE}/app/${{ matrix.extra_overlay }}")
+          fi
+          if [ ${#build_args[@]} -gt 0 ]; then
+            west build -p always -b "${{ matrix.board }}" \
+              -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app" -- "${build_args[@]}"
+          else
+            west build -p always -b "${{ matrix.board }}" \
+              -d "${GITHUB_WORKSPACE}/app/build" "${GITHUB_WORKSPACE}/app"
+          fi
 
       - name: Verify default feature set
         shell: bash
@@ -381,6 +403,21 @@ jobs:
             grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
             grep -qx '# CONFIG_ESP_WIFI_HEAP_SPIRAM is not set' "${config}"
             grep -qx '# CONFIG_ESP32_WIFI_NET_ALLOC_SPIRAM is not set' "${config}"
+          fi
+          # Panel builds: losing PSRAM, LVGL or the on-screen pairing gate
+          # silently turns the Waveshare image back into a headless build, so
+          # assert the trio (and that the object heap really is in PSRAM).
+          if grep -qx 'CONFIG_LINKR_LCD=y' "${config}"; then
+            grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
+            grep -qx 'CONFIG_SPIRAM_SPEED_80M=y' "${config}"
+            grep -qx 'CONFIG_LVGL=y' "${config}"
+            grep -qx 'CONFIG_LV_COLOR_DEPTH_16=y' "${config}"
+            grep -qx 'CONFIG_LV_Z_MEMORY_POOL_CUSTOM_SECTION=y' "${config}"
+            grep -qx 'CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=y' "${config}"
+            grep -qx '# CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH is not set' "${config}"
+            grep -qx 'CONFIG_DISPLAY=y' "${config}"
+            grep -qx 'CONFIG_MIPI_DBI=y' "${config}"
+            grep -qx 'CONFIG_I2C=y' "${config}"
           fi
 
       - name: Package firmware

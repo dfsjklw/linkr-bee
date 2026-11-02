@@ -16,7 +16,8 @@ TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
            "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
            "aarch64-apple-darwin", "x86_64-apple-darwin"]
 BOARDS = ("esp32c3-supermini", "esp32c3-devkitm", "esp32c3-devkitc",
-          "esp32c5-devkitc", "esp32-wroom-32", "linkr-bee-x1-0")
+          "esp32c5-devkitc", "esp32c5-waveshare-lcd", "esp32-wroom-32",
+          "linkr-bee-x1-0")
 
 
 def write_fixture(root: Path, *, firmware_version: str = "0.1.2",
