@@ -167,6 +167,8 @@ optimizations are off and early HAL logging retains warnings/errors. Larger
 custom RF pools fall back to the upstream heap reservation. These limits reduce
 burst tolerance: validate pairing, scan/connect, two BLE peers, LAN forwarding,
 WebDAV uploads, stack watermarks and reported drops on hardware before release.
+The PSRAM placement rules, the ROM region boundary and the self-check steps are
+in [C5 PSRAM and SRAM layout](C5_PSRAM.md).
 
 Use a Zephyr v4.5.0 west workspace. The default WiFi-enabled build also needs
 the Espressif HAL blobs (`modules/hal_espressif`) present in the manifest.

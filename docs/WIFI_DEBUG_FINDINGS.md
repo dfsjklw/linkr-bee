@@ -183,12 +183,13 @@ OR 后层标识无法正确匹配。
 
 **当前处理**
 - 默认构建未启用 `CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE`，因此该问题不影响发布的固件。
-- 项目继续固定在 Zephyr v4.4.1（`west.yml`）。manifest 当前保留 `hostap`，是因为
-  ESP32-C5 控制器的 `CONFIG_ESP32_BT_LE_CRYPTO_STACK_MBEDTLS` 需要 hostap 附带的
-  旧版 mbedTLS 模块；`tools/verify.sh` 与 CI 都会构建该默认配置并断言相关控制器
-  安全符号（见 `docs/DEVELOPMENT.md` 的构建章节）。
+- 项目已从 Zephyr v4.4.1 迁到 **v4.5.0**（`west.yml`），但上面这条 SAE 编译失败是
+  4.4.1 时代的结论，升级时没有重新验证，默认构建仍未启用该选项。manifest 继续保留
+  `hostap`，是因为 ESP32-C5 控制器的 `CONFIG_ESP32_BT_LE_CRYPTO_STACK_MBEDTLS` 需要
+  hostap 附带的旧版 mbedTLS 模块；`tools/verify.sh` 与 CI 都会构建该默认配置并断言
+  相关控制器安全符号（见 `docs/DEVELOPMENT.md` 的构建章节）。
 - 本版不支持 WPA3/SAE。若将来需要，应先在独立分支上验证升级后的 mbedtls 兼容层，
-  而不是直接把固定版本改成 4.4.2+/5.x。
+  而不是直接改 `west.yml` 里固定的版本号。
 
 ---
 

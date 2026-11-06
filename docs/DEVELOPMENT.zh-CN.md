@@ -148,7 +148,8 @@ eventfd、每个服务一个监听器，以及每个尚未完成 HTTP/升级处�
 C5 保持已有实测线程栈预算，WiFi 堆与网络缓冲仍在内部 SRAM，仅应用数据使用 PSRAM。
 可选 WiFi IRAM 速度优化关闭，HAL 早期日志保留告警与错误；自定义增大射频池后会回退到
 上游堆预留值。较小的队列降低了突发承载能力，发布前需真机复测配对、扫描/连接、两个
-BLE peer、LAN 转发、WebDAV 上传、栈水位与丢包计数。
+BLE peer、LAN 转发、WebDAV 上传、栈水位与丢包计数。PSRAM 的放置规则、ROM 保留区
+约束与自检方法见 [C5 PSRAM 与 SRAM 布局](C5_PSRAM.md)。
 
 请使用 Zephyr v4.5.0 的 west workspace。默认的 WiFi 构建还要求 west manifest
 内存在 Espressif HAL blobs（`modules/hal_espressif`）。

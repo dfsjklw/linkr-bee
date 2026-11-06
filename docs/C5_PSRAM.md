@@ -2,6 +2,8 @@
 
 > 依据 ESP32-C5 DevKitC（**WROOM-1-N8R4** 模块，8 MB QSPI PSRAM）的实机测量，并对照
 > `boards/esp32c5_devkitc_esp32c5_hpcore.{conf,overlay}` 与 `src/ext_ram.h` 的实现整理。
+> 当前基线是 **Zephyr v4.5.0 + Zephyr SDK 1.0.1**（`west.yml` 固定）；文中标注
+> 「4.4.1 实测」的数字来自 PSRAM 落地阶段，迁移到 4.5 后没有重做真机测量。
 > 本文只描述 **C5 目标**：C3 与 ESP32-WROOM-32 没有 PSRAM，`src/ext_ram.h` 的宏在这些
 > 板子上展开为空，全部缓冲留在内部 RAM。
 >
@@ -98,8 +100,11 @@ CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺�
 >   就是真实数据。
 > - 多占 256 B PSRAM、43 行代码和一节文档。
 >
-> 两方案实测差异：Kconfig 方案 `ext_dram_seg` 5197216 B、运行时堆起点 `0x420f4da0`；
-> barrier 方案 5197472 B、堆起点 `0x420f0000`。
+> 两方案的差异（4.4.1 实测）：Kconfig 方案 `ext_dram_seg` 5197216 B、运行时堆起点
+> `0x420f4da0`；barrier 方案 5197472 B、堆起点 `0x420f0000`。在 Zephyr 4.5.0 上复核
+> Kconfig 方案：`ext_dram_seg` 5131680 B，`.ext_ram.bss` 仍是 19872 B
+> （`0x420e0000`–`0x420e4da0`），`_ext_ram_heap_start` 与 `_ext_ram_bss_end` 同址，
+> 运行时仍零重叠。
 
 ## 4. 默认配置与 WiFi 的取舍
 
@@ -113,9 +118,28 @@ CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺�
 - `CONFIG_SPIRAM_SPEED_80M=y` —— 40 MHz 会进入 `rst:0x1a CPU_LOCKUP` 复位循环。
 - `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，且 `ESP_WIFI_HEAP_SPIRAM` 与
   `ESP32_WIFI_NET_ALLOC_SPIRAM` 必须为 `n` —— 任一项打开后 2.4 GHz 扫描永不完成
-  （40 s 无结果，正常约 19.7 s）。
+  （40 s 无结果，正常约 19.7 s，均为 4.4.1 实测）。
 
 `CONFIG_ESP_SPIRAM_MEMTEST=n`：每 MB 约 100 ms 启动开销，运行时证明不了什么。
+
+### Zephyr 4.5 的射频与网络预算
+
+4.5 的 WiFi/Bluetooth 代码比 4.4.1 占用更多内部 SRAM，迁移时按下面的顺序收紧
+（每条的理由都写在 `boards/esp32c5_devkitc_esp32c5_hpcore.conf` 的注释里）：
+
+- WiFi 动态 RX/TX 缓冲各 6、管理 RX 缓冲 3、MGMT SBUF 6；同时关闭
+  `ESP32_WIFI_EXTRA_IRAM_OPT` / `SLP_IRAM_OPT`，避免把更多 WiFi 代码搬进 SRAM。
+- 网络缓冲 `NET_BUF_RX/TX_COUNT=20`、包描述符 `NET_PKT_RX/TX_COUNT=10`。
+- BLE 控制器 `MSYS_2` 12 块、ACL 8 × 255 B，与 `Kconfig` 里
+  `HEAP_MEM_POOL_ADD_SIZE_ESP_WIFI=36864`、`_ESP_BT=44000` 的默认值配套 ——
+  这两个默认值只在池子确实被压到上述规模时生效，自定义放大后自动退回上游预留。
+- 应用 `Kconfig` 关掉 `ESP32_WIFI_SOFTAP_SUPPORT`（本项目只做 station），
+  并把 `ZVFS_POLL_MAX` 提到 5：HTTP/1 轮询要为 eventfd、监听口和每个尚未升级的
+  客户端各留一个事件。
+- `ESP_HAL_EARLY_LOG_LEVEL=2`：保留启动期警告/错误，只去掉 info 字符串。
+
+这些预算决定的是**内部 SRAM** 的占用，与 PSRAM 无关，但和 `.ext_ram.bss` 一样只能在
+链接产物里核对：改完必须重建并看链接日志末尾的两行。
 
 > **`shared_multi_heap` 目前没有锁，这是安全的但边界明确。** Zephyr 的该分配器自身
 > 不做并发保护；本配置之所以不需要，是因为 `ESP_WIFI_HEAP_SYSTEM=y` 让
@@ -134,6 +158,7 @@ CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺�
 | 只占 `.bss` 尾 4.5 KB（`0x4085E610`） | 关联 30 s 超时并无限重试 |
 | `CONFIG_SPIRAM_SPEED_40M` | 启动即进 `CPU_LOCKUP` 复位循环，只能 80 MHz |
 | `ESP_WIFI_HEAP_SPIRAM` 或 `ESP32_WIFI_NET_ALLOC_SPIRAM` | 2.4 GHz 扫描 40 s 无结果，且超时看门狗也不触发 |
+| `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
 > **别把这个症状当作单一证据。** `@w scan` 卡死（`WiFi scan started` 之后再无输出，
 > 连超时告警都没有）在**配置正确**的镜像上也会出现：只要 BLE 处于连接状态，扫描在共存
@@ -144,22 +169,28 @@ CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺�
 > 偏向 WiFi（`coex_preference_set(ESP_COEX_PREFER_WIFI)`，结束恢复 `BALANCE`），
 > 以及把 30 s 看门狗从 system workqueue 挪到内核时钟定时器 + 独立队列 —— 原先那个
 > 看门狗和被它看守的扫描排在同一条队列上，扫描卡住时它自己也被卡住，永远不会触发。
-> 修复后实测：BLE 连接下扫描 22–27 s 完成（空闲时 19.7 s，修复前 60–75 s 且常常不完成），
-> 5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。
+> 修复后实测（4.4.1）：BLE 连接下扫描 22–27 s 完成（空闲时 19.7 s，修复前 60–75 s
+> 且常常不完成），5 s 超时配置下 `@scan error` 精确在 5.0 s 送达主机。4.5 迁移后没有
+> 重测这两个数字，只看它们是否仍在 30 s 看门狗之内是不够的 —— 需要真机复测。
 >
 > **两处改动都只在 C5 上编译**（`#if defined(CONFIG_SOC_SERIES_ESP32C5)`）：C3 与
 > ESP32-WROOM-32 没有观察到这种行为，它们保留原来的 delayable-work 看门狗，也不为
 > 此各付一个 768 B 栈 + 独立队列。若其他板子上出现同样的「扫描卡住而看门狗不响」，
 > 把同一个 `LINKR_SCAN_WD_OWN_QUEUE` 开关放开即可。
-| `ESP_SPIRAM_HEAP_SIZE` 配满而 `psram0` 仍声明 4 MB | `ext_dram_seg` 溢出（该段在链接脚本里断言 `<= CONFIG_ESP_SPIRAM_SIZE`） |
 
 ## 6. 构建
 
 ```sh
+# 在 west workspace 根目录执行；若已在应用目录内，结尾的 `linkr-bee` 换成 `.`
 west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-psram linkr-bee
 ```
 
-`build.yml` 断言 PSRAM 配置项，因此“悄悄丢掉 PSRAM”或“镜像开始使用
+从 4.4.1 升级过来的现有 workspace 必须先 `west blobs fetch hal_espressif`：4.5 的
+`hal_espressif` 换了 blob 修订，旧二进制会让 configure 直接失败
+（`Blob for path ".../libble_app.a" isn't valid`）。
+
+`.github/workflows/build.yml`、`.gitea/workflows/build.yml` 和 `tools/verify.sh` 都断言
+PSRAM 配置项与 `.ext_ram.bss` 的落点，因此“悄悄丢掉 PSRAM”或“镜像开始使用
 WiFi-in-PSRAM 选项”都会在打包前失败。
 
 改过板级 `*.conf`、`*.overlay` 或 `CMakeLists.txt` 后必须从零配置
@@ -210,6 +241,9 @@ riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep _ext_ram_bss
 # 某个缓冲到底在不在 PSRAM 里
 riscv64-zephyr-elf-nm -S build/c5-psram/zephyr/zephyr.elf | grep uart_rx_storage
 ```
+
+Windows 上 SDK 里的可执行文件带 `.exe` 后缀，直接写 `riscv64-zephyr-elf-nm` 会
+command not found，要用 `riscv64-zephyr-elf-nm.exe`。
 
 内存占用看构建日志末尾的 `sram0_0_seg` 与 `ext_dram_seg` 两行；链接期常量，反映的是
 预留，不是运行时压力。

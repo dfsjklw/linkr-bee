@@ -20,7 +20,7 @@ ESP32 在系统中承担三重角色：
 | WiFi | 当前固件使用 2.4GHz station 模式 |
 | USB | 内置 USB Serial JTAG（烧录 + console，免外部芯片） |
 | Flash | C3 ≥ 4MB；当前 C5 DevKitC 配置使用 8MB |
-| PSRAM | 不需要 |
+| PSRAM | C3 不需要；C5 DevKitC 的默认镜像依赖模块自带的 8MB PSRAM，见 [C5 PSRAM 布局](C5_PSRAM.md) |
 
 ## 3. 引脚分配
 
