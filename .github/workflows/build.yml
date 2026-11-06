@@ -38,6 +38,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y libdbus-1-dev pkg-config fish zsh
           python3 -m pip install kconfiglib==14.1.0
+      # One version, everywhere. The release assembler proves the *artifacts*
+      # match the tag; this proves the tree agrees with itself (and with the
+      # tag, when a release tag is what triggered the build) before anything is
+      # compiled — the cheapest place to catch a half-done version bump.
+      - name: Version consistency
+        run: python3 tools/check_versions.py --ref "$GITHUB_REF"
       - run: python3 -m unittest discover -s tests -v
       - name: Build the C reference terminal
         run: make -C tools clean all
@@ -78,6 +84,9 @@ jobs:
 
       - name: Run bridge tests
         run: npm test
+
+      - name: Run CLI launcher and Harness plugin regressions
+        run: node --test ../tools/linkr-tui/npm/test/*.test.mjs ../linkr-bee-dsh/test/*.test.mjs
 
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium
@@ -319,6 +328,7 @@ jobs:
           grep -qx 'CONFIG_LINKR_BLE_BRIDGE_UART_RX_DROP_NO_CONN=y' "${config}"
           grep -qx 'CONFIG_WIFI=y' "${config}"
           grep -qx 'CONFIG_NETWORKING=y' "${config}"
+          grep -qx '# CONFIG_WIFI_STA_AUTO_DHCPV4 is not set' "${config}"
           grep -qx 'CONFIG_NET_TCP=y' "${config}"
           grep -qx '# CONFIG_NET_IPV6 is not set' "${config}"
           grep -qx 'CONFIG_HTTP_SERVER=y' "${config}"

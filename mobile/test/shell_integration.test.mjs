@@ -70,7 +70,12 @@ async function enable(f) {
 }
 test('executor requires a matching handshake, start and finish, preserving nonzero exit status', async () => {
   const f=fixture(), setup=await enable(f); assert.equal(f.device.getStatus().shellIntegration.status,'ready');
-  const record=await f.device.execute({text:`printf "it's fine\\n"; exit 7`,appendEnter:true,trackExit:true});
+  /* Full Auto now asks for shell text the guard cannot parse statically, and
+   * this one is quoted: the approval is part of the setup, not the assertion. */
+  const pending=f.device.execute({text:`printf "it's fine\\n"; exit 7`,appendEnter:true,trackExit:true});
+  const waiting=f.device.getRecords().at(-1); assert.equal(waiting.state,'awaiting-approval');
+  f.device.approve(waiting.id);
+  const record=await pending;
   assert.match(record.payload,/^__linkr_run_v1 /); assert.ok(!record.payload.includes(setup.shellTracking.nonce)); assert.ok(!record.payload.includes('LINKR_EXIT_'));
   f.receive(shellMarker(other,1,'C')+shellMarker(other,1,'D',0)); assert.equal(f.device.inspectExecution(record.id).executionStatus,'unknown');
   // Finish without start is not sufficient. Inspect this before delivering start.
@@ -183,4 +188,53 @@ test('ambient boot scanning covers every retained page instead of skipping the t
   const f=fixture();await enable(f);
   f.receive('background line\r\n'.repeat(2000)+'U-Boot 2026\r\nroot@bee:~# ');
   assert.equal(f.device.getStatus().shellIntegration.status,'disabled');assert.equal(f.sent.length,1);
+});
+
+
+test('only application-owned helpers hide echo; ordinary read-only and download commands remain visible', async () => {
+  const setupFixture = fixture();
+  const setup = await enable(setupFixture);
+  assert.equal(setup.terminalEcho, 'hidden');
+  for (const metadata of [{applicationReadOnly:true}, {profileProbe:true}, {toolProbe:['sh']}]) {
+    const f = fixture();
+    const record = await f.device.execute({text:'uname -a',appendEnter:true,trackExit:true,...metadata});
+    assert.equal(record.terminalEcho, 'hidden');
+    assert.equal(record.command, 'uname -a');
+    assert.match(record.payload, /^sh -c /);
+  }
+  for (const metadata of [{}, {download:{path:'/tmp/image.bin'}}]) {
+    const f = fixture();
+    const record = await f.device.execute({text:'uname -a',appendEnter:true,trackExit:true,...metadata});
+    assert.equal(record.terminalEcho, 'command');
+  }
+});
+
+test('OSC presentation hides initialization and internal probes, retaining task output and exit status', () => {
+  const filter = createSerialPresentation(), decode = bytes => new TextDecoder().decode(bytes);
+  const setup = shellIntegrationCommand(nonce) + '\r';
+  filter.register({command:setup.trimEnd(),payload:setup,shellTracking:{protocol:'osc',nonce,sequence:0,phase:'setup'}});
+  const setupRaw = setup.replace(/\r$/, '\r\n') + shellMarker(nonce,0,'R') + '\r\nroot@bee:~# ';
+  let shown = '';
+  for (const byte of encode(setupRaw)) shown += decode(filter.push(Uint8Array.of(byte)));
+  shown += decode(filter.flush());
+  assert.equal(shown, '\r\nroot@bee:~# ');
+  const command = 'command -v curl';
+  const payload = `${SHELL_FUNCTION} ${shellQuote(command)}\r`;
+  filter.register({command,payload,terminalEcho:'hidden',shellTracking:{protocol:'osc',nonce,sequence:1,phase:'command'}});
+  const raw = payload.replace(/\r$/, '\r\n') + shellMarker(nonce,1,'C') + '/usr/bin/curl\r\n' + shellMarker(nonce,1,'D',0) + 'root@bee:~# ';
+  assert.equal(decode(filter.push(encode(raw))) + decode(filter.flush()), '/usr/bin/curl\r\n[Agent] exit=0\r\nroot@bee:~# ');
+  filter.reset();
+});
+
+
+test('hiding an identity-check echo does not grant approval or send dangerous input', async () => {
+  const f = fixture();
+  const pending = f.device.execute({text:'sudo id',appendEnter:true,trackExit:true}, undefined, {hideTerminalEcho:true});
+  const waiting = f.device.getRecords().at(-1);
+  assert.equal(waiting.terminalEcho, 'hidden');
+  assert.equal(waiting.state, 'awaiting-approval');
+  assert.equal(f.sent.length, 0);
+  f.device.reject(waiting.id);
+  await assert.rejects(pending, /rejected/);
+  assert.equal(f.sent.length, 0);
 });

@@ -7,7 +7,7 @@
 export const ABOUT_DATA = {
   "app": {
     "name": "Linkr Bee Terminal",
-    "version": "0.1.2",
+    "version": "1.1.5",
     "license": "Apache-2.0",
     "licenseUrl": "https://github.com/radxa/linkr-bee/blob/main/LICENSE",
     "repository": "https://github.com/radxa/linkr-bee",
@@ -150,31 +150,31 @@ export const ABOUT_DATA = {
       "components": [
         {
           "name": "Zephyr RTOS",
-          "version": "4.4.1",
+          "version": "4.5.0",
           "license": "Apache-2.0",
           "url": "https://github.com/zephyrproject-rtos/zephyr"
         },
         {
           "name": "HAL for Espressif SoCs",
-          "version": "pinned by Zephyr 4.4.1",
+          "version": "pinned by Zephyr 4.5.0",
           "license": "Apache-2.0",
           "url": "https://github.com/zephyrproject-rtos/hal_espressif"
         },
         {
           "name": "Mbed TLS",
-          "version": "pinned by Zephyr 4.4.1",
+          "version": "pinned by Zephyr 4.5.0",
           "license": "Apache-2.0",
           "url": "https://github.com/zephyrproject-rtos/mbedtls"
         },
         {
           "name": "TF-PSA-Crypto",
-          "version": "pinned by Zephyr 4.4.1",
+          "version": "pinned by Zephyr 4.5.0",
           "license": "Apache-2.0",
           "url": "https://github.com/zephyrproject-rtos/tf-psa-crypto"
         },
         {
           "name": "hostap",
-          "version": "pinned by Zephyr 4.4.1",
+          "version": "pinned by Zephyr 4.5.0",
           "license": "BSD-3-Clause",
           "url": "https://github.com/zephyrproject-rtos/hostap"
         }
