@@ -112,8 +112,12 @@ CMake、CI 和 `tools/verify.sh` 检查 C5 PSRAM 构建中的最终配置，缺�
 `esp32c5_wroom_n8r4.dtsi` 只声明 4 MB）；`CONFIG_ESP_SPIRAM_SIZE` 由该节点推导，
 且只有 8 MB 才会选中 `SPIRAM_TYPE_ESPPSRAM64`，所以这个 overlay 不能省。
 
-`CONFIG_ESP_SPIRAM_HEAP_SIZE=4194304` 供 shared multi-heap 使用，8 MB 的其余部分留作
-备用。板级 conf 里还有两条与 PSRAM 直接相关的约束（详见该文件注释）：
+`CONFIG_ESP_SPIRAM_HEAP_SIZE=4194304` 只决定链接脚本里 `.ext_ram` 段的长度（该段还包含
+`.ext_ram.bss` 与约 1 MB 的 XIP placeholder），**不是运行时的池大小**：运行时
+`esp_psram_smh_init()` 注册的是 `esp_psram_get_mapped_region()` 给出的整块映射区。
+4.5 实测启动行为 `PSRAM shared heap 0x420e4da0+0x7fb260`，即 8368736 B =
+8 MB − 19872 B（`.ext_ram.bss`），所以 8 MB 全部进了这一池。板级 conf 里还有两条与
+PSRAM 直接相关的约束（详见该文件注释）：
 
 - `CONFIG_SPIRAM_SPEED_80M=y` —— 40 MHz 会进入 `rst:0x1a CPU_LOCKUP` 复位循环。
 - `CONFIG_ESP_WIFI_HEAP_SYSTEM=y`，且 `ESP_WIFI_HEAP_SPIRAM` 与
@@ -222,15 +226,20 @@ west build -b esp32c5_devkitc/esp32c5/hpcore -d build/c5-sram linkr-bee -- \
 
 ## 7. 怎么量，怎么自检
 
-**启动日志**是 overlay 是否生效的第一道检查。PSRAM 初始化会在
-`*** Booting Zephyr OS ***` 之前打印：
+**启动自检**有两条证据，Zephyr 4.5 上要认第二条：
+
+1. HAL 的 PSRAM 初始化日志（`Found 8MB PSRAM device` / `Speed: 80MHz`）出现在
+   `*** Booting Zephyr OS ***` **之前**。这两行是 `esp_psram` 的 **info** 级日志，
+   而板级配置为了省 SRAM 设了 `CONFIG_ESP_HAL_EARLY_LOG_LEVEL=2`（只留 warning 以上），
+   **所以 4.5 的默认镜像里它们不再出现**——缺这两行不再说明 overlay 失效。
+2. 固件自己的运行时自检（`src/ext_ram.c`）在启动约 1.1 s 后打印一行：
 
 ```
-I (esp_psram): Found 8MB PSRAM device
-I (esp_psram): Speed: 80MHz
+<inf> linkr_ext_ram: PSRAM shared heap 0x420e4da0+0x7fb260 clears .ext_ram.bss (ends 0x420e4da0)
 ```
 
-若第一行缺失，说明 overlay 没生效，`.ext_ram.bss` 的写入正落在未映射内存上。
+   括号里的地址必须等于堆起点；不相等时该模块会打印 `ERR` 并返回非零。要临时把 HAL
+   的 PSRAM 日志要回来，把 `CONFIG_ESP_HAL_EARLY_LOG_LEVEL` 调到 3 重新构建即可。
 
 **放置情况**只能从链接产物核对，`@i?` 里没有 PSRAM 计数器：
 
