@@ -50,32 +50,46 @@ repository owns the accessory firmware and reference clients.
 
 ## Quick Start
 
-Get the firmware running in 5 steps:
+Set up the workspace once, then build, flash and connect:
 
 ```sh
-# 1. Clone and enter the workspace
-git clone https://github.com/radxa/linkr-bee.git
+# 0. Prerequisites: Python 3, git, cmake and ninja, plus west
+python3 -m pip install --user west
+
+# 1. Create the workspace once; the manifest names the app checkout `linkr-bee`
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0, hal_espressif, mbedtls, tf-psa-crypto, hostap
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# 2. Zephyr SDK 1.0.1 with the RISC-V and Xtensa toolchains this repo builds with
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+
+# 3. Build the application directory for ESP32-C3 Super Mini (default WiFi + BLE).
+#    `west build -b <board> linkr-bee` from the workspace root is equivalent.
 cd linkr-bee
+west build -b esp32c3_supermini .
 
-# 2. Build for ESP32-C3 Super Mini (default WiFi + BLE)
-west build -b esp32c3_supermini linkr-bee
-
-# 3. Flash to device
+# 4. Flash to device
 west flash
 
-# 4. Connect via Python terminal
+# 5. Connect via Python terminal
 python3 tools/linkr_ble_terminal.py
 
-# 5. Or serve Web terminal locally
+# 6. Or serve Web terminal locally
 tools/serve_web.sh  # Open http://127.0.0.1:8765/
 ```
 
-> **Note**: Requires Zephyr v4.4.1 west workspace with Espressif HAL blobs. See [Build](#build) for details.
+> **Note**: Requires Zephyr v4.5.0 west workspace with the Espressif HAL blobs
+> from `west.yml`. See [Build](#build) for details, the SDK alternative and the
+> other boards.
 
 ## Supported environment
 
 - Firmware: ESP32-C3 DevKitM, DevKitC, Super Mini, and ESP32-C5 DevKitC
-- Zephyr: **v4.4.1**
+- Zephyr: **v4.5.0**
+- Zephyr SDK: **1.0.1** (the toolchain has its own version; 4.5.0 is the RTOS)
+- Build host: Python **3.12+**, CMake **3.28+**
 - One firmware source tree with BLE UART bridge, WiFi station control,
   anonymous HTTP WebDAV log upload, and UART-over-WebSocket LAN access.
   WebDAV is enabled in the default C3/C5 builds; the ESP32-WROOM build disables
@@ -84,7 +98,77 @@ tools/serve_web.sh  # Open http://127.0.0.1:8765/
 
 ## Build
 
-Use a Zephyr v4.4.1 west workspace. The default WiFi-enabled build also needs
+### Updating an existing workspace
+
+After updating this application, run these commands from the west workspace root:
+
+```sh
+west update
+python3 -m pip install -r zephyr/scripts/requirements.txt
+west blobs fetch hal_espressif
+west build -p always -b linkr_bee_x1_0 linkr-bee
+```
+
+Choose the board target below for other hardware. Recreate the build directory
+with `-p always` when moving from 4.4.1. Zephyr 4.5.0 still selects SDK 1.0.1.
+The migration updates manual DHCP control to `CONFIG_WIFI_STA_AUTO_DHCPV4=n`,
+installs the encryption-event ordering callback in the common HCI driver data,
+and uses `ring_buf_consume()` to discard queued WebSocket bytes. The Bee X1.0
+board selects the plain ESP32-C3 SoC and declares its 4 MB flash explicitly.
+
+Zephyr 4.5 increases RF and network SRAM use. The default profiles retain the
+existing services and client limits with smaller bounded queues:
+
+| Target | 4.5 memory budget |
+| --- | --- |
+| C3 / Bee X1.0 | 8 dynamic WiFi RX/TX buffers, 40 KiB WiFi heap reservation, 8 chunks per BLE peer, 4 KiB deferred logs, 4 KiB HTTP/system/connect stacks |
+| C5 | 6 dynamic WiFi RX/TX buffers, 36 KiB WiFi and 44000 B Bluetooth heap reservations, 12 MSYS-2 blocks, 8 controller ACL buffers of 255 bytes, 20 network buffers and 10 packet descriptors per direction |
+| WROOM | Existing 52000 B system heap, 4 KiB UART capture, 4 chunks per BLE peer, 1 KiB LAN rings, 4 KiB HTTP and 3 KiB LAN client stacks |
+
+Bee X1.0 additionally uses a 2 KiB main stack and a 1 KiB logging stack. Its
+Zephyr 4.5 diagnostic runs measured 1092 B and 732 B respectively during idle,
+BLE management/data traffic, WiFi scans and 1500000-baud UART loopback. The
+board enables `trng0` and uses the hardware entropy source. Including the
+activity-LED bookkeeping and HTTP poll reservation below, the production
+image's available libc arena grows from 13536 B to 15456 B. Other boards keep
+their existing stack budgets.
+
+RGB activity updates coalesce into one frame when traffic starts and one frame
+after 40 ms without traffic. Each received UART chunk extends the deadline
+without redrawing the same color or rescheduling work. This avoids repeatedly
+occupying the system workqueue for the WS2812 driver's 300 us latch delay.
+On Bee X1.0, the same 60-second onboard FIFO loopback generator improved from
+89278 B/s to 150034 B/s, receiving all 9002240 bytes without mismatches or RX-ring
+loss. The divider reports 1500586 baud for the nominal 1500000, 8N1 setting;
+this is a local TX/RX loopback, not an external measurement of the bit clock.
+The generator is diagnostic code; production C3 TX still uses `uart_poll_out()`.
+
+Keep the 16 KiB UART ring and eight chunks per BLE peer on Bee X1.0. Continuous
+UART input can exceed a host's BLE drain rate: a separate unpaced run counted
+9664576 dropped BLE output bytes while UART RX remained intact. Larger buffers
+only absorb bursts; sustained lossless traffic requires upstream pacing, flow
+control or a transport with sufficient throughput.
+
+The HTTP/WebSocket bridge defaults `CONFIG_ZVFS_POLL_MAX` to 5. HTTP/1 polling
+needs one wakeup eventfd, one listener per service and one event per client
+still in HTTP/upgrade processing: two clients and one service need four events.
+This budget is separate from the two-object `CONFIG_ZVFS_EVENTFD_MAX` pool.
+`ws_bridge.c` checks the HTTP fd capacity at build time, including additional
+HTTP/3 listeners/streams, so custom client or service counts must be accompanied
+by a sufficient poll budget. Otherwise simultaneous handshakes can make poll
+fail with `ENOMEM` and restart the listener, closing pending HTTP connections.
+On the 32-bit ESP32 targets, increasing this budget from three to five adds
+16 B to the socket-service poll table and two local `k_poll_event` objects
+(40 B before stack-frame alignment) per poll call; thread stack sizes stay fixed.
+
+C5 keeps the measured thread stack budgets, WiFi heap and network buffers in
+internal SRAM; application data alone uses PSRAM. Its optional WiFi IRAM speed
+optimizations are off and early HAL logging retains warnings/errors. Larger
+custom RF pools fall back to the upstream heap reservation. These limits reduce
+burst tolerance: validate pairing, scan/connect, two BLE peers, LAN forwarding,
+WebDAV uploads, stack watermarks and reported drops on hardware before release.
+
+Use a Zephyr v4.5.0 west workspace. The default WiFi-enabled build also needs
 the Espressif HAL blobs (`modules/hal_espressif`) present in the manifest.
 
 The manifest allowlist also pulls in `hostap`. The ESP32-C5 controller
@@ -97,28 +181,62 @@ CI workflow assert that the C3 (`ESP32_BT_CTLR_LE_SECURITY_ENABLE`) and C5
 (`ESP32_BT_LE_SECURITY_ENABLE`, `…_SM_SC`, `…_LL_CFG_FEAT_LE_ENCRYPTION`,
 `…_CRYPTO_STACK_MBEDTLS`) controller security symbols stay enabled.
 
-From that workspace:
+A fresh clone is only the application half of a workspace. Prepare the
+workspace once, from its root:
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee
+python3 -m pip install --user west
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0, hal_espressif, mbedtls, tf-psa-crypto, hostap
+west zephyr-export
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# Zephyr SDK 1.0.1: RISC-V for ESP32-C3/C5, Xtensa for ESP32-WROOM
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+# or download zephyr-sdk-1.0.1_<host>.tar.xz and run its ./setup.sh
 ```
 
-or for DevKitC:
+`west update` pulls `hal_espressif` (the ESP32 HAL blobs the WiFi build needs)
+and the mbedTLS/hostap modules the C5 controller's pairing depends on; without
+them a C3/C5 build fails to configure instead of silently losing pairing.
+
+Then build the application directory — the board list below is the one
+`tools/verify.sh` and CI build:
 
 ```sh
-west build -b esp32c3_devkitc linkr-bee
+cd linkr-bee
 ```
 
-For ESP32-C3 Super Mini:
+ESP32-C3 DevKitM:
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_devkitm .
 ```
 
-For ESP32-C5 DevKitC:
+ESP32-C3 DevKitC:
 
 ```sh
-west build -b esp32c5_devkitc/esp32c5/hpcore linkr-bee
+west build -b esp32c3_devkitc .
+```
+
+ESP32-C3 Super Mini:
+
+```sh
+west build -b esp32c3_supermini .
+```
+
+ESP32-C5 DevKitC:
+
+```sh
+west build -b esp32c5_devkitc/esp32c5/hpcore .
+```
+
+ESP32-WROOM-32 (`esp32_devkitc/esp32/procpu`) is built by CI; its default
+configuration disables WebDAV for DRAM, and CI is the reference for that board:
+
+```sh
+west build -b esp32_devkitc/esp32/procpu .
 ```
 
 For the Linkr Bee X1.0 production board (MV013). The board definition lives in
@@ -127,7 +245,7 @@ registers the application root as a `BOARD_ROOT`, so no extra CMake argument is
 needed:
 
 ```sh
-west build -b linkr_bee_x1_0 linkr-bee
+west build -b linkr_bee_x1_0 .
 ```
 
 ### GitHub Actions build
@@ -136,7 +254,7 @@ The workflow in `.github/workflows/build.yml` builds each board's default
 WiFi + BLE configuration for `esp32c3_supermini`, `esp32c3_devkitm`,
 `esp32c3_devkitc`, `linkr_bee_x1_0`, `esp32c5_devkitc/esp32c5/hpcore`, and
 `esp32_devkitc/esp32/procpu` (ESP32-WROOM-32). It runs on pushes to `main`,
-pull requests, and manual dispatches using Zephyr v4.4.1 with Zephyr SDK
+pull requests, and manual dispatches using Zephyr v4.5.0 with Zephyr SDK
 1.0.1. To keep runner disk usage bounded, each job installs only the
 toolchain its board needs — `riscv64-zephyr-elf` for the RISC-V targets and
 `xtensa-espressif_esp32_zephyr-elf` for the WROOM — instead of the full Zephyr
@@ -353,7 +471,7 @@ not collide after reboot.
 A normal C3 build already includes it:
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_supermini .
 ```
 
 The ESP32-C3 SoC WiFi driver is `CONFIG_WIFI_ESP32` (defined in
@@ -418,6 +536,16 @@ WebSocket endpoint so LAN clients bypass BLE range and MTU limits entirely:
   build-time token (32 lowercase hex) and takes precedence over the generated one
 - Disable entirely with `-DCONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE=n`
 
+> **Warning — LAN mode without a token is open to the whole network.** The
+> bridge listens on `0.0.0.0` and checks no `Origin` or `Host` header, so any
+> page or script that can reach `ws://<device-ip>/ws` can open the socket.
+> Setting `@s token off`, or leaving
+> `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN` empty, disables
+> authentication entirely: anyone on that network can then **read and write**
+> the target's UART. Keep the token on outside a trusted lab network, rotate it
+> with `@s token` and re-pair the clients. The bridge speaks plain `ws://`; there
+> is no TLS.
+
 The Web Bluetooth terminal (`web/`) has a BLE/LAN switch in the Connection
 card; LAN mode connects to `ws://<host>/ws`, keeps terminal input, quick-send
 chips and counters working, and disables management controls that require BLE
@@ -449,7 +577,7 @@ in a separate build directory:
 
 ```sh
 west build -p always -d build-c5-open-pairing \
-  -b esp32c5_devkitc/esp32c5/hpcore linkr-bee -- \
+  -b esp32c5_devkitc/esp32c5/hpcore . -- \
   -DEXTRA_CONF_FILE=dev_c5_open_pairing.conf
 ```
 
@@ -652,7 +780,7 @@ UART groups expose UART TX drops, BLE output-queue drops, and BLE indication
 timing:
 
 ```text
-@info fw version=0.1.2 zephyr=4.4.1
+@info fw version=0.1.2 zephyr=4.5.0
 @info sys uptime_ms=123456 owner=0 security=1
 @info uart dropped=0 dropped_no_conn=0 buffer=0/16384
 @info wifi state=connected ip=ready error=0
@@ -807,7 +935,7 @@ asset builds: those are covered by CI (`.github/workflows/build.yml`).
 Enable UART RX echo loopback:
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee -- \
+west build -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_uart.conf
 ```
 
@@ -824,7 +952,7 @@ Build the hardware loopback verifier after shorting UART0 TX (GPIO21) to RX
 (GPIO20):
 
 ```sh
-west build -p always -b esp32c3_devkitm linkr-bee -- \
+west build -p always -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_loopback.conf
 ```
 
@@ -832,7 +960,7 @@ For a BLE NUS echo diagnostic using the same full firmware feature set (no
 UART wiring required):
 
 ```sh
-west build -p always -b esp32c3_supermini linkr-bee -- \
+west build -p always -b esp32c3_supermini . -- \
   -DEXTRA_CONF_FILE=test_ble_echo.conf
 ```
 
@@ -855,7 +983,7 @@ they do not write the ESP32-C3 coredump sector.
 ├─────────────────────────────────────────────────────────────┤
 │                    BLE GATT (ATT MTU 247)                    │
 ├─────────────────────────────────────────────────────────────┤
-│            ESP32-C3/C5 Firmware (Zephyr v4.4.1)              │
+│            ESP32-C3/C5 Firmware (Zephyr v4.5.0)              │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │  BLE Stack  │  │  UART Bridge│  │  WiFi/WebSocket     │ │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
@@ -1398,7 +1526,7 @@ task-watchdog path stays covered by the C3 run above. The released image was
 reflashed afterwards and ran 75 s without a reset. WROOM reset behaviour still
 requires physical verification.
 
-Simple-boot images now include the ROM-visible SHA-256 digest. Zephyr v4.4.1's
+Simple-boot images now include the ROM-visible SHA-256 digest. Zephyr v4.5.0's
 `elf2image --ram-only-header` output omits it; Linkr's build module fills existing
 zero padding with the digest and adjusts the loader's scan past it. File size
 and the addresses of the hidden Flash segments remain unchanged. The module
@@ -1412,9 +1540,10 @@ in the [ESP image format](https://docs.espressif.com/projects/esptool/en/latest/
 this simple-boot digest covers the ROM-visible RAM image, not the hidden mapped
 Flash segments; release `SHA256SUMS` and flash readback still check the whole
 file. Do not apply the formatter alone to an old image without the matching
-loader. C3 and C5 startup and fault recovery are verified with the warning
-absent; the other supported boards have build and image-format verification
-only.
+loader. The earlier C3/C5 startup and fault-recovery checks used 4.4.1.
+Bee X1.0 has since exercised 4.5 boot, BLE loopback, WiFi scans and UART
+receive at line rate as described above. Other boards and WiFi/LAN/upload
+workloads still require hardware validation with the new memory budgets.
 
 ## Validation status
 
@@ -1422,9 +1551,13 @@ What each layer has actually been exercised against. A successful build, a host
 test run, or a simulator launch is not end-to-end acceptance on the target
 hardware.
 
+The 4.5 migration also rendered the board and About surfaces at 338, 390, 834
+and 1440 px in English/Chinese and light/dark themes. The About page displays
+4.5.0 without horizontal overflow. Screenshots are in `build-demo/ui-review/`.
+
 | Layer | Verified in this repository | Still requires hardware |
 | --- | --- | --- |
-| Firmware builds | `esp32c3_supermini`, `esp32c3_devkitm`, `esp32c3_devkitc`, `linkr_bee_x1_0`, and `esp32c5_devkitc/esp32c5/hpcore` build in CI under Zephyr v4.4.1, with the per-generation controller security symbols asserted | — |
+| Firmware builds | Six targets including `esp32_devkitc/esp32/procpu` build locally on Zephyr v4.5.0 with controller security, PSRAM placement and ROM image checks; Bee X1.0 also passed boot, BLE binary loopback, WiFi scans and a 60-second UART line-rate RX test with stack watermarks | Other boards' 4.5 runtime acceptance, WiFi association/LAN/uploads, and remote CI on the published revision |
 | Host protocol tests | `tests/` compiles and drives the production management, security, target-binding, WebDAV, and HCI-order code paths, including the C3/C5 build guards | Real SMP pairing, NVS persistence, radio behaviour |
 | BLE terminal | Web, Python, and C clients, plus the browser regression suite for Reliable UART sequencing, reassembly, and session boundaries | Pairing, MTU negotiation, and reconnect behaviour per platform |
 | WiFi, LAN bridge, WebDAV | Host tests and the browser suite; the WS token handshake is covered on both sides | Association, BLE/WiFi coexistence, upload against a real endpoint |
