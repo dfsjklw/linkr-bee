@@ -492,7 +492,7 @@ config LINKR_BLE_BRIDGE_UART_RX_DROP_NO_CONN
 	  active BLE connection.
 
 config LINKR_BLE_BRIDGE_WIFI
-	bool
+	bool "Enable WiFi station and LAN bridge"
 	default y
 	select NETWORKING
 	select NET_IPV4

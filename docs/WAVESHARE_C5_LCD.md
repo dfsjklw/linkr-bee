@@ -19,7 +19,8 @@
 ## 2. 构建方式
 
 适配通过**独立 conf/overlay 文件**叠加在现有 C5 板级配置之上，不改动
-`boards/esp32c5_devkitc_esp32c5_hpcore.*`（保留既有 BLE/WiFi/WebDAV 调优）：
+`boards/esp32c5_devkitc_esp32c5_hpcore.*`（保留既有 BLE 调优；WiFi/WebDAV 在本板
+编译期关闭，见 4.0 节）：
 
 ```powershell
 cd C:\VSCODE\linkr-bmc
@@ -59,7 +60,18 @@ CI 中的 `ESP32-C5 Waveshare Touch LCD 2.8` 矩阵项自动带上这两个参�
 | UART 桥接 | GPIO11 / GPIO12 | `uart1`（沿用现有 overlay） |
 | USB console | GPIO13 / GPIO14 | `usb_serial`（沿用） |
 
-## 4. 内存布局与实测
+## 4. 内存布局与实测（Zephyr 4.5）
+
+本分支已把上游 `radxa/linkr-bee` 的 `main` 合并进来，构建基线从
+**Zephyr 4.4.1 + LVGL 8** 换成 **Zephyr v4.5.0 + LVGL 9.5**（`west.yml`
+固定）。迁移时踩到两处 4.5 的硬变化：
+
+- `modules/lib/gui/lvgl` 必须检出 Zephyr `west.yml` 里钉住的 `c9ffd46`。
+  工作区原来停在一个更新的分支（v9.5 开发线），它删掉了
+  `LV_COLOR_FORMAT_DEFAULT`，会让 4.5 的 `modules/lvgl/lvgl.c` 直接编不过。
+- ST7789 的 devicetree 绑定在 4.5 改了两处：`lcd-controller.yaml` 强制要求
+  `pixel-format`（本板用 `PANEL_PIXEL_FORMAT_RGB_565`），驱动改由它推导
+  COLMOD，旧的 `colmod` 属性已从 `sitronix,st7789v.yaml` 删除。
 
 配置要点（`boards/linkr_c5_touch_lcd.conf`）：
 
@@ -69,69 +81,96 @@ CI 中的 `ESP32-C5 Waveshare Touch LCD 2.8` 矩阵项自动带上这两个参�
   且 `.ext_ram.dummy` 占用约 1 MB 的 XIP 占位，因此**静态 PSRAM 段 + heap ≤ 7 MB**。
 - `CONFIG_ESPTOOLPY_FLASHSIZE_8MB`：修正原本 `2MB` 与 8 MB 分区表不一致的问题。
 
-`build/c5-waveshare` 实测：
+**可用的内部 SRAM 变小了 12.8 KB。** Zephyr 4.5 把 C5 的
+`DRAM_USER_END` 定回 `DRAM_SHARED_BUFFERS_END = 0x4085C610`，即
+`sram0_0_seg = 378384 B`；4.4.1 构建里那块 ROM 栈/尾部（到 `0x4085F800`）不再
+属于 Zephyr。**本文件里 4.4.1 时代的 391168 B 分母不能再拿来对比。**
+
+合并后按原样开启 WiFi 时链接直接失败：
 
 ```
-FLASH         1088324 B / 8388352 B   12.97%
-sram0_0_seg    377200 B / 391168 B    96.43%   ← 余量约 14 KB
-irom0_0_seg    781248 B / 8 MB
-drom0_0_seg    891716 B / 8 MB
-ext_dram_seg     4992 KB / 8 MB       60.94%   ← PSRAM 已生效（heap 4 MB + 占位）
+region `sram0_0_seg' overflowed by 17392 bytes
 ```
 
-接入 LVGL、触摸、终端视图与双页布局之后：
+面板自己占的 SRAM 正好是这一量级（LVGL workqueue 栈 8 KB + VDB 4608 B +
+`lv_global` 5120 B），但三项都迁不走：VDB 迁 PSRAM 实测整屏重绘 574 ms
+（见第 7 节），而线程栈、LVGL 全局状态和 WiFi/BT 系统堆按 Zephyr/ESP32 的约束
+必须留在内部 SRAM。迁移无解，因此**本板关闭 WiFi**（见下方"WiFi 关闭"）。
+
+关闭 WiFi 后的实测（`build/c5-waveshare-merge`）：
 
 ```
-FLASH         1379332 B / 8388352 B   16.44%
-sram0_0_seg    389648 B / 391168 B    99.61%   ← 余量约 1.5 KB
-ext_dram_seg     5312 KB / 8 MB       64.84%
-```
-
-合并上游 main（默认启用的 watchdog + 动态 BLE 名）之后，内部 SRAM 一度只剩
-112 B（99.97%），靠下调 `ESP32_TIMER_TASK_STACK_SIZE`（4096→3072）与
-`SYSTEM_WORKQUEUE_STACK_SIZE`（3072→2560）收回约 1.5 KB：
-
-```
-FLASH         1376884 B / 8388352 B   16.41%
-sram0_0_seg    389520 B / 391168 B    99.58%   ← 余量约 1.6 KB
-ext_dram_seg     5312 KB / 8 MB       64.84%
+FLASH          990,208 B / 8,388,352 B   11.80%
+sram0_0_seg    272,512 B / 378,384 B     72.02%   ← 余量 105,872 B
+irom0_0_seg    659,584 B / 8 MB
+drom0_0_seg    775 KB    / 8 MB
+ext_dram_seg 5,054,256 B / 32 MB         15.06%   ← PSRAM 已生效
+.lvgl_psram    133,936 B                          ← LVGL 对象堆 128 KB + 终端行缓冲
+.ext_ram.bss     7,984 B                          ← 上游的 .ext_ram.bss 机制
 ```
 
 > 渲染缓冲（VDB）在**内部 SRAM**，LVGL 对象堆（128 KB）在 PSRAM。两者分开是
 > 上板实测的结论，见第 7 节"渲染性能与换页耗时"。
 >
-> 内部 SRAM 已用到 99.6%，**不能更满**：实测 99.99% 时 BLE 配对直接失败
-> （`bt_gatt: CMAC operation init failed -141`）。
+> 4.4.1 时代把 SRAM 用到 99.6% 时实测 BLE 配对直接失败
+> （`bt_gatt: CMAC operation init failed -141`）。关掉 WiFi 后 SRAM 降到 72%，
+> 这条线不再是勉强压线运行。
+
+### 4.0 WiFi 关闭（本板的产品取舍）
+
+`boards/linkr_c5_touch_lcd.conf` 里显式 `CONFIG_LINKR_BLE_BRIDGE_WIFI=n`
+（同时 `NETWORKING`、`WIFI`、`HTTP_SERVER`、`WS_BRIDGE`、WebDAV 都不会编入），
+CI 的面板 job 会断言这一点。影响范围：
+
+| 功能 | 面板构建 |
+|---|---|
+| BLE 串口桥 / 管理通道 / 配对 | ✅ 不受影响 |
+| 面板 UI、触摸、终端视图 | ✅ 不受影响 |
+| WiFi 配网 `@w=`、扫描、IP | ❌ 编译期移除（状态页 WIFI 点恒为灭） |
+| LAN WebSocket 桥 `ws://<ip>/ws` | ❌ 随 WiFi 移除 |
+| WebDAV 日志上传 `@d` | ❌ 随 WiFi 移除 |
+
+`LINKR_BLE_BRIDGE_WIFI` 因此从隐藏 bool 改成带 prompt 的用户可配置项
+（否则 board conf 不允许赋值）。共享的 C5 DevKitC 配置仍然开启 WiFi，
+只有面板构建关。
 
 ### 4.1 PSRAM 布局（关键约束）
 
 ESP32-C5 的链接脚本把 `.ext_ram.dummy`（XIP 窗口占位）与 `.ext_ram.bss` 都放在
-映射起点，而 `shared_multi_heap` 也把堆注册在同一个起点，因此**静态段与堆会重叠**
-（本项目实测两者均为 `0x42120000`）。又因为 C5 的 `default.ld` 不调用
-`LINKER_DT_REGIONS()`，`zephyr,memory-region` 也无法用来绕开。
+映射起点，而 `shared_multi_heap` 也把堆注册在同一个起点，因此**静态段与堆会重叠**。
+应用层用 `Kconfig` 的 `SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` 默认值把
+`.ext_ram.bss` 排除出共享堆（CMake 里有 `FATAL_ERROR` 兜底）；又因为 C5 的
+`default.ld` 不调用 `LINKER_DT_REGIONS()`，`zephyr,memory-region` 无法用来放置
+LVGL 的缓冲。
 
 所以 LVGL 的渲染缓冲与对象堆由 `boards/linkr_c5_lvgl_psram.ld` 固定到
-`0x42700000`（堆结束 `0x42520000` 之上，留约 1.9 MB 增长余量），并附带链接期
+`0x42700000`（远超链接脚本预留的 4 MB 堆段末尾 `0x424D1F30`），并附带链接期
 `ASSERT`，代码增长到会重叠时直接链接失败而不是静默跑飞：
 
 ```
-0x42120000  ┌──────────────────────────┐
-            │ shared multi heap 4 MB   │  ← 映射起点，随 .text/.rodata 增长上移
-0x42520000  ├──────────────────────────┤
-            │ 余量 ~1.9 MB             │
+0x420D0000  ┌──────────────────────────┐
+            │ .ext_ram.dummy ~832 KB   │  ← XIP 占位
+0x420D1F30  ├──────────────────────────┤
+            │ .ext_ram.bss 7,984 B     │  ← 启动时清零，堆从其后开始
+            │ shared multi heap 4 MB   │  ← 链接期预留；运行时注册的是整块映射区
+0x424D1F30  ├──────────────────────────┤
+            │ 余量 ~2.2 MB             │
 0x42700000  ├──────────────────────────┤
-            │ .lvgl_buf  96 KB（双缓冲）│
             │ .lvgl_heap 128 KB        │
-0x4272C000  └──────────────────────────┘
+            │ .linkr_psram（终端行）    │
+0x42720B30  └──────────────────────────┘
 ```
 
-> 若 `CONFIG_ESP_SPIRAM_HEAP_SIZE` 变大或镜像显著增长，需同步上调该固定地址
-> （`ASSERT` 会先失败）。
+> 运行时 `esp_psram_smh_init()` 注册的共享堆是整块映射区（启动日志：
+> `PSRAM shared heap 0x420d1f30+0x7fe0d0`），因此它在地址空间上和
+> `0x42700000` 的 LVGL 窗口重叠。当前没有任何代码从
+> `shared_multi_heap` 分配（WiFi 的 `ESP_WIFI_HEAP_SPIRAM` 路径没启用，
+> video 驱动也没启用），所以不会实际占用；一旦有人启用这两者，必须先把
+> LVGL 窗口上移并重新验算。
 
-> SRAM 已经非常紧张（见上方实测）。`linkr_ui.c` 与 `linkr_terminal.c` 需要更多
-> DRAM 时，先把 `log_ring` 等可暂停缓冲迁到 `.linkr_psram`。注意
-> **`uart_rx_storage` 不能迁**：它由 UART ISR 写入，放 PSRAM 后立刻溢出并丢数据
-> （实测启动即报 `Dropped N UART RX bytes`）。`ble_to_uart_storage` 可以迁。
+> `uart_rx_storage` 不能迁 PSRAM：它由 UART ISR 写入，放 PSRAM 后立刻溢出并丢
+> 数据（实测启动即报 `Dropped N UART RX bytes`）。`ble_to_uart_storage`
+> 已经通过上游的 `.ext_ram.bss` 机制放在 PSRAM。
 
 ## 5. 初始化顺序（必须保持）
 
@@ -166,12 +205,19 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 - [x] **面板配对授权**（`src/ble_security.c`）：触屏 PAIR 按钮开 60 s 一次性窗口
 - [x] **终端视图**：VT100 解析 + 逐行着色，25 行固定网格（无滚动历史），未读标志
       驱动状态页圆点
+- [x] **迁移到 Zephyr v4.5.0 + LVGL 9.5**：`pixel-format` 绑定、LVGL 模块钉版本、
+      `.ext_ram.bss` 采用上游机制（本分支旧的 `.linkr_psram` 只保留给 LVGL 窗口）
+- [x] **WiFi 关闭**：内部 SRAM 放不下面板 + 射频，迁移无解，见 4.0 节
 
 未完成 / 不在本期范围：
 
 - [ ] 32 MB Flash 分区表：需自定义 board 定义（现有 devkit dts 硬编码 8 MB 分区 dtsi）
-- [ ] 状态页 RSSI / 信道字段、已绑定主机数 `host N/8`
+- [ ] 状态页 RSSI / 信道字段、已绑定主机数 `host N/8`（WiFi 关闭后 RSSI/信道
+      两项无数据来源）
 - [ ] 换页性能：受 `-Os` 软件渲染限制，见第 7 节实测
+- [ ] 若要恢复 LAN（WebSocket）/ WebDAV，需要先解决内部 SRAM 约 17 KB 的缺口：
+      只能换 32 MB Flash + 自定义 board 去掉 `.ext_ram.dummy`/缩小堆，或接受
+      VDB 移入 PSRAM 的渲染代价
 
 > 电池电量、SD 卡与板载传感器按需求**排除在本期范围之外**（传感器驱动已从
 > `boards/linkr_c5_touch_lcd.conf` 关闭）。
@@ -192,7 +238,8 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
    `inversion-off`。
 6. 若出现 PSRAM 相关 HardFault 或花屏：用 `nm` 确认 `__lvgl_psram_start`
    与 `_ext_ram_heap_end` 未重叠（见 4.1）。
-7. 确认 BLE/WiFi 功能未回归：开启 PSRAM 后必须重跑既有 BLE 回归与 24 h 压测。
+7. 确认 BLE 功能未回归：开启 PSRAM 后必须重跑既有 BLE 回归与 24 h 压测。
+   本板 WiFi 已在编译期关闭（4.0 节），状态页 WIFI 点恒灭属预期，不要当成故障。
 8. 触摸：拖动终端区时应跟手、方向一致；串口不应出现 `linkr_touch` 的读取错误。
 9. 传感器：串口**不应**出现 `linkr_status` 模块日志（该模块已删除，传感器不再上屏）。
 10. 终端：上电后终端区应先显示三行自检文本（`Linkr panel ready` 等），说明字体与
@@ -303,42 +350,78 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   而 `CONFIG_ST7789V_RGB565` 走 `PIXEL_FORMAT_RGB_565` 不做字节交换）。缺少这一项时
   背景 `#1082` 会显示成 `#8210`（洋红），字形边缘出现红/青镶边。
 
-## 8. 实测启动日志（首板验证通过）
+## 8. 实测启动日志（Zephyr 4.5 合并后，WiFi 关闭）
 
-`west flash -d build/c5-waveshare --esp-device COM5` 之后抓取的串口输出（节选，
-已确认无 `<err>` / `<wrn>` 行）：
+烧录：
+
+```powershell
+esptool -c esp32c5 -p COM5 -b 460800 write-flash --flash-mode dio `
+  --flash-freq 80m --flash-size 8MB 0x2000 `
+  build/c5-waveshare-merge/zephyr/zephyr.bin
+```
+
+复位后抓到的串口输出（全文，已确认无 `<err>` / `<wrn>` 行；`<inf>` 行前的
+`[00:00:00.000,000]` 时间戳和颜色转义已去掉）：
 
 ```
-I (spi_flash): flash io: dio
-W (spi_flash): Detected size(32768k) larger than the size in the binary image header(8192k)
-I (esp_psram): Found 8MB PSRAM device
-I (esp_psram): Speed: 80MHz
+ESP-ROM:esp32c5-eco3-20250704
+Build:Jul  4 2025
+rst:0x15 (USB_UART_HPSYS),boot:0x76 (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x40800000,len:0x1eecc
+load:0x4081ef10,len:0x39b8
+load:0x50000000,len:0x24
+entry 0x40800380
+W (spi_flash): Detected size(32768k) larger than the size in the binary image header(8192k). Using the size in the binary image header.
 <inf> board_io: CH32V003 expander ready at 0x24
-<inf> cst3530: CST3530 ready at 0x58 (irq gpio@60091000 pin 5)
-*** Booting Zephyr OS build v4.4.1 ***
+*** Booting Zephyr OS build v4.5.0 ***
 <inf> linkr_display: panel up: 240x320 ST7789
+<inf> linkr_watchdog: Reset cause: 0x00000000
+<inf> linkr_watchdog: Watchdog active: task timeout 60000 ms, hardware fallback enabled
+<inf> linkr_touch: CST3530 polling at 0x58 (240x320)
 <inf> linkr_ui: status screen ready (2 pages)
 <inf> fs_nvs: 8 Sectors of 4096 bytes
-<inf> bt_hci_core: HCI: version 6.0 (0x0e) ...
-<inf> linkr_wifi: WiFi idle (no saved SSID); ...
-<inf> linkr_ble_bridge: BLE advertising as "Linkr BLE UART-3"
+<inf> fs_nvs: alloc wra: 1, f50
+<inf> fs_nvs: data wra: 1, 268
+I (BLE_INIT): Using main XTAL as clock source
+I (BLE_INIT): ble controller commit:[4adb29e,7f63735]
+I (BLE_INIT): Bluetooth MAC: 10:bd:a3:dd:89:96
+PHY: libbtbb version: 92325d6, Mar 10 2026, 10:22:25
+<inf> bt_hci_core: HW Platform: Espressif Systems (0x0004)
+<inf> bt_hci_core: HW Variant: ESP32-C5 (0x0007)
+<inf> bt_hci_core: Controller: Standard Bluetooth controller (0x00) manufacturer 0x02e5 Version 4.5 Build 0
+<inf> bt_hci_core: HCI transport: BT ESP32
+<inf> bt_hci_core: Identity[0]: P:10:BD:A3:DD:89:96
+<inf> bt_hci_core: Identity[1]: R:D5:D7:97:C5:3C:BA
+<inf> bt_hci_core: HCI: version 6.0 (0x0e) revision 0x0000, manufacturer 0x02e5
+<inf> bt_hci_core: LMP: version 6.0 (0x0e) subver 0x0000
+<inf> linkr_ble_bridge: BLE identity 1: R:D5:D7:97:C5:3C:BA
+<inf> linkr_ble_bridge: BLE name: Linkr Bee 8994
+<inf> linkr_ble_mgmt: Linkr Management API v1.0 ready
+<inf> linkr_ext_ram: PSRAM shared heap 0x420d1f30+0x7fe0d0 clears .ext_ram.bss (ends 0x420d1f30)
+<inf> linkr_ble_bridge: Linkr Bee UART bridge ready on uart@60001000
+<inf> linkr_ble_bridge: BLE advertising as "Linkr Bee 8994"
 ```
 
 结论与已知项：
 
 | 项 | 结果 |
 |---|---|
-| 8 MB PSRAM | ✅ 识别为 8 MB，80 MHz |
+| 8 MB PSRAM | ✅ 启动自检 `PSRAM shared heap 0x420d1f30+0x7fe0d0`（4.5 上不再打印 `Found 8MB PSRAM device`，属正常，见 PSRAM 笔记 §1） |
 | CH32V003 expander | ✅ 0x24 应答，面板复位/背光通路可用 |
 | ST7789 面板 | ✅ 240×320 初始化完成 |
-| LVGL 屏幕 | ✅ 构建成功（PSRAM 缓冲无异常） |
+| LVGL 屏幕 | ✅ 构建成功（对象堆在 PSRAM，VDB 在 SRAM） |
 | CST3530 触摸 | ✅ 0x58 初始化完成 |
-| QMI8658A | ✅ 修正为板上实际地址 **0x6b** 后正常（0x6a 报 `-14`） |
-| SHTC3 / PCF85063A | ✅ 驱动实例化，无总线错误 |
+| Watchdog | ✅ task_wdt 60 s + 硬件兜底，`Reset cause: 0x00000000` |
+| BLE | ✅ `Linkr Bee 8994` 广播（Windows 侧 Bleak 扫描可见，RSSI −50 dBm） |
+| WiFi | ❌ 编译期关闭（4.0 节），日志中没有 `linkr_wifi` 行 |
 | 实际 flash | ⚠️ ROM 报告 **32 MB**，二进制头仍声明 8 MB（32 MB 分区待做） |
 | ROM SHA-256 校验 | ⚠️ Zephyr 镜像未附加摘要，ROM 打印 `Attempting to boot anyway` 后正常启动 |
 
-## 8. 已知风险
+> 合并后抓到日志时板上仍有一块旧固件在广播（`Linkr Bee 442C`）；本板是
+> `8994`（MAC `10:bd:a3:dd:89:96`），两块的 RSSI 都是 −50 dBm，别认错设备。
+
+## 9. 已知风险
 
 | 风险 | 说明 |
 |---|---|

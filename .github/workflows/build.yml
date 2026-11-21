@@ -442,6 +442,12 @@ jobs:
             # the GPIO1 jumper (which carries the touch I2C clock here).
             grep -qx 'CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=n' "${config}"
             grep -qx 'CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=y' "${config}"
+            # The panel image cannot fit the WiFi radio in internal SRAM (see
+            # the measurements in boards/linkr_c5_touch_lcd.conf). If this
+            # silently flips back on, the link overflows sram0_0_seg.
+            grep -qx '# CONFIG_LINKR_BLE_BRIDGE_WIFI is not set' "${config}"
+            grep -qx '# CONFIG_WIFI is not set' "${config}"
+            grep -qx '# CONFIG_NETWORKING is not set' "${config}"
           fi
 
       - name: Package firmware

@@ -10,6 +10,7 @@
  *   Touch SDA=GPIO0  SCL=GPIO1  INT=GPIO5  RST -> CH32V003 EXIO0
  */
 
+#include <zephyr/dt-bindings/display/panel.h>
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/pinctrl/esp32c5-pinctrl.h>
 #include <zephyr/dt-bindings/pinctrl/esp32c5-gpio-sigmap.h>
@@ -53,6 +54,11 @@
 
 			width = <240>;
 			height = <320>;
+			/* Zephyr 4.5 made pixel-format mandatory for LCD
+			 * controllers (lcd-controller.yaml); the ST7789 is fed
+			 * 16-bit RGB565 by LVGL.
+			 */
+			pixel-format = <PANEL_PIXEL_FORMAT_RGB_565>;
 			x-offset = <0>;
 			y-offset = <0>;
 			vcom = <0x35>;
@@ -61,7 +67,9 @@
 			vdvs = <0x20>;
 			mdac = <0x00>;
 			gamma = <0x01>;
-			colmod = <0x55>;
+			/* Zephyr 4.5 derives COLMOD from pixel-format above;
+			 * the old colmod = <0x55> property no longer exists.
+			 */
 			lcm = <0x2c>;
 			porch-param = [0c 0c 00 33 33];
 			cmd2en-param = [5a 69 02 01];

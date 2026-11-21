@@ -176,6 +176,17 @@ static int ble_link_count(void)
 	}
 	return count;
 }
+
+/* Referenced first live link, for the panel accessors. */
+static struct bt_conn *ble_link_ref_first(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(ble_links); i++) {
+		if (ble_links[i] != NULL) {
+			return bt_conn_ref(ble_links[i]);
+		}
+	}
+	return NULL;
+}
 static struct k_mutex conn_lock;
 static struct k_mutex uart_config_lock;
 static struct k_work_delayable advertise_work;
@@ -1630,7 +1641,7 @@ int linkr_bridge_ble_format(char *buf, size_t len)
 	int n;
 
 	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	conn = ble_link_ref_first();
 	k_mutex_unlock(&conn_lock);
 
 	if (conn == NULL) {
@@ -1667,7 +1678,7 @@ bool linkr_bridge_ble_connected(void)
 	bool connected;
 
 	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	conn = ble_link_ref_first();
 	k_mutex_unlock(&conn_lock);
 
 	connected = (conn != NULL);
