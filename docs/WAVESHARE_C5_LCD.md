@@ -101,7 +101,7 @@ region `sram0_0_seg' overflowed by 17392 bytes
 
 ```
 FLASH          990,208 B / 8,388,352 B   11.80%
-sram0_0_seg    272,512 B / 378,384 B     72.02%   ← 余量 105,872 B
+sram0_0_seg    271,488 B / 378,384 B     71.75%   ← 余量 106,896 B
 irom0_0_seg    659,584 B / 8 MB
 drom0_0_seg    775 KB    / 8 MB
 ext_dram_seg 5,054,256 B / 32 MB         15.06%   ← PSRAM 已生效
@@ -113,7 +113,7 @@ ext_dram_seg 5,054,256 B / 32 MB         15.06%   ← PSRAM 已生效
 > 上板实测的结论，见第 7 节"渲染性能与换页耗时"。
 >
 > 4.4.1 时代把 SRAM 用到 99.6% 时实测 BLE 配对直接失败
-> （`bt_gatt: CMAC operation init failed -141`）。关掉 WiFi 后 SRAM 降到 72%，
+> （`bt_gatt: CMAC operation init failed -141`）。关掉 WiFi 后 SRAM 降到 71.8%，
 > 这条线不再是勉强压线运行。
 
 ### 4.0 WiFi 关闭（本板的产品取舍）
