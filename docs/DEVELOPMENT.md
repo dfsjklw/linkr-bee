@@ -5,6 +5,9 @@
 This guide covers firmware builds, flashing, UART integration, control commands,
 test modes, client tooling, protocols, and Kconfig options.
 
+See [Multi-client serial sessions](MULTI_CLIENT.md) for connection capacity,
+single-writer ownership and the deferred Linkr integration boundary.
+
 Zephyr application for an ESP32-C3/C5/WROOM BLE serial bridge. The first milestone is a
 plain Bluetooth LE UART window:
 
@@ -47,32 +50,46 @@ repository owns the accessory firmware and reference clients.
 
 ## Quick Start
 
-Get the firmware running in 5 steps:
+Set up the workspace once, then build, flash and connect:
 
 ```sh
-# 1. Clone and enter the workspace
-git clone https://github.com/radxa/linkr-bee.git
+# 0. Prerequisites: Python 3, git, cmake and ninja, plus west
+python3 -m pip install --user west
+
+# 1. Create the workspace once; the manifest names the app checkout `linkr-bee`
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0, hal_espressif, mbedtls, tf-psa-crypto, hostap
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# 2. Zephyr SDK 1.0.1 with the RISC-V and Xtensa toolchains this repo builds with
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+
+# 3. Build the application directory for ESP32-C3 Super Mini (default WiFi + BLE).
+#    `west build -b <board> linkr-bee` from the workspace root is equivalent.
 cd linkr-bee
+west build -b esp32c3_supermini .
 
-# 2. Build for ESP32-C3 Super Mini (default WiFi + BLE)
-west build -b esp32c3_supermini linkr-bee
-
-# 3. Flash to device
+# 4. Flash to device
 west flash
 
-# 4. Connect via Python terminal
+# 5. Connect via Python terminal
 python3 tools/linkr_ble_terminal.py
 
-# 5. Or serve Web terminal locally
+# 6. Or serve Web terminal locally
 tools/serve_web.sh  # Open http://127.0.0.1:8765/
 ```
 
-> **Note**: Requires Zephyr v4.4.1 west workspace with Espressif HAL blobs. See [Build](#build) for details.
+> **Note**: Requires Zephyr v4.5.0 west workspace with the Espressif HAL blobs
+> from `west.yml`. See [Build](#build) for details, the SDK alternative and the
+> other boards.
 
 ## Supported environment
 
 - Firmware: ESP32-C3 DevKitM, DevKitC, Super Mini, and ESP32-C5 DevKitC
-- Zephyr: **v4.4.1**
+- Zephyr: **v4.5.0**
+- Zephyr SDK: **1.0.1** (the toolchain has its own version; 4.5.0 is the RTOS)
+- Build host: Python **3.12+**, CMake **3.28+**
 - One firmware source tree with BLE UART bridge, WiFi station control,
   anonymous HTTP WebDAV log upload, and UART-over-WebSocket LAN access.
   WebDAV is enabled in the default C3/C5 builds; the ESP32-WROOM build disables
@@ -81,7 +98,97 @@ tools/serve_web.sh  # Open http://127.0.0.1:8765/
 
 ## Build
 
-Use a Zephyr v4.4.1 west workspace. The default WiFi-enabled build also needs
+### Updating an existing workspace
+
+After updating this application, run these commands from the west workspace root:
+
+```sh
+west update
+python3 -m pip install -r zephyr/scripts/requirements.txt
+west blobs fetch hal_espressif
+west build -p always -b linkr_bee_x1_0 linkr-bee
+```
+
+Choose the board target below for other hardware. Recreate the build directory
+with `-p always` when moving from 4.4.1. Zephyr 4.5.0 still selects SDK 1.0.1.
+The migration updates manual DHCP control to `CONFIG_WIFI_STA_AUTO_DHCPV4=n`,
+installs the encryption-event ordering callback in the common HCI driver data,
+and uses `ring_buf_consume()` to discard queued WebSocket bytes. The Bee X1.0
+board selects the plain ESP32-C3 SoC and declares its 4 MB flash explicitly.
+
+Zephyr 4.5 increases RF and network SRAM use. The default profiles retain the
+existing services and client limits with smaller bounded queues:
+
+| Target | 4.5 memory budget |
+| --- | --- |
+| C3 / Bee X1.0 | 8 dynamic WiFi RX/TX buffers, 40 KiB WiFi heap reservation, 8 chunks per BLE peer, 4 KiB deferred logs, 4 KiB HTTP/system/connect stacks |
+| C5 | 6 dynamic WiFi RX/TX buffers, 36 KiB WiFi and 44000 B Bluetooth heap reservations, 12 MSYS-2 blocks, 8 controller ACL buffers of 255 bytes, 20 network buffers and 10 packet descriptors per direction |
+| WROOM | Existing 52000 B system heap, 4 KiB UART capture, 4 chunks per BLE peer, 1 KiB LAN rings, 4 KiB HTTP and 3 KiB LAN client stacks |
+
+Bee X1.0 additionally uses a 2 KiB main stack and a 1 KiB logging stack. Its
+Zephyr 4.5 diagnostic runs measured 1092 B and 732 B respectively during idle,
+BLE management/data traffic, WiFi scans and 1500000-baud UART loopback. The
+board enables `trng0` and uses the hardware entropy source. Including the
+activity-LED bookkeeping and HTTP poll reservation below, the production
+image's available libc arena grows from 13536 B to 15456 B. Other boards keep
+their existing stack budgets.
+
+RGB activity updates coalesce into one frame when traffic starts and one frame
+after 40 ms without traffic. Each received UART chunk extends the deadline
+without redrawing the same color or rescheduling work. This avoids repeatedly
+occupying the system workqueue for the WS2812 driver's 300 us latch delay.
+On Bee X1.0, the same 60-second onboard FIFO loopback generator improved from
+89278 B/s to 150034 B/s, receiving all 9002240 bytes without mismatches or RX-ring
+loss. The divider reports 1500586 baud for the nominal 1500000, 8N1 setting;
+this is a local TX/RX loopback, not an external measurement of the bit clock.
+The generator is diagnostic code; production C3 TX still uses `uart_poll_out()`.
+
+Keep the 16 KiB UART ring and eight chunks per BLE peer on Bee X1.0. Continuous
+UART input can exceed a host's BLE drain rate: a separate unpaced run counted
+9664576 dropped BLE output bytes while UART RX remained intact. Larger buffers
+only absorb bursts; sustained lossless traffic requires upstream pacing, flow
+control or a transport with sufficient throughput.
+
+The air link is the other half of that budget, and until now every board left it
+at the slowest setting: `prj.conf` shipped `CONFIG_BT_GAP_AUTO_UPDATE_CONN_PARAMS=n`,
+so the peripheral never asked for an interval and the central's choice stood
+(measured 37.5 ms on the ESP32 board), and no board requested a PHY, so every
+link ran 1M. A full-screen program is the worst case for that: one redraw is a
+burst of a few KB, and a slower interval multiplies the time the 232-byte
+output queue stays full. `prj.conf` now asks for 7.5–15 ms (`PREF_MIN/MAX_INT`
+6/12 in 1.25 ms units) and `BT_AUTO_PHY_PERIPHERAL_2M`; the 2M request is
+guarded by the controller's feature bit, so the BT 4.2 WROOM board keeps 1M.
+`boards/esp32_devkitc_esp32_procpu.conf` keeps the original measurement notes
+for that interval. The supervision timeout that C5 and X1.0 already set
+(`PREF_TIMEOUT=800`) only takes effect now that the request is actually sent.
+
+Compression of the UART stream was considered and rejected for this link: at
+115200 the serial line caps the bridge at 11520 B/s (`src/uart_bulk_tx.c`), and
+once the interval above is in force the air link carries more than that, so
+compressing the bytes cannot raise the ceiling. It would only pay off above
+115200 baud, where the UART stops being the limit — LAN (`ws://`) is the better
+answer there.
+
+The HTTP/WebSocket bridge defaults `CONFIG_ZVFS_POLL_MAX` to 5. HTTP/1 polling
+needs one wakeup eventfd, one listener per service and one event per client
+still in HTTP/upgrade processing: two clients and one service need four events.
+This budget is separate from the two-object `CONFIG_ZVFS_EVENTFD_MAX` pool.
+`ws_bridge.c` checks the HTTP fd capacity at build time, including additional
+HTTP/3 listeners/streams, so custom client or service counts must be accompanied
+by a sufficient poll budget. Otherwise simultaneous handshakes can make poll
+fail with `ENOMEM` and restart the listener, closing pending HTTP connections.
+On the 32-bit ESP32 targets, increasing this budget from three to five adds
+16 B to the socket-service poll table and two local `k_poll_event` objects
+(40 B before stack-frame alignment) per poll call; thread stack sizes stay fixed.
+
+C5 keeps the measured thread stack budgets, WiFi heap and network buffers in
+internal SRAM; application data alone uses PSRAM. Its optional WiFi IRAM speed
+optimizations are off and early HAL logging retains warnings/errors. Larger
+custom RF pools fall back to the upstream heap reservation. These limits reduce
+burst tolerance: validate pairing, scan/connect, two BLE peers, LAN forwarding,
+WebDAV uploads, stack watermarks and reported drops on hardware before release.
+
+Use a Zephyr v4.5.0 west workspace. The default WiFi-enabled build also needs
 the Espressif HAL blobs (`modules/hal_espressif`) present in the manifest.
 
 The manifest allowlist also pulls in `hostap`. The ESP32-C5 controller
@@ -94,37 +201,80 @@ CI workflow assert that the C3 (`ESP32_BT_CTLR_LE_SECURITY_ENABLE`) and C5
 (`ESP32_BT_LE_SECURITY_ENABLE`, `…_SM_SC`, `…_LL_CFG_FEAT_LE_ENCRYPTION`,
 `…_CRYPTO_STACK_MBEDTLS`) controller security symbols stay enabled.
 
-From that workspace:
+A fresh clone is only the application half of a workspace. Prepare the
+workspace once, from its root:
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee
+python3 -m pip install --user west
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0, hal_espressif, mbedtls, tf-psa-crypto, hostap
+west zephyr-export
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# Zephyr SDK 1.0.1: RISC-V for ESP32-C3/C5, Xtensa for ESP32-WROOM
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+# or download zephyr-sdk-1.0.1_<host>.tar.xz and run its ./setup.sh
 ```
 
-or for DevKitC:
+`west update` pulls `hal_espressif` (the ESP32 HAL blobs the WiFi build needs)
+and the mbedTLS/hostap modules the C5 controller's pairing depends on; without
+them a C3/C5 build fails to configure instead of silently losing pairing.
+
+Then build the application directory — the board list below is the one
+`tools/verify.sh` and CI build:
 
 ```sh
-west build -b esp32c3_devkitc linkr-bee
+cd linkr-bee
 ```
 
-For ESP32-C3 Super Mini:
+ESP32-C3 DevKitM:
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_devkitm .
 ```
 
-For ESP32-C5 DevKitC:
+ESP32-C3 DevKitC:
 
 ```sh
-west build -b esp32c5_devkitc/esp32c5/hpcore linkr-bee
+west build -b esp32c3_devkitc .
+```
+
+ESP32-C3 Super Mini:
+
+```sh
+west build -b esp32c3_supermini .
+```
+
+ESP32-C5 DevKitC:
+
+```sh
+west build -b esp32c5_devkitc/esp32c5/hpcore .
+```
+
+ESP32-WROOM-32 (`esp32_devkitc/esp32/procpu`) is built by CI; its default
+configuration disables WebDAV for DRAM, and CI is the reference for that board:
+
+```sh
+west build -b esp32_devkitc/esp32/procpu .
+```
+
+For the Linkr Bee X1.0 production board (MV013). The board definition lives in
+this repository under `boards/radxa/linkr_bee_x1_0`, and `CMakeLists.txt`
+registers the application root as a `BOARD_ROOT`, so no extra CMake argument is
+needed:
+
+```sh
+west build -b linkr_bee_x1_0 .
 ```
 
 ### GitHub Actions build
 
 The workflow in `.github/workflows/build.yml` builds each board's default
 WiFi + BLE configuration for `esp32c3_supermini`, `esp32c3_devkitm`,
-`esp32c3_devkitc`, `esp32c5_devkitc/esp32c5/hpcore`, and
+`esp32c3_devkitc`, `linkr_bee_x1_0`, `esp32c5_devkitc/esp32c5/hpcore`, and
 `esp32_devkitc/esp32/procpu` (ESP32-WROOM-32). It runs on pushes to `main`,
-pull requests, and manual dispatches using Zephyr v4.4.1 with Zephyr SDK
+pull requests, and manual dispatches using Zephyr v4.5.0 with Zephyr SDK
 1.0.1. To keep runner disk usage bounded, each job installs only the
 toolchain its board needs — `riscv64-zephyr-elf` for the RISC-V targets and
 `xtensa-espressif_esp32_zephyr-elf` for the WROOM — instead of the full Zephyr
@@ -144,6 +294,7 @@ run. The flashable images are:
 linkr-bee-esp32c3-supermini.bin
 linkr-bee-esp32c3-devkitm.bin
 linkr-bee-esp32c3-devkitc.bin
+linkr-bee-linkr-bee-x1-0.bin
 linkr-bee-esp32c5-devkitc.bin
 linkr-bee-esp32-wroom-32.bin
 ```
@@ -171,6 +322,32 @@ must be cleared. The artifact also contains `FLASHING.txt`,
 `SHA256SUMS` for debugging and traceability. The workflow fails if the default
 WiFi, networking, Bluetooth, or binary-output configuration is absent.
 
+
+### The browser flashing page
+
+`web/flash.html` writes the same release images over USB from the browser. It
+uses esptool-js (Web Serial, so Chrome or Edge on a desktop) and JSZip to read
+the release bundles, and it reuses the terminal's `style.css` / `skin-v2.css`
+rather than introducing a second design system. It is published with the rest
+of the site as `/flash.html`: a repository has one Pages deployment, so this is
+a page rather than a second site.
+
+The images are not checked in. `.github/workflows/pages.yml` downloads the
+current release's `*firmware-*.zip` and runs:
+
+```sh
+python3 tools/build_firmware_manifest.py --source .firmware-release \
+    --output web/firmware --tag "$tag" --repo "$GITHUB_REPOSITORY"
+```
+
+which writes `web/firmware/<board>/<image>.bin` and one `manifest.json` naming
+the chip, flash address, size and SHA-256 of each board. The page fetches that
+manifest same-origin, because release assets do not send the CORS headers a
+cross-origin fetch would need; if the manifest is absent it falls back to the
+GitHub API for the latest release. Boards are listed in the order of
+`BOARD_NAMES` in the generator, which puts the Bee itself first. To preview
+locally without a release, point `--source` at a directory holding the zips.
+
 ## UART selection
 
 The app reads the UART from the devicetree chosen node
@@ -185,6 +362,60 @@ On `esp32c3_supermini`, `uart0` is enabled for bridge traffic:
 - TX: GPIO21
 - Activity LED: GPIO8 blue LED, flashed on UART RX and TX activity
 - Factory reset: GPIO0, internally pulled up; short it to GND during boot
+
+### Linkr Bee X1.0 board support and auxiliary hardware
+
+`boards/radxa/linkr_bee_x1_0/` is a full out-of-tree Zephyr board (board.yml,
+Kconfig, defconfig, pinctrl and DTS). It describes a bare ESP32-C3FH4 with the
+USB Serial/JTAG console, UART0 on GPIO20/21 as the bridge port, SW1 (GPIO3) as
+the pairing / factory-reset key, and three auxiliary devices that only this PCB
+has:
+
+| Devicetree node / alias | Binding | Hardware | App code |
+| --- | --- | --- | --- |
+| `linkr-rgb` | `radxa,linkr-ws2812` | U1 WS2812-compatible RGBIC on GPIO8 | `src/linkr_ws2812.c`, `src/linkr_status_led.c` |
+| `linkr-opto` | `radxa,linkr-opto-switch` | Q1 optocoupler dry contact on GPIO10 | `src/linkr_opto.c` |
+| `linkr-ir` | `radxa,linkr-ir` | IR LED on GPIO0 (LEDC 38 kHz carrier), IRM_V538M3 on GPIO1 | `src/linkr_ir.c`, `src/ir_nec.c`, `src/ir_learn.c` |
+
+The bindings live in `dts/bindings/linkr/`. Every auxiliary source compiles to
+stubs when the devicetree has no matching node, so one firmware tree still
+serves the dev boards and every command below answers `ERR ... unsupported`
+instead of disappearing:
+
+| Command | Purpose |
+| --- | --- |
+| `@l?`, `@l=<r>,<g>,<b>`, `@l off` | status LED query / colour / off |
+| `@o?`, `@o on`, `@o off`, `@o pulse <ms>` | optocoupler contact |
+| `@r?`, `@r tx <addr>,<cmd>[,<repeats>]`, `@r rx on\|off`, `@r clear` | NEC IR receiver / transmitter |
+| `@r learn [<slot>]`, `@r learn stop`, `@r play [<slot>]`, `@r slots`, `@r delete <slot>` | raw IR learning, stored in NVS |
+
+Kconfig options (all default `y` only where the devicetree node exists):
+`CONFIG_LINKR_BLE_BRIDGE_RGB_STATUS_LED`,
+`CONFIG_LINKR_BLE_BRIDGE_RGB_ACTIVITY_COLOR`,
+`CONFIG_LINKR_BLE_BRIDGE_OPTO_SWITCH`, `CONFIG_LINKR_BLE_BRIDGE_IR`,
+`CONFIG_LINKR_BLE_BRIDGE_IR_TX`, `CONFIG_LINKR_BLE_BRIDGE_IR_RX`, and the
+`CONFIG_LINKR_BLE_BRIDGE_IR_LEARN*` family (raw capture/replay of any remote,
+persisted in NVS; sizes and timeouts are tunable there).
+
+The IR transmitter is a cooperative thread that busy-waits a whole NEC frame
+(~68 ms); the 38 kHz carrier itself comes from LEDC, so only interrupts can
+stretch a mark. The RGB driver bit-bangs the WS2812 waveform under an
+interrupt lock (30 µs per pixel) because no in-tree LED-strip driver targets
+the ESP32-C3.
+
+Without a board, `/?demo=board` runs the same page against a mock accessory:
+`web/demo_mode.js` answers the management channel with firmware-shaped replies
+(including a simulated learning capture) and the browser spec
+`mobile/browser-test/demo_mode.spec.mjs` keeps it in step with the panel.
+
+Hardware facts that constrain the firmware, and the schematic issues to fix
+before a production run, are in
+[Linkr Bee X1.0 hardware](BEE_X1.0_HARDWARE.md). The two that bite first:
+C31 (100 nF) must be removed from the GPIO8 data line, and GPIO12-17 belong to
+the ESP32-C3FH4's in-package flash.
+
+`tools/verify.sh` builds this board and asserts the FH4 SoC selection plus the
+RGB/opto/IR Kconfig options.
 
 ## SBC UART settings
 
@@ -286,7 +517,7 @@ not collide after reboot.
 A normal C3 build already includes it:
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_supermini .
 ```
 
 The ESP32-C3 SoC WiFi driver is `CONFIG_WIFI_ESP32` (defined in
@@ -306,6 +537,19 @@ The application code in `src/wifi.c` uses the standard `net_mgmt` /
 and starts DHCPv4 itself on connect, so no `CONFIG_NET_CONFIG_AUTO_INIT` is
 needed.
 
+The `@w scan` watchdog bound is `CONFIG_LINKR_BLE_BRIDGE_WIFI_SCAN_TIMEOUT_MS`.
+ESP32-C5 is dual-band and its WiFi driver ignores the band bitmap in the
+request, so a full sweep (measured: 16–18 APs, 5 GHz channels included) takes a
+steady ~19.7 s. Asking for 2.4 GHz only and a 60–100 ms per-channel dwell does
+not shorten it, and neither does dropping the BLE link, so this is not
+coexistence scheduling. The C5 board configuration raises the bound to 30 s; the
+15 s default released every scan 4–5 s before the driver reported completion,
+which surfaced as `@scan error`. ESP32-C3 sweeps faster and keeps the default.
+Both the Python CLI (`WIFI_SCAN_TIMEOUT`) and Rust CLI/TUI
+(`device::SCAN_TIMEOUT`) wait 35 s, allowing the 30 s firmware watchdog plus
+queued results to arrive. The Rust limit was previously 20 s. Custom firmware
+with a longer scan watchdog must also increase the client wait.
+
 ### UART over WebSocket (LAN bridge)
 
 When WiFi holds an IP address, the firmware also serves the bridge UART over a
@@ -323,6 +567,7 @@ WebSocket endpoint so LAN clients bypass BLE range and MTU limits entirely:
   access token are persisted in settings.
   `@i?` reports
   `@info ws state=up port=80 clients=N tx=… rx=… dropped=…` (no token)
+  (`dropped` is cleared when a client connects)
 - Protocol: after the upgrade the bridge sends a text frame announcing whether a
   token is required (`@ws auth=none` / `@ws auth=required`), and `@ws auth=ok`
   once access is granted. UART bytes always travel as binary frames. See
@@ -336,6 +581,16 @@ WebSocket endpoint so LAN clients bypass BLE range and MTU limits entirely:
 - Legacy override: `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN` pins a
   build-time token (32 lowercase hex) and takes precedence over the generated one
 - Disable entirely with `-DCONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE=n`
+
+> **Warning — LAN mode without a token is open to the whole network.** The
+> bridge listens on `0.0.0.0` and checks no `Origin` or `Host` header, so any
+> page or script that can reach `ws://<device-ip>/ws` can open the socket.
+> Setting `@s token off`, or leaving
+> `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN` empty, disables
+> authentication entirely: anyone on that network can then **read and write**
+> the target's UART. Keep the token on outside a trusted lab network, rotate it
+> with `@s token` and re-pair the clients. The bridge speaks plain `ws://`; there
+> is no TLS.
 
 The Web Bluetooth terminal (`web/`) has a BLE/LAN switch in the Connection
 card; LAN mode connects to `ws://<host>/ws`, keeps terminal input, quick-send
@@ -351,13 +606,33 @@ log uploader; bytes discarded from BLE delivery are not replayed on reconnect.
 ### Pairing GPIO, persistence, and factory reset
 
 BLE uses LE Secure Connections Just Works pairing, bonding and encrypted GATT
-access. C3/C5 hold GPIO1 low before a new host requests pairing. WROOM ships
-with `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=n`, so no GPIO press is needed;
-if that option is enabled, GPIO4 is the pairing input. Existing bonds restore
-encryption without the pairing GPIO; replacing lost host keys requires it again
-when the check is enabled. The default is eight bonds with no automatic
+access. C3/C5 press GPIO1 to open a pairing window: a press authorizes pairing
+requests for `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS` (30 s by default; 0
+restores the old "held during the request" rule), so the key does not have to
+stay held. WROOM ships with `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=n`, so no
+GPIO press is needed; if that option is enabled, GPIO4 is the pairing input.
+Existing bonds restore encryption without the pairing GPIO; replacing lost host
+keys requires a fresh press when the check is enabled. The default is eight bonds with no automatic
 eviction. A full table requires factory reset before adding more hosts. See
 [pairing and recovery](BLE_PAIRING.md).
+
+C5 DevKitC uses an external button or jumper on GPIO1; its onboard BOOT and
+RST keys do not authorize pairing. Production builds keep the GPIO check on.
+For controlled C5 bench testing only, explicitly add the development fragment
+in a separate build directory:
+
+```sh
+west build -p always -d build-c5-open-pairing \
+  -b esp32c5_devkitc/esp32c5/hpcore . -- \
+  -DEXTRA_CONF_FILE=dev_c5_open_pairing.conf
+```
+
+This image allows any nearby host to pair and then access the UART and
+management services. Encryption, Secure Connections and bonding remain
+required, but they do not identify an authorized owner. Do not distribute
+this image or leave it powered in a shared space. Normal builds and release
+CI do not load this fragment. Use the default build command without it for
+production, and do not reuse the development build directory.
 
 | Item | Default / persistence rule | Clear or transfer |
 | --- | --- | --- |
@@ -490,6 +765,28 @@ The desktop and mobile clients ask the board first (`@n?`) and show whether the
 name is the MAC-derived default or a custom one; a write is confirmed by the
 board and read back. The C client prints the board's answer on stdout.
 
+### Paired-device labels
+
+`@linkr bonds?` lists the saved identities; each label is a separate
+`@linkr bonds label <type>/<address>` read so the fixed reply buffer never
+holds them all.
+
+| Host | List | Rename | Remove |
+| --- | --- | --- | --- |
+| `bee` (TUI) | Network view → *Refresh paired devices* | same view → the host row | same view → *Remove this pairing* |
+| `bee-cli` | `--query-bonds` / `query bonds` | `--rename-bond <id>=<label>` / `bond <id> <label>` | `--remove-bond <id>` / `unbond <id>` |
+| `bee --serve` | `{"op":"bonds"}` | `{"op":"bond-label","id":"…","label":"…"}` | `{"op":"bond-remove","id":"…"}` |
+| Web / mobile | Connection panel → *Paired devices* | *Rename* on the row | *Remove pairing* |
+
+Labels are display-only, at most 48 UTF-8 bytes, stored in NVS by identity
+address and deleted with the pairing. The web and phone editors report the
+browser's OS once when the board stores none; the TUI reports the local user
+name once for this host. `@linkr bonds name <label>`/`@linkr bonds names?` are
+kept as the self-only compatibility form, so a host can name itself without
+console ownership; `bonds label <type>/<address>` is the management form for any
+pairing. Older firmware without the commands hides the section (web/TUI)
+rather than leaving a dead control.
+
 ### UART Commands
 
 | Short Form | Long Form | Description |
@@ -523,17 +820,25 @@ ERR format: @u=115200,8,n,1,n
 
 The diagnostic command is read-only. It reports the application and Zephyr
 versions, uptime, the open BLE access/security state, UART buffer usage and
-dropped-byte count, WiFi/IP state, and WebDAV
-queue, drop, HTTP, failure, and success counters:
+dropped-byte count, WiFi/IP state, WebSocket clients and drops, and WebDAV
+queue, drop, HTTP, failure, and success counters. The queue, peer and Reliable
+UART groups expose UART TX drops, BLE output-queue drops, and BLE indication
+timing:
 
 ```text
-@info fw version=0.1.2 zephyr=4.4.1
-@info sys uptime_ms=123456 owner=0 security=1
-@info uart dropped=0 buffer=0/16384
+@info fw version=0.1.2 zephyr=4.5.0
+@info sys uptime_ms=123456 owner=0 links=1 security=1
+@info uart dropped=0 dropped_no_conn=0 buffer=0/16384
 @info wifi state=connected ip=ready error=0
 @info upload state=on queue=0 dropped=0 http=201 failures=0 successes=4
+@info ws state=up port=80 clients=1 tx=1234 rx=5678 dropped=0
+@info queue dropped=0
+@info peer dropped=0
+@info rel ind=0 retry=0 busy=0 nomem=0 slept_ms=0 timeout=0 wait_max_ms=0
 @info done
 ```
+
+Buffer sizes and enabled services depend on the board configuration.
 
 The application version comes from
 `CONFIG_LINKR_BLE_BRIDGE_FIRMWARE_VERSION`.
@@ -561,12 +866,73 @@ fails without touching the radio. The change is persisted in the board's
 settings and survives a reboot; `--reset-ble-name` restores the
 MAC-derived `Linkr Bee XXXX`.
 
+Board I/O and one-shot commands:
+
+```sh
+python3 tools/linkr_ble_terminal.py --led 1a2b3c --no-terminal    # status LED
+python3 tools/linkr_ble_terminal.py --led off --no-terminal
+python3 tools/linkr_ble_terminal.py --opto on --no-terminal      # isolated contact
+python3 tools/linkr_ble_terminal.py --opto-pulse 500 --no-terminal
+python3 tools/linkr_ble_terminal.py --query-led --query-opto --no-terminal
+```
+
+`--cmd` sends any management command verbatim and prints the reply on stdout, so a
+script captures the answer rather than the transport's own echo. It is repeatable
+and the commands run in the order given, which is how a firmware command without a
+dedicated flag is reachable:
+
+```sh
+python3 tools/linkr_ble_terminal.py --cmd '@linkr bonds?' --no-terminal
+python3 tools/linkr_ble_terminal.py --cmd '@r slots' --cmd '@l?' --no-terminal
+```
+
+`--monitor` prints the target UART and never reads the keyboard; `--reconnect N`
+retries a dropped link N times before giving up:
+
+```sh
+python3 tools/linkr_ble_terminal.py --monitor | tee board.log
+python3 tools/linkr_ble_terminal.py --reconnect 2
+```
+
+Reconnects keep the first selected BLE address and verify the same hardware
+Device ID. Dial/setup failures use the remaining retry budget. Startup commands
+(including pulses and `--cmd`) run once; reconnecting only restores the transport.
+A refused or interrupted startup command fails the invocation and is not replayed.
+`--scan` also connects and runs when combined with a command or `--monitor`.
+
+Console control and the saved pairings belong to the board, not to this client:
+
+```sh
+python3 tools/linkr_ble_terminal.py --query-control --no-terminal
+python3 tools/linkr_ble_terminal.py --claim --bonds --no-terminal
+python3 tools/linkr_ble_terminal.py --claim --opto-pulse 500 --release --no-terminal
+python3 tools/linkr_ble_terminal.py --bonds-names --no-terminal
+python3 tools/linkr_ble_terminal.py --bonds-remove 0/AA:BB:CC:DD:EE:01 --no-terminal
+```
+
+`--claim` runs before every other command and `--release` runs after them, so one
+invocation can take the console, change something and hand it back. A mutation
+from a client that does not own the console is refused by the board
+(`ERR control=readonly`), which is the same state the web terminal shows.
+
+`--scan --json` reports one record per device instead of the tab-separated
+listing, because a name may itself contain a tab:
+
+```json
+{"type": "device", "name": "Linkr Bee 1A2B", "address": "AA:BB:CC:DD:EE:01", "rssi": -52, "management": true}
+```
+
 Scripting and safety notes:
 
 - `--json` writes management responses and events to stdout as one JSON object
   per line, e.g.
   `{"type":"response","requestId":1,"ok":true,"lines":["OK fw version=0.1.2"],"command":"@i?"}`.
   `@w=`/`@d=` commands are always reported as `<redacted>` in that field.
+- Every command sent from a flag also emits one `result` record that splits the
+  reply into its `key=value` pairs, e.g.
+  `{"type":"result","command":"@o?","ok":true,"text":"OK opto=closed","fields":{"opto":"closed"}}`.
+  A value that contains a comma or a space -- an SSID, a URL with a query string
+  -- is only complete in `text`.
 - `--quiet` suppresses progress messages (`linkr: …`); errors and
   `loopback PASS/FAIL` still print.
 - `--help` and `--version` do not need bleak installed; it is imported only
@@ -579,7 +945,7 @@ Scripting and safety notes:
 - `--rename-ble` is validated locally too: 1–29 UTF-8 bytes, no control
   characters, and the two name flags cannot both be given.
 - Exit codes: `0` ok, `1` error, `2` bad arguments, `3` device disconnected
-  during the terminal session.
+  during the terminal session, or after `--reconnect` runs out of attempts.
 
 Configuration commands use Management Service v1 binary frames with an API
 version, request ID, logical payload length, response ID, and confirmed
@@ -615,7 +981,7 @@ asset builds: those are covered by CI (`.github/workflows/build.yml`).
 Enable UART RX echo loopback:
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee -- \
+west build -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_uart.conf
 ```
 
@@ -632,7 +998,7 @@ Build the hardware loopback verifier after shorting UART0 TX (GPIO21) to RX
 (GPIO20):
 
 ```sh
-west build -p always -b esp32c3_devkitm linkr-bee -- \
+west build -p always -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_loopback.conf
 ```
 
@@ -640,7 +1006,7 @@ For a BLE NUS echo diagnostic using the same full firmware feature set (no
 UART wiring required):
 
 ```sh
-west build -p always -b esp32c3_supermini linkr-bee -- \
+west build -p always -b esp32c3_supermini . -- \
   -DEXTRA_CONF_FILE=test_ble_echo.conf
 ```
 
@@ -663,7 +1029,7 @@ they do not write the ESP32-C3 coredump sector.
 ├─────────────────────────────────────────────────────────────┤
 │                    BLE GATT (ATT MTU 247)                    │
 ├─────────────────────────────────────────────────────────────┤
-│            ESP32-C3/C5 Firmware (Zephyr v4.4.1)              │
+│            ESP32-C3/C5 Firmware (Zephyr v4.5.0)              │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │  BLE Stack  │  │  UART Bridge│  │  WiFi/WebSocket     │ │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
@@ -762,11 +1128,10 @@ cd tools && make
 ./linkr_ble_terminal_c
 ```
 
-Its command line now matches the Python client, so scripts can treat both alike:
-
-- Exit codes `0` ok, `1` error, `2` bad arguments, `3` device disconnected
-  mid-session. Argument errors used to exit `1`, indistinguishable from a
-  device that would not connect.
+Its exit codes match the Python client -- `0` ok, `1` error, `2` bad arguments,
+`3` device disconnected mid-session -- so a script can tell the two apart without
+reading their output; the *flags* do not match, and the table above is the whole
+Management v1 surface it exposes.
 - `--version`; `--quiet` suppresses progress only, errors always print.
 - Long options also accept `--option=value`; a missing value reports
   `--opt requires a value` instead of the misleading `unknown option`.
@@ -961,6 +1326,18 @@ command instead -- the PyInstaller build `linkr-ble-terminal`, a wrapper, or the
 script on `PATH`. fish is the strictest of the three: it does not read the
 completion file at all while the command is missing from `PATH`.
 
+## Frontend UI review
+
+Every frontend change is reviewed visually before it is finished: render the
+demo (`sh tools/serve_web.sh 8090`, open `/?demo=board`) and capture
+`cd mobile && node ui-review.mjs`, which writes phone/tablet/desktop screenshots
+in both themes and both languages under `build-demo/ui-review/`. Compare them
+with [DESIGN.md](../DESIGN.md), fix clipping/alignment/type/colour drift and
+missing states, and record what was reviewed in the commit message. See
+[AGENTS.md](../AGENTS.md) for the full checklist. UI modules are
+capability-driven: when the connected board does not support a feature, hide
+its card and, if needed, its section instead of leaving disabled controls.
+
 ## Web Bluetooth terminal
 
 The browser terminal is an additional option, not a replacement for the Python
@@ -988,6 +1365,16 @@ page restore that device after a refresh.  `Connect` or `Reconnect` can then
 reuse the authorization without reopening the chooser.  If the saved device is
 no longer available, the page clears it and falls back to the normal chooser on
 the next attempt.  Browsers without `getDevices()` always use the chooser.
+
+After a link that had been up is lost unexpectedly (the board went out of
+range, was power-cycled, or the battery died; the LAN WebSocket closed), the
+page redials on its own with a bounded backoff of 1, 2, 4, 8, 16 and 30 seconds
+(six attempts). The status line shows the attempt/countdown and the Connect
+button becomes **Cancel reconnect**. A successful redial appends
+`[reconnect] Link restored automatically` and keeps the transcript, so the gap
+stays visible; a successful manual `Disconnect` is never treated as a lost
+link, and no input or command is replayed. If all attempts fail the page stops
+and asks the user to press Reconnect.
 
 The firmware places the Management Service UUID in the primary advertising
 packet and the advertised name in the scan response. The default name is
@@ -1025,6 +1412,9 @@ The page can:
 - connect to devices advertising the Linkr Management Service UUID
 - restore the last authorized Linkr device after a page refresh for quick
   reconnect, when the browser supports `navigator.bluetooth.getDevices()`
+- redial a BLE or LAN link automatically after an unexpected drop, with a
+  bounded 1/2/4/8/16/30-second backoff, a visible attempt/countdown, and a
+  Cancel action; user-initiated disconnects are never retried
 - read API version and stable Device ID, and subscribe to separate management
   indications and Reliable UART indications
 - keep firmware/runtime diagnostics collapsed by default; expanding the panel
@@ -1038,7 +1428,10 @@ The page can:
 - adjust line ending and BLE write chunk size
 - switch between the system monospace stack and common locally installed Nerd
   Fonts, with a Powerline/Nerd glyph preview; the selection is persisted for
-  the current browser origin, but the font files themselves are not bundled
+  the current browser origin, but the Nerd font files themselves are not
+  bundled. The only bundled face is a BabelStone Pseudographica subset for the
+  Unicode 13/16 legacy-computing blocks (`web/fonts/`), because desktop
+  monospace stacks render those ANSI-art glyphs as .notdef
 - render terminal control sequences through xterm.js, including cursor movement,
   line erasing, readline redraws, 16-color, 256-color, and truecolor SGR
 - expand the terminal to fullscreen and automatically refit its rows and columns
@@ -1083,12 +1476,46 @@ Terminal layout and touch behavior intentionally differ by surface:
 | Surface | Remote tty size | Soft keyboard | History and copy |
 | --- | --- | --- | --- |
 | Browser Web / Pages | Synchronized with `stty` after login and on layout changes | Follows the browser viewport | Wheel, trackpad, or touch drag; select and copy |
-| Android / iOS / HarmonyOS native shell | Android never sends `stty`; other native shells also keep the tty unchanged when the keyboard opens or closes | Local WebView shrinks and refits its rows; restored on close; the settings drawer closes the IME before sliding and composites on the GPU | Swipe scrolls `term.scrollLines()`; tap opens the keyboard; long press selects the word under the finger and shows two draggable handles, one per edge, to adjust the selection character by character or across lines; a floating Copy pill copies it, and a long hold never opens the keyboard. Copy keeps the selected text even when the WebView drops its own DOM selection, and copying does not steal focus. With the keyboard open the same long press/drag still selects and copies, and the same swipe still scrolls. The keyboard button follows the IME actually on screen |
+| Desktop Rust TUI | Synchronized with the same `stty rows <rows> cols <cols>` command at the next idle shell prompt; re-sent when the window, the rail or the assistant panel changes the pane's width | The pane follows the terminal window | Pane scrollback, drag selection, and the copy chord; see `tools/linkr-tui/README.md` |
+| Android / iOS / HarmonyOS native shell | One `stty` per connection at the first idle prompt, so a full-screen program starts at the size the pane has with the keyboard away; "Automatically sync target size" keeps it following later resizes. The keyboard itself never moves the tty | Local WebView shrinks and refits its rows; restored on close; the settings drawer closes the IME before sliding and composites on the GPU | Swipe scrolls `term.scrollLines()`; tap opens the keyboard; long press selects the word under the finger and shows two draggable handles, one per edge, to adjust the selection character by character or across lines; a floating Copy pill copies it, and a long hold never opens the keyboard. Copy keeps the selected text even when the WebView drops its own DOM selection, and copying does not steal focus. With the keyboard open the same long press/drag still selects and copies, and the same swipe still scrolls. The keyboard button follows the IME actually on screen |
 
-The native shells deliberately skip `scheduleTerminalGeometrySync()`: a soft-keyboard
-resize is local display state, not a request to reflow the remote console. On
-Android this means no `stty rows/cols` is sent at all. The browser build keeps the
-existing `stty rows <rows> cols <cols>` behavior.
+A native shell resizes its own viewport for the soft keyboard, so a keyboard
+open/close is local display state and never a request to reflow the remote
+console: `onTerminalResize` ignores a pane that shrank while the keyboard is up,
+and `scheduleTerminalGeometrySync` holds while it is open. What a native shell
+does send is one `stty` per connection, at the first idle prompt — the size a
+full-screen program reads when it starts, which is otherwise the tty's boot-time
+80x24. Turning on "Automatically sync target size" (Terminal settings, native shells only)
+keeps the target following later resizes as well; the switch is hidden in a
+browser build, which always syncs. Changing this preference preserves the
+confirmed size and any pending readback; turning it off cancels queued automatic
+resizes, including the resize normally sent after a full-screen program exits.
+
+Both surfaces offer **Sync to current window** in Terminal settings. It requests
+one resize without changing the automatic-sync preference. A busy shell,
+alternate-screen program or open soft keyboard holds the request until a safe
+idle prompt; disconnect, reboot and ownership changes discard it. Completion is
+shown only after the current nonce's `stty size` readback, and an unconfirmed
+request is never automatically retried. Another click explicitly requests a
+fresh readback, including when the window size itself has not changed.
+
+The desktop TUI sends the same command as the web and Python clients, and only
+at an idle shell prompt: local typing, a pending line-mode buffer, or any target
+output that is not a prompt clears the gate until the shell returns one. The
+pane is sized to the painted centre, so opening or closing the rail or the
+assistant panel changes the emulator width and queues the same size for the
+target. A target tty that keeps an old width wraps readline's prompt onto the
+same row, which is what makes a long `user@host:~$` prompt look overwritten.
+
+If the pane shows `�` or a broken progress bar, inspect the actual diagnostic
+counters before attributing it to transport loss or rendering. `@i?` reports
+UART RX drops, disconnected BLE drops, UART TX queue drops, and Reliable UART
+indication retries, timeouts and maximum wait time. Sustained high-rate output
+can fill the UART RX ring when BLE delivery cannot keep up. UART forwarding,
+WebSocket and log capture still share the same worker; this firmware does not
+include a separate BLE sender or guarantee that a slow central cannot stall
+the other sinks. Reduce the target console's baud rate if drops increase;
+the TUI's legacy NUS path is best effort and has no retry.
 
 Build the shared assets and synchronize the generated Android/iOS projects:
 
@@ -1148,9 +1575,19 @@ firmware was restored without injection hooks, its bytes matched flash readback,
 and encrypted BLE diagnostics succeeded after more than 75 s of stable operation.
 BLE identity, bond keys, and the bound target record retained their original
 values; GATT cache metadata and new default settings were updated normally.
-C5 and WROOM reset behaviour still require physical verification.
 
-Simple-boot images now include the ROM-visible SHA-256 digest. Zephyr v4.4.1's
+C5 hardware recovery is verified on the devkit. With a temporary hook that
+blocked the system workqueue 15 s after boot, the hardware watchdog reset the
+chip after about 13 s — the ROM reported `rst:0x7 (TG0_WDT_HPSYS)` and
+`PRO CPU has been reset by WDT`, and the application logged reset cause
+`0x00000010` (`RESET_WATCHDOG`). Four consecutive injections each came back to
+bridge-ready within 1.3 s with the same BLE identity, name and bond records.
+C5 reaches the hardware fallback before the 60 s task channel fires, so that
+task-watchdog path stays covered by the C3 run above. The released image was
+reflashed afterwards and ran 75 s without a reset. WROOM reset behaviour still
+requires physical verification.
+
+Simple-boot images now include the ROM-visible SHA-256 digest. Zephyr v4.5.0's
 `elf2image --ram-only-header` output omits it; Linkr's build module fills existing
 zero padding with the digest and adjusts the loader's scan past it. File size
 and the addresses of the hidden Flash segments remain unchanged. The module
@@ -1164,8 +1601,10 @@ in the [ESP image format](https://docs.espressif.com/projects/esptool/en/latest/
 this simple-boot digest covers the ROM-visible RAM image, not the hidden mapped
 Flash segments; release `SHA256SUMS` and flash readback still check the whole
 file. Do not apply the formatter alone to an old image without the matching
-loader. C3 startup and fault recovery are verified with the warning absent;
-the other supported boards have build and image-format verification only.
+loader. The earlier C3/C5 startup and fault-recovery checks used 4.4.1.
+Bee X1.0 has since exercised 4.5 boot, BLE loopback, WiFi scans and UART
+receive at line rate as described above. Other boards and WiFi/LAN/upload
+workloads still require hardware validation with the new memory budgets.
 
 ## Validation status
 
@@ -1173,14 +1612,20 @@ What each layer has actually been exercised against. A successful build, a host
 test run, or a simulator launch is not end-to-end acceptance on the target
 hardware.
 
+The 4.5 migration also rendered the board and About surfaces at 338, 390, 834
+and 1440 px in English/Chinese and light/dark themes. The About page displays
+4.5.0 without horizontal overflow. Screenshots are in `build-demo/ui-review/`.
+
 | Layer | Verified in this repository | Still requires hardware |
 | --- | --- | --- |
-| Firmware builds | `esp32c3_supermini`, `esp32c3_devkitm`, `esp32c3_devkitc`, and `esp32c5_devkitc/esp32c5/hpcore` build in CI under Zephyr v4.4.1, with the per-generation controller security symbols asserted | — |
+| Firmware builds | Six targets including `esp32_devkitc/esp32/procpu` build locally on Zephyr v4.5.0 with controller security, PSRAM placement and ROM image checks; Bee X1.0 also passed boot, BLE binary loopback, WiFi scans and a 60-second UART line-rate RX test with stack watermarks | Other boards' 4.5 runtime acceptance, WiFi association/LAN/uploads, and remote CI on the published revision |
 | Host protocol tests | `tests/` compiles and drives the production management, security, target-binding, WebDAV, and HCI-order code paths, including the C3/C5 build guards | Real SMP pairing, NVS persistence, radio behaviour |
 | BLE terminal | Web, Python, and C clients, plus the browser regression suite for Reliable UART sequencing, reassembly, and session boundaries | Pairing, MTU negotiation, and reconnect behaviour per platform |
+| Browser flasher | Web Streams and browser regressions cover release of the loader reader across baud changes, port reuse, exclusive flash/reset operations, and ROM error reporting. On native USB, an explicit download-mode message permits another EN pulse. A Zephyr banner confirms boot. The X1.0 also offers a C3 watchdog reset on its native USB port. The Chinese flash page was rendered at 338, 390, 834 and 1440 px in light and dark themes | Physical EN timing, USB re-enumeration, and an end-to-end flash on supported boards and browsers |
+| Rust TUI | Bee X1.0 ran the Reliable UART path (`link: Reliable UART`, `@i?` sequence counters advancing, line input reaching a live target shell), the wrong-board reconnect fix, the F6/F7/F8 order, and console ownership: read-only and in-control badges, automatic claim of a free console, idle hand-over on typing, and a refused claim while another session was typing. Release, hand-over, the one-question ownership wait, and the LAN `@control …` text-frame path are covered by host tests, as are the reliable-write shutdown when the transmit characteristic disappears and the rule that a session joining a busy console does not claim it when it later frees up. The CLI shares the same session: `--query-control`, `--control …` and the send gate are exercised through `App` by the same tests | A second physical host for a live `yield`/hand-over, because one host adapter can expose both processes as a single session; LAN ownership against a real bridge |
 | WiFi, LAN bridge, WebDAV | Host tests and the browser suite; the WS token handshake is covered on both sides | Association, BLE/WiFi coexistence, upload against a real endpoint |
 | Assistant (Agent mode) | Node and browser suites cover the execution policy, evidence handling, and task recovery | Command execution and profile recovery on a real target; details in [AGENT_VALIDATION.zh-CN.md](AGENT_VALIDATION.zh-CN.md) |
-| Phone apps | Shared web assets build and type-check; Android/iOS/HarmonyOS projects are synchronized with the terminal UI; browser regressions cover Termux-style touch scrolling, tap-to-open keyboard, long-press selection with two draggable handles (both with the keyboard closed and open), the floating Copy pill, copy surviving a WebView selection clear, whole-transcript copy preserving wrapped lines and boundary spaces, a clipboard fallback that keeps focus and selection, a long hold never opening the keyboard, IME-aware keyboard-button state, and local keyboard layout without remote `stty` | Android, iOS, and HarmonyOS Bluetooth LE on physical devices |
+| Phone apps | Shared web assets build and type-check; Android/iOS/HarmonyOS projects are synchronized with the terminal UI; browser regressions cover Termux-style touch scrolling, tap-to-open keyboard, native-shell long-press selection with two draggable handles (both with the keyboard closed and open), the floating Copy pill, copy surviving a WebView selection clear, native browser selection without custom dots, Copy writing nothing with no selection, selected wrapped lines preserving boundary spaces, a clipboard fallback that keeps focus and selection, a long hold never opening the keyboard, IME-aware keyboard-button state, and local keyboard layout without remote `stty` | Android, iOS, and HarmonyOS Bluetooth LE on physical devices |
 
 ---
 

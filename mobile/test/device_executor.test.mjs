@@ -26,6 +26,9 @@ function fixture({ initial = "root@board:~# ", send } = {}) {
 test("console hints use the current tail and do not trust old shell prompts", () => {
   for (const [text, kind] of [
     ["Linux boot\r\nroot@board:~# ", "shell"], ["[root@board /]# ", "shell"],
+    ["12:23:57 radxa@radxa-cubie-a7z ~ → ", "shell"],
+    ["radxa@board:~❯ ", "shell"], ["radxa@board:~/repo % ", "shell"],
+    ["logs say use radxa@board ~ → ", "unknown"], ["note → ", "unknown"],
     ["board login: ", "login"], ["Password: ", "password"], ["=> ", "bootloader"],
     ["Kernel panic - not syncing: VFS failed\r\n", "panic"],
     ["root@board:~# reboot\r\nBooting...\r\n", "unknown"],
@@ -251,7 +254,13 @@ test("tracked shell commands preserve quoting and require an explicit exit marke
   const { execFileSync } = await import("node:child_process");
   const f = fixture();
   f.device.setMode("full-auto");
-  const record = await f.device.execute({ text: "printf \"it's working\\n\"; exit 7", appendEnter: true, trackExit: true });
+  /* Full Auto asks for shell text the guard cannot parse statically, and this
+   * one is quoted: approve it first, then assert on the tracked execution. */
+  const pending = f.device.execute({ text: "printf \"it's working\\n\"; exit 7", appendEnter: true, trackExit: true });
+  const waiting = f.device.getRecords().at(-1);
+  assert.equal(waiting.state, "awaiting-approval");
+  f.device.approve(waiting.id);
+  const record = await pending;
   // Terminal echo of the wrapper must not be interpreted as completion.
   f.receive(f.sent[0] + "\n");
   assert.equal(f.device.inspectExecution(record.id).executionStatus, "unknown");

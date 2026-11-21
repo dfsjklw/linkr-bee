@@ -28,6 +28,7 @@ pub struct Strings {
     pub tx: &'static str,
     /// The auto-scroll indicator.
     pub autoscroll: &'static str,
+    pub scroll_paused: &'static str,
     /// The unit of the signal reading beside the state (`dBm`).
     pub signal_unit: &'static str,
     /// What a slot shows before the device has reported a value.
@@ -122,6 +123,9 @@ pub struct Strings {
     /// device's — because either one is the user's to check and neither is
     /// visible from the pane the user is looking at.
     pub decode_loss_notice: &'static str,
+    /// Appended to that notice on a BLE or LAN link, where the bridge itself
+    /// can drop bytes under load before the target's text ever reaches it.
+    pub decode_loss_bridge_hint: &'static str,
 
     // --- views -----------------------------------------------------------
     /// Title of the serial terminal view.
@@ -234,6 +238,32 @@ pub struct Strings {
     pub net_ble_name_custom: &'static str,
     /// The note marking the MAC-derived name.
     pub net_ble_name_default: &'static str,
+    /// The paired-device section heading.
+    pub net_paired_section: &'static str,
+    /// The read-the-bonds action.
+    pub net_paired_refresh: &'static str,
+    /// Shown when no host is bonded.
+    pub net_paired_empty: &'static str,
+    /// Shown before the list has been read.
+    pub net_paired_not_read: &'static str,
+    /// A delayed removal is still pending on the board.
+    pub net_paired_pending: &'static str,
+    /// The last removal failed.
+    pub net_paired_failed: &'static str,
+    /// The firmware lists bonds but has no label commands.
+    pub net_paired_labels_unsupported: &'static str,
+    /// A label reply that was neither a label nor the removal acknowledgement.
+    pub net_paired_bad_reply: &'static str,
+    /// A typed label is longer than the client cap.
+    pub net_paired_label_too_long: &'static str,
+    /// The marker for this connection's own pairing.
+    pub net_paired_self: &'static str,
+    /// The remove action.
+    pub net_paired_remove: &'static str,
+    /// The note under the list.
+    pub net_paired_hint: &'static str,
+    /// Shown when the firmware has no paired-device commands.
+    pub net_paired_unsupported: &'static str,
     /// The WebDAV status action.
     pub net_webdav_status: &'static str,
     /// Refusing to enable WebDAV without a URL.
@@ -412,10 +442,52 @@ pub struct Strings {
     pub link_closed: &'static str,
     /// Prefix of the notice raised when a dial fails.
     pub link_failed: &'static str,
+    /// Prefix of the notice raised when a live link drops and the last dial is
+    /// retried on its own. The link's description follows it.
+    pub auto_reconnect_lost: &'static str,
+    /// Prefix of the notice raised when that retry brings the link back. The
+    /// link's description follows it.
+    pub auto_reconnect_restored: &'static str,
+    /// The words before the attempt's number: the notice reads
+    /// `"<this> 1/6"`.
+    pub auto_reconnect_attempt: &'static str,
+    /// The warning raised when every automatic attempt has failed and the user
+    /// has to ask for the link again.
+    pub auto_reconnect_gave_up: &'static str,
     /// Shown when something was to be sent and there was no link to send it
     /// over. A silent drop reads as success, which for `reboot` is the worst
     /// possible lie.
     pub not_connected: &'static str,
+    /// The top bar's badge when this session owns the shared console.
+    pub control_owned: &'static str,
+    /// The top bar's badge when another session owns it.
+    pub control_readonly: &'static str,
+    /// The top bar's badge when nobody owns it.
+    pub control_available: &'static str,
+    /// The notice after asking for the console.
+    pub control_requested: &'static str,
+    /// The notice after giving the console up.
+    pub control_released: &'static str,
+    /// The notice when another session took the console from this one.
+    pub control_taken: &'static str,
+    /// The notice when typing could not take an idle console from an active
+    /// typist.
+    pub control_busy: &'static str,
+    /// The notice when the bridge refused an ownership command; the reason
+    /// follows.
+    pub control_refused: &'static str,
+    /// The notice when releasing or handing over without control.
+    pub control_not_owner: &'static str,
+    /// The notice when there is no earlier controller to hand back to.
+    pub control_no_handover: &'static str,
+    /// The notice before handing the console to another session; the number
+    /// follows.
+    pub control_handover: &'static str,
+    /// The notice on a board that does not arbitrate ownership.
+    pub control_unsupported: &'static str,
+    /// The notice when a control command had to wait for the bridge's answer
+    /// to a question already in flight.
+    pub control_wait: &'static str,
 
     // --- the switches ------------------------------------------------------
     /// Prefix of the notice raised when the interface language changes.
@@ -442,7 +514,8 @@ pub struct Strings {
 const ZH: Strings = Strings {
     rx: "RX",
     tx: "TX",
-    autoscroll: "Auto",
+    autoscroll: "跟随",
+    scroll_paused: "暂停",
     signal_unit: "dBm",
     value_unknown: "─",
     label_separator: "：",
@@ -472,13 +545,14 @@ const ZH: Strings = Strings {
     term_input: "输入",
     hint_palette: "Ctrl+P 面板",
     hint_help: "F1 帮助",
-    hint_views: "F2-F5 视图",
+    hint_views: "F2/4/5 视图",
     hint_quit: "Ctrl+Q 退出",
     latch_armed: "{} 已武装：下一次按键会带上它",
     latch_disarmed: "{} 已取消武装",
     latch_pending: "待发",
     decode_loss: "乱码",
     decode_loss_notice: "串口收到 {} 字节不是有效 UTF-8 文本：终端里显示为 �（旧控制台上是 ?）。请检查设备的串口参数（--query-uart 查看、--uart 设置），或确认设备没有用 GBK 等非 UTF-8 编码。",
+    decode_loss_bridge_hint: "如果只是零星字节缺失、设备本身输出正常，则可能是桥接链路在拥塞时丢弃了数据：打开“诊断”视图读取 @i? 的 uart / rel 计数即可确认；持续高速输出时可降低对端控制台波特率，或改用浏览器 Web 端的可靠 UART 通道。",
     view_terminal: "串口终端",
     view_diagnostics: "诊断",
     view_network: "网络",
@@ -575,6 +649,19 @@ const ZH: Strings = Strings {
     net_ble_name_invalid: "名称需为 1–29 个 UTF-8 字节，且不能包含控制字符",
     net_ble_name_custom: "自定义",
     net_ble_name_default: "MAC 默认",
+    net_paired_section: "已配对设备",
+    net_paired_refresh: "[刷新已配对设备]",
+    net_paired_empty: "没有已配对的主机",
+    net_paired_not_read: "尚未读取；按 Enter 读取",
+    net_paired_pending: "删除等待固件处理，稍后刷新",
+    net_paired_failed: "上次删除失败，请刷新后重试",
+    net_paired_labels_unsupported: "此固件没有标签命令，仍可删除配对",
+    net_paired_bad_reply: "无法解析板子的标签回复",
+    net_paired_label_too_long: "名称最多 48 个 UTF-8 字节",
+    net_paired_self: "当前主机",
+    net_paired_remove: "[删除此配对]",
+    net_paired_hint: "Enter 改名或删除；标签只影响显示",
+    net_paired_unsupported: "此固件不支持配对管理",
     net_webdav_status: "[WebDAV 状态]",
     net_no_url: "先输入 WebDAV 上传地址",
     net_state_on: "开启",
@@ -613,7 +700,24 @@ const ZH: Strings = Strings {
     link_opened: "链路已建立：",
     link_closed: "链路已断开：",
     link_failed: "连接失败：",
+    auto_reconnect_lost: "链路意外断开，正在自动重连：",
+    auto_reconnect_restored: "链路已自动恢复：",
+    auto_reconnect_attempt: "自动重连尝试",
+    auto_reconnect_gave_up: "自动重连 6 次后失败；请按“重新连接”再试",
     not_connected: "未连接——没有发送任何内容。",
+    control_owned: "控制中",
+    control_readonly: "只读",
+    control_available: "无人控制",
+    control_requested: "正在申请控制…",
+    control_released: "已释放控制。",
+    control_taken: "其他会话已接管控制；输入时会在对方空闲后自动申请。",
+    control_busy: "对方正在输入，未发送；Ctrl+P →「申请控制」可立即接管。",
+    control_refused: "控制权操作被拒绝：",
+    control_not_owner: "当前会话没有控制权。",
+    control_no_handover: "没有记录到可交接的上一个控制方。",
+    control_handover: "正在把控制权交接给会话 #",
+    control_unsupported: "这块板子的固件不支持控制权仲裁。",
+    control_wait: "桥接板还在回答另一个查询，请稍后再试。",
     language_switched_prefix: "界面语言",
     language_zh: "中文",
     language_en: "English",
@@ -627,7 +731,8 @@ const ZH: Strings = Strings {
 const EN: Strings = Strings {
     rx: "RX",
     tx: "TX",
-    autoscroll: "Auto",
+    autoscroll: "Follow",
+    scroll_paused: "Paused",
     signal_unit: "dBm",
     value_unknown: "─",
     label_separator: ": ",
@@ -661,13 +766,14 @@ const EN: Strings = Strings {
     term_input: "typing",
     hint_palette: "Ctrl+P palette",
     hint_help: "F1 help",
-    hint_views: "F2-F5 views",
+    hint_views: "F2/4/5 views",
     hint_quit: "Ctrl+Q quit",
     latch_armed: "{} armed — the next key carries it",
     latch_disarmed: "{} disarmed",
     latch_pending: "armed",
     decode_loss: "garbled",
     decode_loss_notice: "{} bytes from the serial link are not valid UTF-8: the pane shows � (? on the old console). Check the device's serial parameters (--query-uart reads them, --uart sets them), or whether it speaks GBK rather than UTF-8.",
+    decode_loss_bridge_hint: "If only occasional bytes are missing and the device's own output is otherwise sound, the bridge may have dropped them under load: open Diagnostics and read the uart / rel counters from @i? to tell. At sustained high output, lower the target console's baud rate, or use the browser client's Reliable UART channel.",
     view_terminal: "Serial Terminal",
     view_diagnostics: "Diagnostics",
     view_network: "Network",
@@ -770,6 +876,19 @@ const EN: Strings = Strings {
     net_ble_name_invalid: "the name must be 1-29 UTF-8 bytes without control characters",
     net_ble_name_custom: "custom",
     net_ble_name_default: "MAC default",
+    net_paired_section: "Paired devices",
+    net_paired_refresh: "[Refresh paired devices]",
+    net_paired_empty: "no paired hosts",
+    net_paired_not_read: "not read yet; press Enter to read",
+    net_paired_pending: "removal pending; refresh shortly",
+    net_paired_failed: "last removal failed; refresh and retry",
+    net_paired_labels_unsupported: "this firmware has no label command; removal still works",
+    net_paired_bad_reply: "could not read the board's label reply",
+    net_paired_label_too_long: "a label is at most 48 UTF-8 bytes",
+    net_paired_self: "this host",
+    net_paired_remove: "[Remove this pairing]",
+    net_paired_hint: "Enter renames or removes; the label is display-only",
+    net_paired_unsupported: "this firmware has no pairing management",
     net_webdav_status: "[WebDAV status]",
     net_no_url: "enter a WebDAV upload URL first",
     net_state_on: "on",
@@ -809,7 +928,25 @@ const EN: Strings = Strings {
     link_opened: "link open: ",
     link_closed: "link closed: ",
     link_failed: "connect failed: ",
+    auto_reconnect_lost: "link lost, reconnecting automatically: ",
+    auto_reconnect_restored: "link restored automatically: ",
+    auto_reconnect_attempt: "auto-reconnect attempt",
+    auto_reconnect_gave_up:
+        "automatic reconnect failed after 6 attempts; press Reconnect to try again",
     not_connected: "Not connected — nothing was sent.",
+    control_owned: "In control",
+    control_readonly: "Read only",
+    control_available: "No controller",
+    control_requested: "Requesting console control…",
+    control_released: "Console control released.",
+    control_taken: "Another session took the console; typing asks for control once it is idle.",
+    control_busy: "The other session is typing, so nothing was sent; use Ctrl+P → Take control to preempt.",
+    control_refused: "Console control was refused: ",
+    control_not_owner: "This session does not hold the console.",
+    control_no_handover: "No earlier controller is known, so there is nobody to hand back to.",
+    control_handover: "Handing the console to session #",
+    control_unsupported: "This board's firmware does not arbitrate console control.",
+    control_wait: "The bridge is still answering another question; try again in a moment.",
     language_switched_prefix: "Interface language",
     language_zh: "中文",
     language_en: "English",
@@ -1036,6 +1173,7 @@ mod tests {
                 s.rx,
                 s.tx,
                 s.autoscroll,
+                s.scroll_paused,
                 s.signal_unit,
                 s.value_unknown,
                 s.label_separator,
@@ -1181,6 +1319,10 @@ mod tests {
                 s.link_opened,
                 s.link_closed,
                 s.link_failed,
+                s.auto_reconnect_lost,
+                s.auto_reconnect_restored,
+                s.auto_reconnect_attempt,
+                s.auto_reconnect_gave_up,
                 s.not_connected,
                 s.language_switched_prefix,
                 s.language_zh,
@@ -1344,7 +1486,6 @@ mod tests {
         for (name, zh, en) in [
             ("rx", zh.rx, en.rx),
             ("tx", zh.tx, en.tx),
-            ("autoscroll", zh.autoscroll, en.autoscroll),
             ("signal_unit", zh.signal_unit, en.signal_unit),
             ("value_unknown", zh.value_unknown, en.value_unknown),
             (

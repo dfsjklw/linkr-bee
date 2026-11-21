@@ -100,7 +100,7 @@ pub const FLAGS: &[Flag] = &[
     Flag::with_choices("--lang", &["zh", "en"], "interface language"),
     Flag::with_choices(
         "--theme",
-        &["dark", "light", "nord", "gruvbox", "dracula", "solarized"],
+        &["dark", "light"],
         "colour theme",
     ),
     Flag::with_choices(
@@ -111,7 +111,7 @@ pub const FLAGS: &[Flag] = &[
     Flag::with_choices(
         "--overlay",
         &[
-            "palette", "help", "notices", "confirm", "wifi", "settings", "about", "licenses",
+            "device", "palette", "help", "notices", "confirm", "wifi", "settings", "about", "licenses",
             "splash",
         ],
         "open on this modal",
@@ -155,7 +155,7 @@ pub const FLAGS: &[Flag] = &[
     Flag::new(
         "--ble-address",
         Value::Free,
-        "dial the board at this Bluetooth address",
+        "dial the board at this MAC address or macOS device UUID",
     ),
     Flag::new(
         "--ble-name",
@@ -187,6 +187,16 @@ pub const FLAGS: &[Flag] = &[
         "--connect-timeout",
         Value::Free,
         "seconds to wait for a dialled link to come up",
+    ),
+    Flag::new(
+        "--auto-reconnect",
+        Value::None,
+        "redial the last link after an unexpected drop (the default)",
+    ),
+    Flag::new(
+        "--no-auto-reconnect",
+        Value::None,
+        "leave a dropped link down instead of redialling it",
     ),
     // Scripting
     Flag::new(
@@ -283,6 +293,31 @@ pub const FLAGS: &[Flag] = &[
         "--query-lan",
         Value::None,
         "ask @s? and print the bridge's LAN address and token state",
+    ),
+    Flag::new(
+        "--query-bonds",
+        Value::None,
+        "ask @linkr bonds? and print the paired hosts and their labels",
+    ),
+    Flag::new(
+        "--query-control",
+        Value::None,
+        "print who owns the shared console, and in which mode",
+    ),
+    Flag::with_choices(
+        "--control",
+        &["claim", "idle", "release", "yield"],
+        "claim the console now, claim it when idle, release it, or hand it back",
+    ),
+    Flag::new(
+        "--rename-bond",
+        Value::Free,
+        "set a paired host's label as <type>/<address>=<label>",
+    ),
+    Flag::new(
+        "--remove-bond",
+        Value::Free,
+        "remove the pairing for <type>/<address>",
     ),
     Flag::new(
         "--uart",
@@ -390,12 +425,18 @@ pub const SUBCOMMANDS: &[(&str, &str)] = &[
     ),
     (
         "query",
-        "read one thing: info, uart, wifi, webdav, ble-name or lan",
+        "read one thing: info, uart, wifi, webdav, ble-name, lan, bonds or control",
     ),
     (
         "set",
         "change one thing and read it back: uart, wifi, webdav or ble-name",
     ),
+    (
+        "control",
+        "take, share, release or hand over the shared console: control <action>",
+    ),
+    ("bond", "label a paired host: bond <type>/<address> <label>"),
+    ("unbond", "remove a pairing: unbond <type>/<address>"),
     (
         "exec",
         "run a command on the target and bring its status back: exec -- <cmd>",
@@ -540,14 +581,42 @@ pub fn expand_subcommand(argv: Vec<String>) -> Result<Vec<String>, String> {
                     "webdav" => "--query-webdav",
                     "ble-name" => "--query-ble-name",
                     "lan" => "--query-lan",
+                    "bonds" => "--query-bonds",
+                    "control" => "--query-control",
                     other => {
                         return Err(format!(
-                        "query reads one of info, uart, wifi, webdav, ble-name or lan; '{other}' is not one"
+                        "query reads one of info, uart, wifi, webdav, ble-name, lan, bonds or control; '{other}' is not one"
                     ))
                     }
                 }
                 .to_string(),
             );
+        }
+        "bond" => {
+            let (address, label) = words
+                .split_first()
+                .ok_or_else(|| "bond wants <type>/<address> <label>".to_string())?;
+            if !crate::accessory::bond_id_valid(address) {
+                return Err(format!(
+                    "'{address}' is not a paired-device identity address"
+                ));
+            }
+            let label = label.join(" ");
+            if label.trim().is_empty() {
+                return Err("bond wants a label after the address".to_string());
+            }
+            translated.push("--rename-bond".to_string());
+            translated.push(format!("{address}={label}"));
+        }
+        "unbond" => {
+            let [address] = one_word(name, &words)?;
+            if !crate::accessory::bond_id_valid(&address) {
+                return Err(format!(
+                    "'{address}' is not a paired-device identity address"
+                ));
+            }
+            translated.push("--remove-bond".to_string());
+            translated.push(address);
         }
         "set" => {
             let [what, value] = two_words(name, &words)?;
@@ -572,6 +641,16 @@ pub fn expand_subcommand(argv: Vec<String>) -> Result<Vec<String>, String> {
                 );
                 translated.push(value);
             }
+        }
+        "control" => {
+            let [action] = one_word(name, &words)?;
+            if ControlAction::from_name(&action).is_none() {
+                return Err(format!(
+                    "control wants claim, idle, release or yield; '{action}' is not one"
+                ));
+            }
+            translated.push("--control".to_string());
+            translated.push(action);
         }
         "loopback" => {
             let [payload] = one_word(name, &words)?;
@@ -1010,17 +1089,9 @@ pub fn parse_escape(value: &str) -> Result<u8, String> {
 pub struct FoundDevice {
     /// The advertised name, when it advertised one.
     pub name: Option<String>,
-    /// Where the device is, as the platform spells an address — a MAC on
-    /// BlueZ, as in `FB:F6:91:14:33:3A`. This is the one spelling that names
-    /// the device everywhere: what the rows show, what `--ble-address` takes,
-    /// what the shelf remembers, and what a dial is matched against, because
-    /// it is the address a dial matches — see
-    /// `transport::ble::Selection::accepts`.
-    ///
-    /// It is deliberately *not* the platform's internal identifier: BlueZ
-    /// identifies a device by the path it keeps it under (`hci0/dev_FB_…`),
-    /// and a path shown where an address belongs is a device name nobody can
-    /// match against anything.
+    /// The connection identifier: a real MAC on Linux/Windows, or the full
+    /// CoreBluetooth UUID on macOS. The picker, --ble-address and saved
+    /// reconnects all retain this same value; zero placeholder MACs are not IDs.
     pub address: String,
     /// Whether the advertisement identifies a Linkr Bee. New firmware is
     /// identified by the Linkr Management Service and confirmed by its Device
@@ -1396,7 +1467,10 @@ fn rows_of_heard(
         }
         found.push(FoundDevice {
             name: crate::transport::ble::display_name(properties.local_name.as_deref()),
-            address: properties.address.to_string(),
+            address: crate::transport::ble::connection_identifier(
+                &id,
+                &properties.address.to_string(),
+            ),
             board: true,
             // The reading the advertisement that was just heard carried, or
             // the last one the daemon has on file when that event carried
@@ -1405,6 +1479,40 @@ fn rows_of_heard(
         });
     }
     found
+}
+
+/// What `--control` asked the bridge to do with the shared console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAction {
+    /// Take the console now.
+    Claim,
+    /// Take it only if the current owner has stopped typing.
+    Idle,
+    /// Give it up.
+    Release,
+    /// Give it back to the session this one took it from.
+    Yield,
+}
+
+impl ControlAction {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "claim" => Some(ControlAction::Claim),
+            "idle" => Some(ControlAction::Idle),
+            "release" => Some(ControlAction::Release),
+            "yield" => Some(ControlAction::Yield),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlAction::Claim => "claim",
+            ControlAction::Idle => "idle",
+            ControlAction::Release => "release",
+            ControlAction::Yield => "yield",
+        }
+    }
 }
 
 /// What the command line asked the bridge to do instead of opening a terminal.
@@ -1432,6 +1540,12 @@ pub struct Requests {
     pub ble_name: Option<String>,
     /// `@n default`.
     pub ble_name_default: bool,
+    /// `<type>/<address>` and its new label, when `--rename-bond` named one.
+    pub bond_label: Option<(String, String)>,
+    /// `<type>/<address>` when `--remove-bond` named one.
+    pub bond_remove: Option<String>,
+    /// What `--control` asked of the shared console.
+    pub control: Option<ControlAction>,
 }
 
 impl Requests {
@@ -1446,6 +1560,9 @@ impl Requests {
             && !self.webdav_off
             && self.ble_name.is_none()
             && !self.ble_name_default
+            && self.bond_label.is_none()
+            && self.bond_remove.is_none()
+            && self.control.is_none()
     }
 }
 
@@ -1499,10 +1616,17 @@ pub fn run_requests(app: &mut App, requests: &Requests, format: Format, connect:
     let mut failed = 0;
 
     for query in &requests.queries {
+        if *query == crate::device::Query::Control {
+            failed += report_control_status(app, format, connect);
+            continue;
+        }
         match app.ask_device(*query) {
             Err(why) => failed += report(format, query_name(*query), false, &why),
             Ok(()) => failed += wait_and_report(app, *query, format),
         }
+    }
+    if let Some(action) = requests.control {
+        failed += run_control_action(app, action, format, connect);
     }
     // A write is followed by the read that confirms it, so what gets reported
     // is what the bridge is doing and not what it was asked to do — see
@@ -1546,6 +1670,22 @@ pub fn run_requests(app: &mut App, requests: &Requests, format: Format, connect:
         match result {
             Err(why) => failed += report(format, "ble-name", false, &why),
             Ok(()) => failed += wait_and_report(app, crate::device::Query::BleName, format),
+        }
+    }
+    if let Some((address, label)) = &requests.bond_label {
+        match app.set_bond_label(address, label) {
+            Err(why) => failed += report(format, "bond-label", false, &why),
+            Ok(()) => {
+                failed += report_bond_mutation(app, format, "bond-label");
+            }
+        }
+    }
+    if let Some(address) = &requests.bond_remove {
+        match app.remove_bond(address) {
+            Err(why) => failed += report(format, "bond-remove", false, &why),
+            Ok(()) => {
+                failed += report_bond_mutation(app, format, "bond-remove");
+            }
         }
     }
     if requests.wifi_scan {
@@ -1615,6 +1755,11 @@ pub fn send_stdin(app: &mut App, how: Framing, format: Format) -> i32 {
     use std::io::{BufRead, Read};
 
     app.collect_output = true;
+    // A script types as the user would: it needs the console before its first
+    // byte, not a silent delivery of half of them into another session's shell.
+    if let Err(why) = prepare_serial_input(app) {
+        return report(format, "send", false, &why);
+    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut sent = 0usize;
@@ -1671,6 +1816,17 @@ pub fn send_stdin(app: &mut App, how: Framing, format: Format) -> i32 {
                 line
             }
         };
+        app.pump();
+        if app.control_readonly() {
+            return report(
+                format,
+                "send",
+                false,
+                &format!(
+                    "the console is no longer this session's after {sent} bytes; nothing more was sent"
+                ),
+            );
+        }
         if app.send_bytes(&outgoing) {
             sent += outgoing.len();
         } else {
@@ -1687,6 +1843,14 @@ pub fn send_stdin(app: &mut App, how: Framing, format: Format) -> i32 {
         app.pump();
         drain(app, format);
         thread::sleep(Duration::from_millis(5));
+    }
+    if let Some(reason) = app.control_refusal() {
+        return report(
+            format,
+            "send",
+            false,
+            &format!("the bridge refused control={reason}; delivery is unconfirmed"),
+        );
     }
     match send_detail(sent, missing, unreadable.as_ref()) {
         Ok(detail) => report(format, "send", true, &detail),
@@ -1770,6 +1934,8 @@ pub fn loopback_round_trip(
     if payload.is_empty() {
         return Err("the payload is empty".to_string());
     }
+    prepare_serial_input(app)?;
+    app.take_output(); // bytes observed during arbitration predate the probe
     if !app.send_bytes(payload) {
         return Err(app.strings().not_connected.to_string());
     }
@@ -1876,6 +2042,192 @@ fn with_wifi_state(app: &App, why: &str) -> String {
 /// ends it is the answer, the question's own timeout, or the link going away
 /// — and the report afterwards reads whichever of those happened off the
 /// state it left.
+/// How long the console may take to answer, before a script gives up.
+fn control_window() -> Duration {
+    crate::device::Query::Control.patience() + SETTLE_SLACK
+}
+
+/// Read the shared console's ownership, waiting for the connect-time answer.
+fn report_control_status(app: &mut App, format: Format, window: Duration) -> i32 {
+    match wait_for_control_ready(app, window) {
+        Ok(false) => report(
+            format,
+            "control",
+            false,
+            "this board does not arbitrate console ownership",
+        ),
+        Ok(true) => report_query(app, crate::device::Query::Control, format),
+        Err(why) => report(format, "control", false, &why),
+    }
+}
+
+/// Wait until the link says whether the console is arbitrated, and who owns it.
+///
+/// `false` is old firmware or an old LAN bridge: neither arbitrates, and a
+/// script keeps the historical freedom to type. `true` means the ownership
+/// answer has landed.
+fn wait_for_control_ready(app: &mut App, window: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + window;
+    loop {
+        if !app.session.is_live() {
+            return Err("the link ended before the bridge said who owns the console".to_string());
+        }
+        if app.supports_control() {
+            if app.control.is_some() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Err("the bridge did not report console ownership".to_string());
+            }
+        } else if app.transport != crate::app::Transport::Lan || app.control_announcement_waited {
+            return Ok(false);
+        } else if Instant::now() >= deadline {
+            // Pay the compatibility wait only once per LAN connection. A late
+            // announcement still takes precedence via supports_control above.
+            app.control_announcement_waited = true;
+            return Ok(false);
+        }
+        app.pump();
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait for one ownership command's answer to move the mode, or for a refusal.
+fn wait_for_control_answer(
+    app: &mut App,
+    action: ControlAction,
+    window: Duration,
+) -> Result<(), String> {
+    use crate::device::ControlMode;
+
+    let deadline = Instant::now() + window;
+    loop {
+        if let Some(reason) = app.control_refusal() {
+            return Err(format!("the bridge refused control={reason}"));
+        }
+        let mode = app.control_mode();
+        let arrived = match action {
+            ControlAction::Claim | ControlAction::Idle => mode == Some(ControlMode::Control),
+            ControlAction::Release | ControlAction::Yield => {
+                mode.is_some_and(|mode| mode != ControlMode::Control)
+            }
+        };
+        if arrived {
+            return Ok(());
+        }
+        if !app.session.is_live() {
+            return Err("the link ended before the bridge answered".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err("the bridge did not answer the ownership command".to_string());
+        }
+        app.pump();
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A CLI action shares the BLE management slot with connect-time reads.
+fn wait_for_control_slot(app: &mut App, deadline: Instant) -> Result<(), String> {
+    while app.talk.waiting().is_some() {
+        if !app.connected() || Instant::now() >= deadline {
+            return Err("the management channel did not become available".to_string());
+        }
+        app.pump();
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+/// Run one `--control` action and print the mode it left behind.
+fn run_control_action(
+    app: &mut App,
+    action: ControlAction,
+    format: Format,
+    window: Duration,
+) -> i32 {
+    let deadline = Instant::now() + window;
+    let arbitrated = match wait_for_control_ready(app, window) {
+        Ok(arbitrated) => arbitrated,
+        Err(why) => return report(format, "control", false, &why),
+    };
+    if !arbitrated {
+        return report(
+            format,
+            "control",
+            false,
+            "this board does not arbitrate console ownership",
+        );
+    }
+    if let Err(why) = wait_for_control_slot(app, deadline) {
+        return report(format, "control", false, &why);
+    }
+    let notice = match action {
+        ControlAction::Claim => app.take_control(),
+        ControlAction::Idle => app.take_control_when_idle(),
+        ControlAction::Release => app.release_control(),
+        ControlAction::Yield => app.hand_over_control(),
+    };
+    if notice.level == crate::event::NoticeLevel::Warn {
+        return report(format, "control", false, &notice.text);
+    }
+    match wait_for_control_answer(
+        app,
+        action,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        Err(why) => report(format, "control", false, &why),
+        Ok(()) => report_query(app, crate::device::Query::Control, format),
+    }
+}
+
+/// Bring a script's cached ownership up to date before its first UART write.
+pub(crate) fn prepare_serial_input(app: &mut App) -> Result<(), String> {
+    app.pump();
+    if !app.connected() {
+        return Err(app.strings().not_connected.to_string());
+    }
+    wait_for_input_control(app, control_window())
+}
+
+/// Make the console writable for a script before it sends stdin.
+///
+/// The rule is the TUI's: a free console is taken on connect, a console whose
+/// owner has stopped typing is taken by an idle claim, and one that is in use
+/// fails the send before queuing any UART bytes.
+fn wait_for_input_control(app: &mut App, window: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + window;
+    if !wait_for_control_ready(app, window)? {
+        return Ok(());
+    }
+    if !app.control_readonly() {
+        app.control_error = None;
+        return Ok(());
+    }
+    // The connect-time claim is sent on the same edge the status is read; it
+    // may already be on its way and needs no second command.
+    if app.control_mode() == Some(crate::device::ControlMode::Available)
+        && wait_for_control_answer(
+            app,
+            ControlAction::Claim,
+            Duration::from_millis(500).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    wait_for_control_slot(app, deadline)?;
+    let notice = app.take_control_when_idle();
+    if notice.level == crate::event::NoticeLevel::Warn {
+        return Err(format!("{}; nothing was sent", notice.text));
+    }
+    wait_for_control_answer(
+        app,
+        ControlAction::Idle,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(|why| format!("{why}; nothing was sent"))
+}
+
 fn wait_and_report(app: &mut App, query: crate::device::Query, format: Format) -> i32 {
     if !wait_for_query(app, query, format) {
         return report(format, query_name(query), false, &why_no_answer(app));
@@ -1901,6 +2253,15 @@ pub fn ask_and_wait(
         return Err(why_no_answer(app));
     }
     answer_of(app, query)
+}
+
+fn report_bond_mutation(app: &mut App, format: Format, what: &str) -> i32 {
+    let settled = wait_for_query(app, crate::device::Query::BondLabel, format);
+    match app.take_bond_mutation_result() {
+        Some(Ok(detail)) if settled => report(format, what, true, &detail),
+        Some(Err(why)) => report(format, what, false, &why),
+        _ => report(format, what, false, &why_no_answer(app)),
+    }
 }
 
 /// Wait for the answer to the question that was just asked, and say whether it
@@ -2045,12 +2406,15 @@ fn query_name(query: crate::device::Query) -> &'static str {
         crate::device::Query::Webdav => "webdav",
         crate::device::Query::BleName => "ble-name",
         crate::device::Query::Lan => "lan",
+        crate::device::Query::Bonds => "bonds",
+        crate::device::Query::BondLabel => "bond-label",
+        crate::device::Query::Control => "control",
     }
 }
 
 /// Print one request's outcome. Returns 1 when it failed, so the exit code
 /// counts failures rather than merely mentioning them.
-fn report(format: Format, what: &str, ok: bool, detail: &str) -> i32 {
+pub(crate) fn report(format: Format, what: &str, ok: bool, detail: &str) -> i32 {
     match format {
         Format::Text => {
             if detail.is_empty() {
@@ -2098,10 +2462,27 @@ fn answer_of(app: &App, query: crate::device::Query) -> Result<String, String> {
         return Err(why.clone());
     }
     Ok(match query {
+        crate::device::Query::Control => match app.control {
+            Some(control) => format!(
+                "control self={} owner={} mode={} epoch={} peers={}",
+                control.self_id,
+                control.owner,
+                match control.mode {
+                    crate::device::ControlMode::Control => "control",
+                    crate::device::ControlMode::Readonly => "readonly",
+                    crate::device::ControlMode::Available => "available",
+                },
+                control.epoch,
+                control.peers
+            ),
+            None => String::new(),
+        },
         crate::device::Query::Diagnostics => app.diagnostics.raw.join("\n"),
         crate::device::Query::Uart => app
-            .baud
-            .map(|baud| format!("uart={baud}"))
+            .uart_settings
+            .as_ref()
+            .map(|settings| format!("uart={}", settings.spec()))
+            .or_else(|| app.baud.map(|baud| format!("uart={baud}")))
             .unwrap_or_default(),
         crate::device::Query::Wifi => match &app.network.wifi {
             Some(wifi) => format!("wifi={},ssid={},ip={}", wifi.state, wifi.ssid, wifi.ip),
@@ -2152,6 +2533,22 @@ fn answer_of(app: &App, query: crate::device::Query) -> Result<String, String> {
                 )
             }
         }
+        // One host per line: its identity address, then its label, then a
+        // marker for this connection. Bonded hosts come from `bonds?` and the
+        // labels were read after it.
+        crate::device::Query::Bonds => match &app.network.bonds {
+            Some(bonds) => bonds
+                .iter()
+                .map(|bond| {
+                    let label = bond.label.as_deref().unwrap_or("(no label)");
+                    let mark = if bond.is_self { "  [self]" } else { "" };
+                    format!("{}  {label}{mark}", bond.id)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        },
+        crate::device::Query::BondLabel => String::new(),
     })
 }
 
@@ -2281,6 +2678,99 @@ pub fn lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_advertised_ownership_blocks_send_but_legacy_ble_remains_writable() {
+        use crate::transport::testing::MemoryLink;
+        for (caps, arbitrated) in [(0, false), (crate::protocol::MGMT_CAP_MULTI_SESSION, true)] {
+            let wire = MemoryLink::ble().with_capabilities(caps);
+            let mut app = App::default();
+            app.connect(wire.link()).unwrap();
+            wait_for_connected(&mut app, Duration::from_secs(1));
+            assert_eq!(
+                wait_for_input_control(&mut app, Duration::ZERO).is_err(),
+                arbitrated
+            );
+            assert_eq!(app.send_bytes(b"test"), !arbitrated);
+        }
+    }
+
+    #[test]
+    fn late_lan_announcement_supersedes_legacy_fallback() {
+        let wire = crate::transport::testing::MemoryLink::lan();
+        let mut app = App::default();
+        app.connect(wire.link()).unwrap();
+        wait_for_connected(&mut app, Duration::from_secs(1));
+        assert_eq!(wait_for_control_ready(&mut app, Duration::ZERO), Ok(false));
+        wire.feed_control("OK control self=2 owner=1 mode=readonly epoch=3 peers=2");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !app.control_announced && Instant::now() < deadline {
+            app.pump();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(wait_for_control_ready(&mut app, Duration::ZERO), Ok(true));
+        assert!(!app.send_bytes(b"old"));
+    }
+
+    #[test]
+    fn cli_claim_waits_for_connect_time_management_reads() {
+        use crate::device::Query;
+        use crate::protocol::{MGMT_CAP_MULTI_SESSION, MGMT_HEADER_SIZE};
+        use crate::transport::testing::{answer, MemoryLink};
+        let wire = MemoryLink::ble().with_capabilities(MGMT_CAP_MULTI_SESSION);
+        let mut app = App::default();
+        app.connect(wire.link()).unwrap();
+        let bridge = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                for frame in wire.take_management() {
+                    let id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                    let command = std::str::from_utf8(&frame[MGMT_HEADER_SIZE..]).unwrap();
+                    let reply = match command {
+                        "@c?" => "OK control self=2 owner=1 mode=readonly epoch=1 peers=2",
+                        "@c claim" => "OK control self=2 owner=2 mode=control epoch=2 peers=2",
+                        cmd if cmd == Query::BleName.command() => "OK name=Bench custom=yes",
+                        cmd if cmd == Query::Lan.command() => "OK ws=off token=none",
+                        _ => panic!("unexpected management request {command}"),
+                    };
+                    wire.feed_management(answer(id, reply));
+                    if command == "@c claim" {
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            panic!("no explicit claim reached the bridge");
+        });
+        let result = run_requests(
+            &mut app,
+            &Requests {
+                control: Some(ControlAction::Claim),
+                ..Default::default()
+            },
+            Format::Text,
+            Duration::from_secs(2),
+        );
+        bridge.join().unwrap();
+        assert_eq!(result, 0);
+        assert_eq!(
+            app.control_mode(),
+            Some(crate::device::ControlMode::Control)
+        );
+    }
+
+    #[test]
+    fn uart_query_returns_the_full_confirmed_format() {
+        let app = App {
+            baud: Some(230400),
+            uart_settings: crate::accessory::parse_uart_settings("OK uart=230400,7,E,2,rtscts"),
+            ..App::default()
+        };
+        assert_eq!(
+            answer_of(&app, crate::device::Query::Uart).unwrap(),
+            "uart=230400,7,e,2,rtscts"
+        );
+    }
 
     /// A completion that offers a flag the parser has never heard of completes
     /// a command line into an error, and a flag the parser knows but the
@@ -2671,6 +3161,7 @@ mod tests {
             (&["query", "webdav"], &["--query-webdav"]),
             (&["query", "ble-name"], &["--query-ble-name"]),
             (&["query", "lan"], &["--query-lan"]),
+            (&["query", "bonds"], &["--query-bonds"]),
             (&["query", "info", "--json"], &["--query-info", "--json"]),
             (
                 &["set", "uart", "115200,8,n,1,none"],
@@ -2691,6 +3182,14 @@ mod tests {
             ),
             (&["set", "ble-name", "测试😀"], &["--rename-ble", "测试😀"]),
             (&["set", "ble-name", "default"], &["--reset-ble-name"]),
+            (
+                &["bond", "0/AA:BB:CC:DD:EE:01", "Alice's phone"],
+                &["--rename-bond", "0/AA:BB:CC:DD:EE:01=Alice's phone"],
+            ),
+            (
+                &["unbond", "0/AA:BB:CC:DD:EE:01"],
+                &["--remove-bond", "0/AA:BB:CC:DD:EE:01"],
+            ),
             (&["exec", "--", "df", "-h"], &["--exec", "df -h"]),
             (&["exec", "--", "echo", "hi"], &["--exec", "echo hi"]),
             (
@@ -2698,6 +3197,9 @@ mod tests {
                 &["--timeout", "15", "--exec", "df -h"],
             ),
             (&["loopback", "AB"], &["--loopback-test", "AB"]),
+            (&["query", "control"], &["--query-control"]),
+            (&["control", "claim"], &["--control", "claim"]),
+            (&["control", "yield"], &["--control", "yield"]),
             (&["send", "--line"], &["--send", "line"]),
             (&["send", "--raw"], &["--send", "raw"]),
             // The same framing said twice is the same framing; only the two
@@ -2756,6 +3258,8 @@ mod tests {
             (&["set", "uart"], "two words"),
             (&["set", "uart", "a", "b"], "two words"),
             (&["exec"], "wants a command"),
+            (&["control"], "wants one word"),
+            (&["control", "steal"], "not one"),
             (&["loopback"], "wants one word"),
             (&["scan", "everything"], "takes no words"),
             (&["send"], "wants --line or --raw"),
@@ -2805,12 +3309,12 @@ mod tests {
         #[cfg(feature = "tui")]
         assert_eq!(
             subcommands_json(),
-            r#"["scan","doctor","query","set","exec","send","loopback","tui","capabilities"]"#
+            r#"["scan","doctor","query","set","control","bond","unbond","exec","send","loopback","tui","capabilities"]"#
         );
         #[cfg(not(feature = "tui"))]
         assert_eq!(
             subcommands_json(),
-            r#"["scan","doctor","query","set","exec","send","loopback","capabilities"]"#
+            r#"["scan","doctor","query","set","control","bond","unbond","exec","send","loopback","capabilities"]"#
         );
         #[cfg(feature = "tui")]
         assert!(subcommands_words().contains("tui"));
@@ -2828,6 +3332,28 @@ mod tests {
             rssi,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn macos_scan_rows_retain_distinct_native_ids_with_placeholder_macs() {
+        let first = "11111111-1111-4111-8111-aabbccddeeff";
+        let second = "22222222-2222-4222-8222-aabbccddeeff";
+        let known = vec![
+            (
+                first.into(),
+                seen("00:00:00:00:00:00", "Linkr Bee 1", Some(-40)),
+            ),
+            (
+                second.into(),
+                seen("00:00:00:00:00:00", "Linkr Bee 2", Some(-50)),
+            ),
+        ];
+        let heard = HashMap::from([(first.into(), Some(-40)), (second.into(), Some(-50))]);
+        let rows = rows_of_heard(&heard, known);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].address, first.to_ascii_uppercase());
+        assert_eq!(rows[1].address, second.to_ascii_uppercase());
+        assert_ne!(rows[0].address, rows[1].address);
     }
 
     /// A scan is a question about the air, not about the daemon's memory: a

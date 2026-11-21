@@ -1,4 +1,40 @@
+# The HAL defaults this hidden symbol only for ESP32/S2/S3. Extend its
+# defaults here so Kconfig resolves the C5 heap boundary on the first configure,
+# with any selected HAL checkout, without modifying external source trees.
+config SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+	default y if SOC_SERIES_ESP32C5 && ESP_SPIRAM
+
+# Linkr exposes station mode only. Zephyr 4.5 otherwise includes SoftAP's
+# supplicant and RF code through this hidden default on every ESP32 target.
+config ESP32_WIFI_SOFTAP_SUPPORT
+	default n
+
+# Match the reduced RF buffer counts below instead of reserving the upstream
+# heap for larger pools. Fall back to upstream defaults for custom larger pools.
+config HEAP_MEM_POOL_ADD_SIZE_ESP_WIFI
+	default 36864 if ESP_WIFI_HEAP_SYSTEM && ESP32_WIFI_DYNAMIC_TX_BUFFER && SOC_SERIES_ESP32C5 && \
+		ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM <= 6 && ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM <= 6 && \
+		ESP32_WIFI_STATIC_RX_BUFFER_NUM <= 6 && ESP32_WIFI_MGMT_SBUF_NUM <= 6
+	default 40960 if ESP_WIFI_HEAP_SYSTEM && ESP32_WIFI_DYNAMIC_TX_BUFFER && SOC_SERIES_ESP32C3 && \
+		ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM <= 8 && ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM <= 8 && \
+		ESP32_WIFI_STATIC_RX_BUFFER_NUM <= 6 && ESP32_WIFI_MGMT_SBUF_NUM <= 8
+
+config HEAP_MEM_POOL_ADD_SIZE_ESP_BT
+	default 44000 if BT_ESP32 && SOC_SERIES_ESP32C5 && ESP32_BT_LE_MAX_CONNECTIONS <= 2 && \
+		ESP32_BT_LE_MSYS_1_BLOCK_COUNT <= 12 && ESP32_BT_LE_MSYS_1_BLOCK_SIZE <= 256 && \
+		ESP32_BT_LE_MSYS_2_BLOCK_COUNT <= 12 && ESP32_BT_LE_MSYS_2_BLOCK_SIZE <= 320 && \
+		ESP32_BT_LE_ACL_BUF_COUNT <= 8 && ESP32_BT_LE_ACL_BUF_SIZE <= 255
+
 menu "Linkr Bee bridge"
+
+config LINKR_BLE_BRIDGE_PEER_TX_QUEUE_DEPTH
+	int "Buffered UART chunks per BLE peer"
+	default 8 if SOC_SERIES_ESP32C3
+	default 16
+	range 4 64
+	help
+	  Each peer has its own bounded queue and sender. A peer that cannot
+	  keep up is disconnected without stalling UART capture or other peers.
 
 # ESP32 uses Espressif's controller, not Zephyr's BT_CTLR. The upstream
 # controller encryption default follows BT_CTLR_LE_ENC, which is unset with
@@ -26,7 +62,7 @@ endif
 
 config LINKR_BLE_BRIDGE_FIRMWARE_VERSION
 	string "Firmware version"
-	default "0.1.2"
+	default "1.2.0"
 	help
 	  Human-readable application version returned by the diagnostic command
 	  and included in release metadata.
@@ -287,6 +323,18 @@ config LINKR_BLE_BRIDGE_UART_FLOW_CONTROL_RTS_CTS
 
 endchoice
 
+config LINKR_BLE_BRIDGE_SESSION_IDLE_MS
+	int "Idle milliseconds before another session may take the console"
+	default 3000
+	range 500 60000
+	help
+	  An explicit @c claim always takes the serial console. This timeout is
+	  the seamless path: a write from another session may take over after the
+	  current owner has been silent for this long, so a person can simply start
+	  typing on a read-only client instead of pressing Take control. Keep it
+	  long enough to cover a pause between keystrokes; the old owner's already
+	  queued bytes are protected by the ownership epoch either way.
+
 config LINKR_BLE_BRIDGE_CONTROL_COMMANDS
 	bool "Enable BLE control commands"
 	default y
@@ -299,10 +347,28 @@ config LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH
 	bool "Require GPIO button press for BLE pairing"
 	default n
 	help
-	  When enabled, the pairing GPIO (linkr-pairing alias) must be held
-	  active before the host can initiate BLE pairing. Set to n to allow
+	  When enabled, the pairing GPIO (linkr-pairing alias) must have been
+	  pressed before the host can initiate BLE pairing. Set to n to allow
 	  pairing without physical button access, e.g. for boards without a
 	  dedicated pairing button or during development.
+
+config LINKR_BLE_BRIDGE_PAIRING_GRACE_MS
+	int "Pairing authorization window after the pairing GPIO press (ms)"
+	depends on LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH
+	default 30000
+	range 0 300000
+	help
+	  A press of the pairing GPIO authorizes pairing requests received
+	  within this many milliseconds after the press. Hosts scan, connect
+	  and only then request keys, so requiring the key to be held for the
+	  whole exchange asks users to guess when to press. Keep the window
+	  short enough that an authorized press cannot be reused long after the
+	  person walked away; the security property is still "somebody touched
+	  the board shortly before the new host paired".
+
+	  Holding the key low at the moment of the pairing request continues to
+	  authorize it. Set 0 to require the key low during the pairing request,
+	  which is the behaviour before this option existed.
 
 config LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC
 	bool "Dynamic BLE name with hardware-MAC suffix and runtime override"
@@ -463,7 +529,7 @@ config LINKR_BLE_BRIDGE_WIFI_RETRY_MS
 
 config LINKR_BLE_BRIDGE_WIFI_CONNECT_STACK
 	int "WiFi connect thread stack size"
-	default 8192
+	default 4096
 	range 1024 16384
 	depends on LINKR_BLE_BRIDGE_WIFI
 
@@ -476,6 +542,21 @@ config LINKR_BLE_BRIDGE_WIFI_OPERATION_TIMEOUT_MS
 	  Bound the time spent waiting for association or an IPv4 lease. When the
 	  deadline expires, the pending operation fails, the interface is reset,
 	  and the normal reconnect policy is resumed.
+
+config LINKR_BLE_BRIDGE_WIFI_SCAN_TIMEOUT_MS
+	int "WiFi scan timeout in milliseconds"
+	default 15000
+	range 5000 120000
+	depends on LINKR_BLE_BRIDGE_WIFI
+	help
+	  Bound a single scan sweep. When the driver has not reported completion
+	  by this deadline the watchdog releases the scan state, so the value has
+	  to exceed how long one sweep actually takes on the board.
+
+	  ESP32-C5 is dual-band and its WiFi driver ignores the requested band
+	  bitmap, so a sweep there measures about 20 s even when only 2.4 GHz and
+	  a short per-channel dwell are requested. ESP32-C3 sweeps faster and
+	  keeps the default.
 
 config LINKR_BLE_BRIDGE_WEBDAV
 	bool "Enable WebDAV serial log upload"
@@ -592,7 +673,7 @@ config LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN
 
 config LINKR_BLE_BRIDGE_WS_BRIDGE_STACK
 	int "WebSocket bridge per-client thread stack size"
-	default 4096
+	default 3072
 	range 1024 8192
 	depends on LINKR_BLE_BRIDGE_WS_BRIDGE
 
@@ -616,6 +697,12 @@ config LINKR_BLE_BRIDGE_MGMT_REQUEST_STACK
 config HTTP_SERVER_MAX_CLIENTS
 	default LINKR_BLE_BRIDGE_WS_BRIDGE_MAX_CLIENTS if LINKR_BLE_BRIDGE_WS_BRIDGE
 
+# HTTP/1 polling needs an eventfd, a listener and every unupgraded client.
+# Two clients need four events; keep a spare. ws_bridge.c rejects larger
+# custom service/client counts unless the poll budget is raised with them.
+config ZVFS_POLL_MAX
+	default 5 if LINKR_BLE_BRIDGE_WS_BRIDGE
+
 config WEBSOCKET_MAX_CONTEXTS
 	default LINKR_BLE_BRIDGE_WS_BRIDGE_MAX_CLIENTS if LINKR_BLE_BRIDGE_WS_BRIDGE
 
@@ -626,7 +713,189 @@ config HTTP_SERVER_VERSION_2
 	  avoids reserving its parser, HPACK, and Huffman resources on ESP32-C3.
 
 config HTTP_SERVER_STACK_SIZE
-	default 8192 if LINKR_BLE_BRIDGE_WS_BRIDGE
+	default 4096 if LINKR_BLE_BRIDGE_WS_BRIDGE
+
+# --------------------------------------------------------------------------
+# Linkr Bee X1.0 auxiliary board I/O (RGB status LED, optocoupler, IR remote)
+# --------------------------------------------------------------------------
+# The dev boards and the Super Mini have none of these nodes, so every option
+# below collapses to n there and the command group only advertises what the
+# board can actually do.
+
+config LINKR_BLE_BRIDGE_RGB_STATUS_LED
+	bool "Addressable RGB status LED"
+	depends on DT_HAS_RADXA_LINKR_WS2812_ENABLED
+	default y
+	help
+	  Drive the board's WS2812-compatible status LED, and use it for the UART
+	  activity indication instead of a plain GPIO LED. BLE is blue, WiFi
+	  white, and AI takeover cyan (in increasing priority). UART traffic
+	  blinks the current colour at 5 Hz. The protocol is
+	  generated by the application (src/linkr_ws2812.c): Zephyr has no LED
+	  strip driver for the ESP32-C3.
+
+config LINKR_BLE_BRIDGE_RGB_BRIGHTNESS
+	int "RGB status LED brightness (percent)"
+	depends on LINKR_BLE_BRIDGE_RGB_STATUS_LED
+	default 30
+	range 0 100
+	help
+	  Scale all status, UART activity, manual preview and self-test colours
+	  once before transmission. Logical RGB values remain unchanged.
+
+config LINKR_BLE_BRIDGE_RGB_ACTIVITY_COLOR
+	hex "Status LED activity colour while disconnected"
+	depends on LINKR_BLE_BRIDGE_RGB_STATUS_LED
+	default 0x001830
+	range 0x000000 0xFFFFFF
+	help
+	  Colour of UART activity while no connection status is shown. Keep it
+	  dim: a WS2812 pixel at full white draws about 60 mA.
+
+config LINKR_BLE_BRIDGE_OPTO_SWITCH
+	bool "Optocoupler dry-contact switch"
+	depends on DT_HAS_RADXA_LINKR_OPTO_SWITCH_ENABLED
+	default y
+	help
+	  Allow the host to close the isolated contact wired across J5, for
+	  example to press the target board's reset or power key.
+
+config LINKR_BLE_BRIDGE_IR
+	bool "Infrared remote transceiver (NEC)"
+	depends on DT_HAS_RADXA_LINKR_IR_ENABLED
+	default y
+	help
+	  Receive NEC frames from an IR remote and transmit them. The receiver
+	  decodes the demodulating IR module's output; the transmitter gates a
+	  38 kHz carrier generated by LEDC.
+
+config LINKR_BLE_BRIDGE_IR_TX
+	bool "Infrared transmitter"
+	depends on LINKR_BLE_BRIDGE_IR
+	depends on DT_HAS_ESPRESSIF_ESP32_LEDC_ENABLED
+	select PWM
+	default y
+	help
+	  Transmit NEC frames. A full frame is about 68 ms of busy-waiting on a
+	  cooperative helper thread; the carrier itself is hardware generated,
+	  so only interrupts can stretch a mark.
+
+config LINKR_BLE_BRIDGE_IR_RX
+	bool "Infrared receiver"
+	depends on LINKR_BLE_BRIDGE_IR
+	default y
+	help
+	  Decode NEC frames in the receiver GPIO interrupt handler. The last
+	  frame and the receive counters are readable with @r?.
+
+config LINKR_BLE_BRIDGE_AI_CONFIG
+	bool "Store the AI configuration on the board"
+	depends on SETTINGS
+	default y
+	help
+	  Keep one AI configuration blob (endpoint, model, protocol, limits and,
+	  if the user opts in, the API key and extra headers) in NVS so it
+	  follows the board instead of one browser. The firmware treats it as
+	  opaque bytes; the app owns the schema and validates it on load. A
+	  paired host can read the blob over the management channel, so the key
+	  is stored only when the user explicitly asks for it.
+
+config LINKR_BLE_BRIDGE_AI_CONFIG_MAX
+	int "Maximum AI configuration blob size in bytes"
+	depends on LINKR_BLE_BRIDGE_AI_CONFIG
+	default 960
+	range 240 2048
+	help
+	  The blob is uploaded in chunks over the management channel; 960 bytes
+	  covers a long endpoint, a model id, a token and several headers.
+
+# --------------------------------------------------------------------------
+# Paired-device labels
+# --------------------------------------------------------------------------
+# A bonded host shows up in the paired-device list under its identity address.
+# The owner can give it a display label (e.g. "Alice's phone") stored in NVS
+# next to the bond; the Bluetooth stack owns the bond table itself and cannot
+# carry extra fields, so the two are joined by address.
+
+config LINKR_BLE_BRIDGE_BOND_LABEL_MAX
+	int "Maximum paired-device label length in bytes"
+	depends on SETTINGS
+	default 48
+	range 8 64
+	help
+	  Each pairing can carry a free-text display label (UTF-8) so the owner
+	  can tell "my phone" from "that laptop". It is stored in NVS under the
+	  bond's identity address and removed with the pairing. 48 bytes fits
+	  about sixteen Chinese characters or a full phone name; the label
+	  travels as hex over the management channel, so 64 bytes would double
+	  to 128 characters on the wire, still inside the 512-byte reply.
+
+	  The web and TUI clients cap their own input at 48 bytes because the
+	  reply protocol does not report this value. Keep the default unless
+	  those clients are changed too: a smaller value makes their writes
+	  fail, and a larger value is unreachable from them.
+
+config LINKR_BLE_BRIDGE_IR_LEARN
+	bool "Infrared learning (capture and replay arbitrary remotes)"
+	depends on LINKR_BLE_BRIDGE_IR
+	depends on LINKR_BLE_BRIDGE_IR_RX
+	depends on LINKR_BLE_BRIDGE_IR_TX
+	depends on SETTINGS
+	default y
+	help
+	  Capture the raw mark/space train of any IR remote, store it in NVS and
+	  replay it later. This covers remotes that are not NEC (RC5, Sony, JVC,
+	  ...) as long as one key press fits in the edge budget. Commands are
+	  @r learn, @r play, @r slots and @r delete.
+
+config LINKR_BLE_BRIDGE_IR_LEARN_SLOTS
+	int "Learned IR command slots"
+	depends on LINKR_BLE_BRIDGE_IR_LEARN
+	default 8
+	range 1 16
+	help
+	  Number of learned commands kept in NVS. Each slot costs about 400 bytes
+	  of NVS space and the same amount of RAM.
+
+config LINKR_BLE_BRIDGE_IR_LEARN_MAX_EDGES
+	int "Maximum intervals captured per learned command"
+	depends on LINKR_BLE_BRIDGE_IR_LEARN
+	default 192
+	range 16 512
+	help
+	  One key press is stored as alternating mark/space intervals. A NEC frame
+	  is 67 intervals and RC5 is under 30; 192 also leaves room for the
+	  longer Sony and JVC frames. Protocols whose frame does not fit are
+	  rejected instead of being truncated.
+
+config LINKR_BLE_BRIDGE_IR_LEARN_NAME_MAX
+	int "Maximum saved-command name length in bytes"
+	depends on LINKR_BLE_BRIDGE_IR_LEARN
+	default 32
+	range 8 64
+	help
+	  Each learned slot can carry a free-text name (UTF-8) so the owner can
+	  tell the keys of a multi-button remote apart. The name is stored in NVS
+	  next to the waveform and travels with the board; 32 bytes fits about ten
+	  Chinese characters or 32 ASCII ones. Names are moved as hex over the
+	  management channel to keep spaces and non-ASCII bytes unambiguous.
+
+config LINKR_BLE_BRIDGE_IR_LEARN_IDLE_MS
+	int "Silence that ends a learned frame"
+	depends on LINKR_BLE_BRIDGE_IR_LEARN
+	default 60
+	range 20 500
+	help
+	  The capture closes after the receiver line has been quiet this long,
+	  which is how a key press is separated from the next one.
+
+config LINKR_BLE_BRIDGE_IR_LEARN_TIMEOUT_MS
+	int "Learning request timeout"
+	depends on LINKR_BLE_BRIDGE_IR_LEARN
+	default 15000
+	range 1000 60000
+	help
+	  Give up when no usable frame was captured within this time.
 
 endmenu
 

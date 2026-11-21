@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "linkr-tui"
-version = "0.1.2"
+version = "1.2.0"
 dependencies = [
  "bluez-async",
  "btleplug",
@@ -1527,6 +1527,7 @@ dependencies = [
  "resvg",
  "tokio",
  "tokio-tungstenite",
+ "unicode-segmentation",
  "unicode-width",
  "usvg",
  "uuid",

@@ -7,10 +7,14 @@
     <meta name="theme-color" id="themeColorMeta" content="#05080D" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="stylesheet" href="./vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="./style.css?v=20261021-cross-browser" />
-    <link rel="stylesheet" href="./window.css?v=20260906-agent-sidebar-2" />
-    <link rel="stylesheet" href="./skin-v2.css?v=20261021-cross-browser" />
-    <link rel="stylesheet" href="./mobile-ui.css?v=20261023-compact-controls" />
+    <link rel="stylesheet" href="./style.css?v=20261030-full-labels" />
+    <link rel="stylesheet" href="./window.css?v=20261026-safearea3" />
+    <link rel="stylesheet" href="./skin-v2.css?v=20261030-full-labels" />
+    <link rel="stylesheet" href="./mobile-ui.css?v=20261029-layout" />
+    <link rel="stylesheet" href="./form_controls.css?v=20261029" />
+    <link rel="stylesheet" href="./ble_guidance.css?v=20261029" />
+    <link rel="stylesheet" href="./agent_choices.css?v=20261029" />
+    <link rel="stylesheet" href="./agent_ui.css?v=20261029" />
   </head>
   <body>
     <main class="app-shell">
@@ -26,6 +30,7 @@
           <div>
             <h1 data-i18n="title">Linkr Bee Terminal</h1>
             <p id="supportText" class="support-text">Checking Web Bluetooth…</p>
+            <p id="compactDevice" class="support-text compact-device" hidden></p>
           </div>
         </div>
 
@@ -87,6 +92,12 @@
             <circle cx="12" cy="19" r="1.1" fill="currentColor" stroke="none"></circle>
           </svg>
         </button>
+        <button class="rail-btn" type="button" data-rail-target="board" aria-label="Board I/O" data-i18n-aria="settingsBoard" data-i18n-title="settingsBoard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="7.2" y="7.2" width="9.6" height="9.6" rx="1.6"></rect>
+            <path d="M10 4.2v3M14 4.2v3M10 16.8v3M14 16.8v3M4.2 10h3M4.2 14h3M16.8 10h3M16.8 14h3"></path>
+          </svg>
+        </button>
         <button class="rail-btn" type="button" data-rail-target="ai" aria-label="Assistant" data-i18n-aria="assistant" data-i18n-title="assistant">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 3.2l1.9 5 5 1.9-5 1.9-1.9 5-1.9-5-5-1.9 5-1.9z"></path>
@@ -131,6 +142,7 @@
           <button class="settings-tab active" type="button" data-settings-target="connection" data-i18n="settingsConnection" aria-selected="true">Connect</button>
           <button class="settings-tab" type="button" data-settings-target="terminal" data-i18n="settingsTerminal" aria-selected="false">Serial</button>
           <button class="settings-tab" type="button" data-settings-target="network" data-i18n="settingsNetwork" aria-selected="false">Network</button>
+          <button class="settings-tab" type="button" data-settings-target="board" data-i18n="settingsBoard" aria-selected="false">Board</button>
           <button class="settings-tab" type="button" data-settings-target="ai" aria-selected="false" hidden>AI</button>
           <button class="settings-tab" type="button" data-settings-target="about" data-i18n="aboutNav" aria-selected="false">About</button>
         </nav>
@@ -154,7 +166,7 @@
             <span id="wsTokenError" class="field-error" role="alert" hidden></span>
             <span class="field-hint" data-i18n="wsTokenHint">Shown by @s? on the encrypted BLE channel. Leave blank only if LAN auth was disabled with @s token off.</span>
           </label>
-          <p id="blePairingHint" class="field-hint" data-i18n="pairingHint">New host: hold Bee GPIO1 to GND before connecting and accept system pairing. Bonded hosts reconnect without GPIO1.</p>
+          <p id="blePairingHint" class="field-hint" data-i18n="pairingHint">New host: press the Bee pairing key once (Linkr Bee X1.0: USER_KEY/GPIO3; C3/C5: GPIO1), then connect within 30 s. Bonded hosts reconnect without a key press.</p>
           <div class="btn-grid">
             <button id="connectButton" class="btn btn-primary" type="button">
               <span class="spinner" aria-hidden="true"></span>
@@ -225,7 +237,7 @@
           </div>
         </details>
 
-        <section class="card" data-i18n-aria="bleNameAria" aria-label="BLE device name" data-settings-page="connection">
+        <section id="bleNameCard" class="card" data-i18n-aria="bleNameAria" aria-label="BLE device name" data-settings-page="connection">
           <div class="card-title"><span class="dot"></span><span data-i18n="bleNameTitle">BLE device name</span></div>
           <p class="field-hint" data-i18n="bleNameHint">Shown when scanning nearby devices. 1–29 UTF-8 bytes; Chinese and emoji are allowed (an emoji usually uses 4 bytes). The Device ID used for verification does not change.</p>
           <label class="field" for="bleNameInput">
@@ -248,8 +260,40 @@
           </div>
         </section>
 
+        <section id="boardBondsCard" class="card bond-card" data-settings-page="connection" aria-label="Paired devices">
+          <div class="card-title"><span class="dot"></span><span data-bonds-title>已配对设备</span></div>
+          <p class="field-hint" data-bonds-hint></p>
+          <div class="bond-list" data-bonds-list></div>
+          <div class="btn-grid"><button class="btn btn-soft" type="button" data-bonds-refresh>刷新列表</button></div>
+          <p class="field-hint" role="status"></p>
+        </section>
+
         <section class="card" data-i18n-aria="terminalSettingsAria" aria-label="Terminal settings" data-settings-page="terminal">
           <div class="card-title"><span class="dot"></span><span data-i18n="terminalSettings">Terminal Settings</span></div>
+          <div class="field">
+            <label class="field-label" for="baudSelect" data-i18n="baudRate">Baud rate</label>
+            <select id="baudSelect" aria-describedby="baudHint">
+              <option value="1200">1200</option>
+              <option value="2400">2400</option>
+              <option value="4800">4800</option>
+              <option value="9600">9600</option>
+              <option value="19200">19200</option>
+              <option value="38400">38400</option>
+              <option value="57600">57600</option>
+              <option value="115200" selected>115200</option>
+              <option value="230400">230400</option>
+              <option value="460800">460800</option>
+              <option value="921600">921600</option>
+              <!-- 1500000 is the console rate most Rockchip (RK) boards ship with. -->
+              <option value="1500000">1500000</option>
+              <option value="custom" data-i18n="baudCustom">Custom…</option>
+            </select>
+            <span id="baudHint" class="field-hint" data-i18n="baudHint">Picking a rate updates the UART string below; press Set to apply it.</span>
+          </div>
+          <label class="field" id="baudCustomField" for="baudCustomInput" hidden>
+            <span class="field-label" data-i18n="baudCustomRate">Custom baud rate</span>
+            <input id="baudCustomInput" type="number" min="300" max="3000000" step="1" inputmode="numeric" autocomplete="off" aria-describedby="baudHint">
+          </label>
           <label class="field">
             <span class="field-label" data-i18n="uart">UART</span>
             <span class="field-row">
@@ -259,6 +303,16 @@
               </button>
             </span>
           </label>
+
+          <div id="uartModeField" class="field">
+            <label class="field-label" for="uartModeSelect" data-i18n="uartMode">BLE UART mode</label>
+            <select id="uartModeSelect" aria-describedby="uartModeHint uartTransportStatus">
+              <option value="interactive" data-i18n="uartModeInteractive">Interaction first</option>
+              <option value="reliable" data-i18n="uartModeReliable">Reliability first</option>
+            </select>
+            <span id="uartModeHint" class="field-hint"></span>
+          </div>
+          <p id="uartTransportStatus" class="field-hint" role="status" hidden></p>
 
           <label class="field">
             <span class="field-label" data-i18n="enterKey">Enter key</span>
@@ -298,10 +352,51 @@
               <span data-i18n="debugIO">Debug I/O</span>
             </label>
           </div>
+          <div class="field">
+            <button id="terminalResizeButton" class="btn btn-soft" type="button" aria-describedby="terminalResizeStatus" disabled>
+              <span class="btn-label" data-i18n="resizeTarget">Sync to current window</span>
+            </button>
+            <span id="terminalResizeStatus" class="field-hint" role="status"></span>
+          </div>
+          <div id="remoteSizeField">
+            <label class="check">
+              <input id="remoteSizeInput" type="checkbox">
+              <span data-i18n="remoteSize">Automatically sync target size</span>
+            </label>
+            <span class="field-hint" data-i18n="remoteSizeHint">A native app sends the window size once after connecting. Turn this on to follow later window changes. The soft keyboard never resizes the target tty.</span>
+          </div>
         </section>
 
-        <section class="card" data-i18n-aria="wifiWebdavAria" aria-label="WiFi and WebDAV" data-settings-page="network">
-          <div class="card-title"><span class="dot"></span><span data-i18n="wifiWebdav">WiFi &amp; WebDAV</span></div>
+        <section id="logViewCard" class="card" data-settings-page="terminal" aria-labelledby="logViewTitle">
+          <div class="card-title"><span class="dot"></span><span id="logViewTitle" data-i18n="logViewTitle">Log view</span></div>
+          <label class="field">
+            <!-- The card band above already says "Log view"; repeating it as a field
+                 label read as a duplicate heading. The control keeps the name. -->
+            <select id="logViewSelect" aria-describedby="logViewHint"
+                    data-i18n-aria="logViewTitle" aria-label="Log view">
+              <option value="reading" data-i18n="logViewReading">Reading</option>
+              <option value="raw" data-i18n="logViewRaw">Raw</option>
+            </select>
+          </label>
+          <p id="logViewHint" class="field-hint" data-i18n="logViewHint">Reading hides internal Agent probe/setup echoes and simplifies tracked commands. Device output stays visible. Raw and board WebDAV retain original UART bytes.</p>
+          <div class="btn-grid compact two-actions">
+            <button id="saveReadingLog" class="btn btn-soft" type="button"><span class="btn-label" data-i18n="saveReadingLog">Export reading log</span></button>
+            <button id="saveRawLog" class="btn btn-soft" type="button"><span class="btn-label" data-i18n="saveRawLog">Export raw log</span></button>
+          </div>
+          <div class="field shell-integration-field">
+            <span class="field-label" data-i18n="shellIntegrationTitle">Session Shell integration</span>
+            <p class="field-hint" data-i18n="shellIntegrationHint">Optional for an idle POSIX shell. Defines a temporary function without sudo or files; commands still run in sh subprocesses. Re-enable after reconnecting or starting a new chat. Disabling only changes future tracking.</p>
+            <p id="shellIntegrationStatus" class="field-hint" role="status"></p>
+            <div class="btn-grid compact two-actions">
+              <button id="shellIntegrationEnable" class="btn btn-soft" type="button" disabled><span class="btn-label" data-i18n="shellIntegrationEnable">Enable for this Shell</span></button>
+              <button id="shellIntegrationDisable" class="btn btn-soft" type="button" disabled><span class="btn-label" data-i18n="shellIntegrationDisable">Use normal tracking</span></button>
+            </div>
+          </div>
+        </section>
+
+        <section id="wifiWebdavCard" class="card" data-i18n-aria="wifiWebdavAria" aria-label="WiFi and WebDAV" data-settings-page="network">
+          <div class="card-title"><span class="dot"></span><span id="wifiWebdavTitle" data-i18n="wifiWebdav">WiFi &amp; WebDAV</span></div>
+          <div id="wifiBlock">
           <div id="wifiConnectedSummary" class="wifi-connected-summary" hidden>
             <div class="wifi-connected-network">
               <span class="wifi-connected-mark" aria-hidden="true"></span>
@@ -355,7 +450,9 @@
               <span class="btn-label" data-i18n="wifiStatus">WiFi status</span>
             </button>
           </div>
+          </div>
 
+          <div id="webdavBlock">
           <label class="field">
             <span class="field-label" data-i18n="webdav">WebDAV</span>
             <span class="field-row">
@@ -373,6 +470,113 @@
               <span class="btn-label" data-i18n="webdavStatus">WebDAV status</span>
             </button>
           </div>
+          </div>
+        </section>
+
+
+        <section id="boardLedCard" class="card board-card" data-settings-page="board" data-i18n-aria="boardLedAria" aria-label="Status LED">
+          <div class="card-title"><span class="dot"></span><span data-i18n="boardLed">Status LED</span></div>
+          <p id="boardIoBanner" class="board-banner" role="status" hidden></p>
+          <p id="boardIoHint" class="field-hint" data-i18n="boardIoHint">Available on the Linkr Bee X1.0. Commands use the encrypted management channel, not the target UART.</p>
+          <p class="field-hint" data-i18n="boardLedHint">With automatic-status firmware: blue for Bluetooth, white for WiFi, cyan for AI. UART traffic blinks. Manual colours preview for 5 seconds; AI takes priority.</p>
+          <div id="boardLedSwatches" class="board-swatches" role="group" data-i18n-aria="boardLedColors" aria-label="Status LED colours"></div>
+          <div class="field-row board-color-row">
+            <input id="boardLedColor" type="color" value="#001830" data-i18n-aria="boardLedCustom" aria-label="Custom colour">
+            <button id="boardLedApply" class="btn btn-primary" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardApply">Apply</span>
+            </button>
+            <button id="boardLedOff" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="off">Off</span>
+            </button>
+            <button id="boardLedQuery" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="refresh">Refresh</span>
+            </button>
+          </div>
+          <p id="boardLedStatus" class="field-hint board-status" role="status">–</p>
+        </section>
+
+        <section id="boardOptoCard" class="card board-card" data-settings-page="board" data-i18n-aria="boardOptoAria" aria-label="Optocoupler contact">
+          <div class="card-title"><span class="dot"></span><span data-i18n="boardOpto">Isolated contact (J5)</span></div>
+          <div class="btn-grid compact three-actions">
+            <button id="boardOptoClose" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardOptoClose">Close</span>
+            </button>
+            <button id="boardOptoOpen" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardOptoOpen">Open</span>
+            </button>
+            <button id="boardOptoQuery" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="refresh">Refresh</span>
+            </button>
+          </div>
+          <div class="field-row board-pulse-row">
+            <label class="field" for="boardOptoPulseMs">
+              <span class="field-label" data-i18n="boardOptoPulseMs">Pulse length (ms)</span>
+              <input id="boardOptoPulseMs" type="number" min="1" max="60000" step="50" value="500">
+            </label>
+            <button id="boardOptoPulse" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardOptoPulse">Pulse</span>
+            </button>
+          </div>
+          <p id="boardOptoStatus" class="field-hint board-status" role="status">–</p>
+        </section>
+
+        <section id="boardIrCard" class="card board-card board-ir-card" data-settings-page="board" data-i18n-aria="boardIrAria" aria-label="Infrared remote and learning">
+          <div class="card-title"><span class="dot"></span><span data-i18n="boardIr">Infrared remote &amp; learning</span></div>
+          <p class="field-hint" data-i18n="boardIrLearnHint">Send a NEC frame, or learn any remote's signal and keep it on the board.</p>
+
+          <div class="board-subsection">
+            <div class="board-subtitle" data-i18n="boardIrSendTitle">Send NEC frame</div>
+            <div class="field-row board-ir-form">
+              <label class="field" for="boardIrAddress">
+                <span class="field-label" data-i18n="boardIrAddress">Address</span>
+                <input id="boardIrAddress" type="text" placeholder="0x0004" spellcheck="false" autocomplete="off">
+              </label>
+              <label class="field" for="boardIrCommand">
+                <span class="field-label" data-i18n="boardIrCommand">Command</span>
+                <input id="boardIrCommand" type="text" placeholder="0x08" spellcheck="false" autocomplete="off">
+              </label>
+              <label class="field" for="boardIrRepeats">
+                <span class="field-label" data-i18n="boardIrRepeats">Repeats</span>
+                <input id="boardIrRepeats" type="number" min="0" max="16" step="1" value="0">
+              </label>
+            </div>
+            <div class="btn-grid compact two-actions">
+              <button id="boardIrSend" class="btn btn-primary" type="button" disabled="">
+                <span class="btn-label" data-i18n="boardIrSend">Send NEC</span>
+              </button>
+              <button id="boardIrQuery" class="btn btn-soft" type="button" disabled="">
+                <span class="btn-label" data-i18n="boardIrReceiver">Receiver status</span>
+              </button>
+            </div>
+            <p id="boardIrStatus" class="field-hint board-status" role="status">–</p>
+          </div>
+
+          <div id="boardLearnBlock" class="board-subsection">
+            <div class="board-subtitle" data-i18n="boardLearn">Learn a signal</div>
+            <p class="field-hint" data-i18n="boardLearnHint">Point a remote at the receiver and press a key; the frame is saved about 60 ms after the key is released.</p>
+            <div class="board-learn-row">
+              <label class="field" for="boardLearnSlot">
+                <span class="field-label" data-i18n="boardLearnSlot">Slot</span>
+                <select id="boardLearnSlot" aria-label="Learning slot"></select>
+              </label>
+              <div class="board-learn-actions">
+                <button id="boardLearnStart" class="btn btn-soft" type="button" disabled="">
+                  <span class="btn-label" data-i18n="boardLearnStart">Learn</span>
+                </button>
+                <button id="boardLearnStop" class="btn btn-soft" type="button" disabled="">
+                  <span class="btn-label" data-i18n="boardLearnStop">Stop &amp; save</span>
+                </button>
+              </div>
+            </div>
+            <p id="boardLearnStatus" class="field-hint board-status" role="status">–</p>
+          </div>
+
+          <div id="boardSavedBlock" class="board-subsection">
+            <div class="board-subtitle" data-i18n="boardSavedSignals">Saved signals</div>
+            <p class="field-hint" data-i18n="boardSavedHint">Kept in the board's NVS, so they survive reboots. Play sends one directly.</p>
+            <p id="boardSlotEmptyHint" class="field-hint board-empty" data-i18n="boardSlotsEmpty" hidden>No signals learned yet — press Learn, then a remote key.</p>
+            <div id="boardSlotList" class="board-slots" role="list"></div>
+          </div>
         </section>
 
         <section class="card" data-i18n-aria="cheatsheetAria" aria-label="Cheat sheet" data-settings-page="terminal">
@@ -389,87 +593,139 @@
           </details>
           <p class="ref-hint" data-i18n="cheatHint">Tip: click a command to send it when connected.</p>
         </section>
-        <section id="agentSettings" class="card agent-settings" data-settings-page="ai" aria-labelledby="agentSettingsTitle" hidden>
-          <div class="card-title"><span class="dot"></span><span id="agentSettingsTitle" data-ai-setting="title">AI configuration</span></div>
+        <section id="agentSettings" class="agent-settings" data-settings-page="ai" aria-labelledby="agentSettingsTitle" hidden>
           <form id="agentSettingsForm" novalidate>
             <div class="agent-settings-scroll">
-              <fieldset id="agentSettingsFields">
-                <label class="field"><span class="field-label" data-ai-setting="vendor">AI provider</span>
-                  <select id="agentVendor" aria-describedby="agentVendorHint agentSettingsStatus"></select>
-                  <span id="agentVendorHint" class="field-hint" data-ai-setting="vendorHint"></span>
-                </label>
-                <label class="field"><span class="field-label" data-ai-setting="endpoint">API base URL</span>
-                  <input id="agentEndpoint" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://api.example.com/v1" aria-describedby="agentEndpointHint agentSettingsStatus">
-                  <span id="agentEndpointHint" class="field-hint" data-ai-setting="endpointHint"></span>
-                </label>
-                <label class="field"><span class="field-label" data-ai-setting="model">Model ID</span>
-                  <input id="agentModel" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="model-id" list="agentModelOptions" aria-describedby="agentModelHint agentSettingsStatus">
-                  <!-- Filled by "Fetch model list" once the address and key are in; the
-                       input stays editable because a service may not offer the endpoint. -->
-                  <datalist id="agentModelOptions"></datalist>
-                  <span id="agentModelHint" class="field-hint" data-ai-setting="modelHint"></span>
-                </label>
-                <label class="field"><span class="field-label" data-ai-setting="key">API key</span>
-                  <input id="agentApiKey" type="password" autocomplete="off" spellcheck="false" aria-describedby="agentKeyHint">
-                  <span id="agentKeyHint" class="field-hint" data-ai-setting="keyHint"></span>
-                </label>
-                <!-- Stored-key disclosure sits next to the field, not at the bottom of the
-                     card: the question "where does this go?" is asked while typing it. -->
-                <p class="key-note">
-                  <svg class="key-note-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-                  <span data-ai-setting="keyStorage"></span>
-                </p>
-                <!-- The hard-coded ids in the presets go stale; this reads the real list
-                     once the address and key are in, and never replaces the manual field. -->
-                <button id="agentModelFetch" class="btn model-fetch" type="button" data-ai-setting="fetchModels">Fetch model list</button>
-                <p id="agentModelStatus" class="field-hint model-fetch-status" role="status" aria-live="polite"></p>
-                <details id="agentAdvancedSettings" class="agent-advanced-settings">
-                  <summary data-ai-setting="advanced">Advanced settings</summary>
-                  <div class="agent-advanced-fields">
-                    <label class="field"><span class="field-label" data-ai-setting="headers">Extra request headers</span>
+              <section class="card agent-card" id="agentModelCard">
+                <div class="card-title"><span class="dot"></span><span id="agentSettingsTitle" data-ai-setting="title">AI configuration</span></div>
+                <fieldset id="agentSettingsFields">
+                  <label class="field"><span class="field-label" data-ai-setting="vendor">AI provider</span>
+                    <select id="agentVendor" aria-describedby="agentVendorHint agentSettingsStatus"></select>
+                    <span id="agentVendorHint" class="field-hint" data-ai-setting="vendorHint"></span>
+                  </label>
+                  <label class="field"><span class="field-label" data-ai-setting="endpoint">API base URL</span>
+                    <input id="agentEndpoint" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://api.example.com/v1" aria-describedby="agentEndpointHint agentSettingsStatus">
+                    <span id="agentEndpointHint" class="field-hint" data-ai-setting="endpointHint"></span>
+                  </label>
+                  <label class="field"><span class="field-label" data-ai-setting="key">API key</span>
+                    <input id="agentApiKey" type="password" autocomplete="off" spellcheck="false" aria-describedby="agentKeyHint">
+                    <span id="agentKeyHint" class="field-hint" data-ai-setting="keyHint"></span>
+                  </label>
+                  <p class="key-note">
+                    <svg class="key-note-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                    <span data-ai-setting="keyStorage"></span>
+                  </p>
+                  <label class="field"><span class="field-label" data-ai-setting="model">Model ID</span>
+                    <input id="agentModel" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="model-id" list="agentModelOptions" aria-describedby="agentModelHint agentSettingsStatus">
+                    <datalist id="agentModelOptions"></datalist>
+                    <span id="agentModelHint" class="field-hint" data-ai-setting="modelHint"></span>
+                  </label>
+                  <div class="agent-model-actions">
+                    <button id="agentModelFetch" class="btn btn-soft" type="button" data-ai-setting="fetchModels">Fetch model list</button>
+                    <p id="agentModelStatus" class="field-hint model-fetch-status" role="status" aria-live="polite"></p>
+                  </div>
+
+
+                  <details id="agentAdvancedSettings" class="agent-inline-disclosure">
+                    <summary><span data-ai-setting="advanced">Advanced options</span></summary>
+                    <div class="agent-advanced-fields">
+                      <label class="field"><span class="field-label" data-ai-setting="headers">Extra request headers</span>
                       <textarea id="agentHeaders" rows="2" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="anthropic-dangerous-direct-browser-access: true" aria-describedby="agentHeadersHint agentSettingsStatus"></textarea>
                       <span id="agentHeadersHint" class="field-hint" data-ai-setting="headersHint"></span>
-                    </label>
-                    <label class="field"><span class="field-label" data-ai-setting="provider">API protocol</span>
+                      </label>
+                      <label class="field"><span class="field-label" data-ai-setting="provider">API protocol</span>
                       <select id="agentProvider" aria-describedby="agentProviderHint agentSettingsStatus"></select>
                       <span id="agentProviderHint" class="field-hint" data-ai-setting="providerHint"></span>
-                    </label>
-                    <label class="field"><span class="field-label" data-ai-setting="reasoning">Reasoning effort</span>
+                      </label>
+                      <label class="field"><span class="field-label" data-ai-setting="reasoning">Reasoning effort</span>
                       <select id="agentReasoning" aria-describedby="agentReasoningHint agentSettingsStatus"></select>
                       <span id="agentReasoningHint" class="field-hint" data-ai-setting="reasoningHint"></span>
-                    </label>
-                    <label class="field"><span class="field-label" data-ai-setting="contextWindow">Context window in tokens (optional)</span>
+                      </label>
+                      <label class="field"><span class="field-label" data-ai-setting="contextWindow">Context window in tokens (optional)</span>
                       <input id="agentContextWindow" type="number" min="0" max="2000000" step="1" inputmode="numeric" autocomplete="off" placeholder="0" aria-describedby="agentContextWindowHint agentSettingsStatus">
                       <span id="agentContextWindowHint" class="field-hint" data-ai-setting="contextWindowHint"></span>
-                    </label>
-                    <label class="field"><span class="field-label" data-ai-setting="maxTokens">Max output tokens (optional)</span>
+                      </label>
+                      <label class="field"><span class="field-label" data-ai-setting="maxTokens">Max output tokens (optional)</span>
                       <input id="agentMaxTokens" type="number" min="0" max="100000" step="1" inputmode="numeric" autocomplete="off" placeholder="0" aria-describedby="agentMaxTokensHint agentSettingsStatus">
                       <span id="agentMaxTokensHint" class="field-hint" data-ai-setting="limitsHint"></span>
-                    </label>
-                    <label class="field"><span class="field-label" data-ai-setting="pricing">Token prices per 1M (optional)</span>
+                      </label>
+                      <label class="field"><span class="field-label" data-ai-setting="pricing">Token prices per 1M (optional)</span>
                       <span class="field-row pricing">
-                        <input id="agentPriceInput" type="number" min="0" step="0.01" inputmode="decimal" placeholder="input" aria-label="input price per million tokens" aria-describedby="agentPricingHint agentSettingsStatus">
-                        <input id="agentPriceOutput" type="number" min="0" step="0.01" inputmode="decimal" placeholder="output" aria-label="output price per million tokens" aria-describedby="agentPricingHint agentSettingsStatus">
+                      <input id="agentPriceInput" type="number" min="0" step="0.01" inputmode="decimal" placeholder="input" aria-label="input price per million tokens" aria-describedby="agentPricingHint agentSettingsStatus">
+                      <input id="agentPriceOutput" type="number" min="0" step="0.01" inputmode="decimal" placeholder="output" aria-label="output price per million tokens" aria-describedby="agentPricingHint agentSettingsStatus">
                       </span>
                       <span id="agentPricingHint" class="field-hint" data-ai-setting="pricingHint"></span>
-                    </label>
-                  </div>
-                </details>
-              </fieldset>
+                      </label>
+                    </div>
+                  </details>
+                </fieldset>
+
+                <details id="cliproxyImport" class="agent-inline-disclosure cliproxy-import">
+                <summary><span data-ai-setting="importTitle"></span></summary>
+                <fieldset id="cliproxyFields" class="agent-advanced-fields">
+                <p class="field-hint" data-cliproxy="hint"></p>
+                <label class="field"><span class="field-label" data-cliproxy="address">CLIProxyAPI server URL</span>
+                <input id="cliproxyAddress" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="cliproxyAddressHint cliproxyStatus">
+                <span id="cliproxyAddressHint" class="field-hint" data-cliproxy="addressHint"></span>
+                </label>
+                <label class="field"><span class="field-label" data-cliproxy="management">Temporary management key</span>
+                <input id="cliproxySecret" type="password" autocomplete="off" spellcheck="false" aria-describedby="cliproxySecretHint cliproxyStatus">
+                <span id="cliproxySecretHint" class="field-hint" data-cliproxy="secretHint"></span>
+                </label>
+                <button id="cliproxyConnect" class="btn btn-primary" type="button" data-cliproxy="connect">Connect and import</button>
+                <div id="cliproxyChoices" hidden>
+                <label id="cliproxyClientField" class="field" hidden><span class="field-label" data-cliproxy="client">Choose a client API key</span>
+                <select id="cliproxyClient" aria-describedby="cliproxyStatus"></select>
+                </label>
+                <label id="cliproxyModelField" class="field" hidden><span class="field-label" data-cliproxy="model">Choose a model</span>
+                <select id="cliproxyModel" aria-describedby="cliproxyStatus"></select>
+                </label>
+                <button id="cliproxySave" class="btn btn-primary" type="button" data-cliproxy="save" disabled>Save imported configuration</button>
+                </div>
+                <button id="cliproxyCancel" class="btn" type="button" data-cliproxy="cancel" hidden>Cancel import</button>
+                <p id="cliproxyStatus" class="field-hint" role="status" aria-live="polite"></p>
+                </fieldset>
+              </details>
+              </section>
+
+              <section class="card agent-board-config" id="agentBoardConfigCard" aria-labelledby="agentBoardConfigTitle">
+                <div class="card-title"><span class="dot"></span><span id="agentBoardConfigTitle" data-ai-setting="boardConfigTitle"></span></div>
+<p class="field-hint" data-ai-setting="boardConfigHint"></p>
+            <label class="check"><input id="agentBoardConfigSecrets" type="checkbox"><span data-ai-setting="boardConfigSecrets"></span></label>
+            <div class="btn-grid">
+              <button id="agentBoardConfigSave" class="btn" type="button" data-ai-setting="boardConfigSave"></button>
+              <button id="agentBoardConfigLoad" class="btn" type="button" data-ai-setting="boardConfigLoad"></button>
+              <button id="agentBoardConfigClear" class="btn" type="button" data-ai-setting="boardConfigClear"></button>
             </div>
-            <div class="agent-settings-actions">
-              <div class="btn-grid">
-                <button id="agentSettingsSave" class="btn btn-primary" type="submit" data-ai-setting="save">Save configuration</button>
-                <button id="agentSettingsClear" class="btn" type="button" data-ai-setting="clear">Clear configuration</button>
-              </div>
-              <p id="agentSettingsStatus" class="field-hint" role="status" aria-live="polite"></p>
-            </div>
-          </form>
-          <p class="field-hint" data-ai-setting="storage"></p>
-          <p class="field-hint" data-ai-setting="notice"></p>
-          <section class="target-binding" aria-labelledby="targetBindingTitle">
-            <h3 id="targetBindingTitle" data-ai-setting="bindingTitle"></h3>
-            <p class="field-hint" data-ai-setting="bindingHint"></p>
+            <p id="agentBoardConfigStatus" class="field-hint" role="status" aria-live="polite"></p>
+              </section>
+
+        <section id="boardPromptCard" class="card board-card" data-i18n-aria="boardPromptAria" aria-label="On-board AI prompt">
+          <div class="card-title"><span class="dot"></span><span data-i18n="boardPrompt">On-board AI prompt</span></div>
+          <p class="field-hint" data-i18n="boardPromptHint">The custom instructions are stored in the board's NVS. The assistant reads them when a conversation starts, so they follow the board instead of one browser.</p>
+          <label class="field" for="boardPromptText">
+            <span class="field-label" data-i18n="boardPromptText">Custom instructions</span>
+            <textarea id="boardPromptText" rows="3" spellcheck="false" data-i18n-ph="boardPromptPlaceholder" placeholder="例如：回答前先给出结论，命令用中文解释。"></textarea>
+          </label>
+          <div class="board-prompt-meta"><span id="boardPromptCount" class="board-count">0 / 240</span></div>
+          <div class="board-prompt-actions">
+            <button id="boardPromptSave" class="btn btn-primary" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardPromptSave">Save to board</span>
+            </button>
+            <button id="boardPromptLoad" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardPromptLoad">Load</span>
+            </button>
+            <button id="boardPromptClear" class="btn btn-soft" type="button" disabled="">
+              <span class="btn-label" data-i18n="boardPromptClear">Clear</span>
+            </button>
+          </div>
+          <p id="boardPromptStatus" class="field-hint board-status" role="status">–</p>
+        </section>
+
+              <details class="card agent-card" id="agentBindingCard" aria-labelledby="targetBindingTitle">
+                <summary class="card-title"><span class="dot"></span><span id="targetBindingTitle" data-ai-setting="bindingTitle"></span></summary>
+                <div class="target-binding">
+<p class="field-hint" data-ai-setting="bindingHint"></p>
             <p id="targetBindingIdentity" class="field-hint"></p>
             <fieldset id="targetBindingFields">
               <div class="btn-grid">
@@ -481,7 +737,23 @@
               <button type="button" class="btn" id="targetRegenerate" data-ai-setting="bindingRegenerate" disabled></button>
             </fieldset>
             <p id="targetBindingStatus" class="field-hint" role="status" aria-live="polite"></p>
-          </section>
+                </div>
+              </details>
+
+              <details class="card agent-card" id="agentPrivacyCard">
+                <summary class="card-title"><span class="dot"></span><span data-ai-setting="privacyTitle"></span></summary>
+                <p class="field-hint" data-ai-setting="storage"></p>
+            <p class="field-hint" data-ai-setting="notice"></p>
+              </details>
+            </div>
+            <div class="agent-config-footer">
+              <p id="agentSettingsStatus" class="field-hint" role="status" aria-live="polite"></p>
+              <div class="agent-config-footer-actions">
+                <button id="agentSettingsSave" class="btn agent-config-save" type="submit" data-ai-setting="save">Save configuration</button>
+                <button id="agentSettingsClear" class="btn agent-config-clear" type="button" data-ai-setting="clear">Clear configuration</button>
+              </div>
+            </div>
+          </form>
         </section>
         <section id="aboutPage" class="card about-page" data-settings-page="about" aria-labelledby="aboutTitle">
           <div class="card-title">
@@ -518,6 +790,11 @@
               <span class="term-led"></span><span data-i18n="serialOutput">Serial Terminal</span>
             </span>
             <div class="term-tools">
+              <div id="serialControlGroup" class="serial-control-group" hidden>
+              <span id="serialControlStatus" class="serial-control-status" role="status" hidden></span>
+              <button id="serialControlButton" class="term-tool serial-control-button" type="button" hidden></button>
+              </div>
+              <div class="terminal-actions">
               <button id="agentButton" class="term-tool" type="button" aria-label="Serial assistant" hidden>AI</button>
               <button id="zoomOutBtn" class="term-tool" type="button" data-i18n-title="zoomOut" data-i18n-aria="zoomOut" aria-label="Decrease font">A−</button>
               <button id="zoomInBtn" class="term-tool" type="button" data-i18n-title="zoomIn" data-i18n-aria="zoomIn" aria-label="Increase font">A+</button>
@@ -529,9 +806,11 @@
                   <path d="M3 8h5V3M21 8h-5V3M3 16h5v5M21 16h-5v5"></path>
                 </svg>
               </button>
+              <button id="eventLogBtn" class="term-tool event-log-toggle" type="button" data-i18n-title="eventLogHint" data-i18n-aria="eventLog" aria-label="Event log" aria-expanded="false" aria-controls="eventLogPanel"><span data-i18n="eventLogShort">Log</span><span id="eventLogDot" class="event-log-dot" hidden aria-hidden="true"></span></button>
               <button id="autoscrollBtn" class="term-tool" type="button" data-i18n-title="autoScroll" data-i18n-aria="autoScroll" aria-label="Auto-scroll" aria-pressed="true">⤓</button>
               <button id="copyBtn" class="term-tool" type="button" data-i18n-title="copy" data-i18n-aria="copy" aria-label="Copy selection">⧉</button>
               <span class="term-hint" data-i18n="xterm">xterm.js</span>
+              </div>
             </div>
           </div>
           <div
@@ -618,6 +897,19 @@
             </div>
             <button id="terminalKeysCustomize" class="terminal-keys-customize" type="button" hidden>Choose favorite keys</button>
           </div>
+          <section id="eventLogPanel" class="event-log" hidden aria-label="Event log" data-i18n-aria="eventLog">
+            <div id="eventLogResize" class="event-log-resize" role="separator" aria-orientation="horizontal" tabindex="0" data-i18n-title="eventLogResize" data-i18n-aria="eventLogResize" title="Drag to resize the event log" aria-label="Resize event log"></div>
+            <div class="event-log-head">
+              <span class="event-log-title"><span class="dot"></span><span data-i18n="eventLog">Event log</span></span>
+              <div class="event-log-actions">
+                <button id="eventLogClear" class="term-tool event-log-clear" type="button" data-i18n="eventLogClear">Clear</button>
+                <button id="eventLogClose" class="term-tool" type="button" data-i18n-title="eventLogClose" data-i18n-aria="eventLogClose" aria-label="Close event log">×</button>
+              </div>
+            </div>
+            <div id="eventLogList" class="event-log-list" role="log" aria-live="polite" tabindex="0">
+              <p class="event-log-empty" data-i18n="eventLogEmpty">No events yet. Connection, reconnect and error messages appear here instead of in the serial terminal.</p>
+            </div>
+          </section>
         </section>
         </div>
 
@@ -625,6 +917,7 @@
           <span class="sb-item"><b id="rxCount">0</b> <span data-i18n="rx">RX</span></span>
           <span class="sb-item"><b id="txCount">0</b> <span data-i18n="tx">TX</span></span>
           <span class="sb-item"><span data-i18n="baud">Baud</span> <b id="baudLabel">115200</b></span>
+          <span class="sb-item sb-tty" id="ttySizeItem" title=""><span data-i18n="tty">TTY</span> <b id="ttySizeLabel">—</b></span>
           <span class="sb-item sb-state" id="connStateText"><span data-i18n="disconnected">Disconnected</span></span>
         </div>
       </section>
@@ -638,7 +931,8 @@
     <script src="./vendor/xterm/xterm.js"></script>
     <script src="./vendor/addon-fit/addon-fit.js"></script>
     <script type="module" src="./ble_transport.js?v=20260901-mobile1"></script>
-    <script type="module" src="./app.js?v=20261021-ble-name"></script>
+    <script type="module" src="./app.js?v=20261030-full-labels"></script>
+    <script type="module" src="./ble_guidance.js?v=20261029"></script>
     <script type="module" src="./rail_nav.js?v=20261017-v2"></script>
     <script>
       /* The terminal boots from static ES modules, so one failed request -- a

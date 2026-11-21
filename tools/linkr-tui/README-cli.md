@@ -13,7 +13,7 @@ this build has no interface and exits with status 2.
 ## Check the build
 
 ```sh
-./bee-cli --version          # bee-cli 0.1.2
+./bee-cli --version          # bee-cli 1.2.0
 ./bee-cli --capabilities     # operations, defaults and exit codes
 ./bee-cli --licenses         # third-party notice (also in THIRD_PARTY_LICENSES.md)
 ```
@@ -28,9 +28,9 @@ this build has no interface and exits with status 2.
 | LAN token | `--lan-token <TOKEN>`, `--lan-token-file <FILE>` or `$LINKR_LAN_TOKEN` |
 | Offline loopback | `--bridge -` |
 
-Management commands (`@i?`, `@u?`, `@w?`, `@d?`, `@s?`) are available only over
-BLE. On a LAN or stdio link they report that the management channel is absent
-and exit with status 1.
+Management commands (`@i?`, `@u?`, `@w?`, `@d?`, `@s?`, `@linkr bonds?` and
+the label commands) are available only over BLE. On a LAN or stdio link they
+report that the management channel is absent and exit with status 1.
 
 ## Common requests
 
@@ -42,6 +42,9 @@ bee-cli --query-wifi                   # @w?
 bee-cli --query-webdav                 # @d?
 bee-cli --query-ble-name               # @n?
 bee-cli --query-lan                    # @s?
+bee-cli --query-bonds                  # @linkr bonds? plus one label read each
+bee-cli --rename-bond 0/AA:BB:CC:DD:EE:01="Alice's phone"
+bee-cli --remove-bond 0/AA:BB:CC:DD:EE:01
 bee-cli --wifi "MySSID,MyPassword"     # join a network
 bee-cli --wifi "MySSID" --wifi-key-file pw.txt
 bee-cli --wifi-scan
@@ -71,6 +74,22 @@ For a rename or reset the C reference client prints only the board's `@n?`
 readback, not the write reply; a rename exits non-zero when the board reports
 a different name.
 
+Paired-device labels are read and changed with
+
+```sh
+bee-cli query bonds                    # --query-bonds
+bee-cli bond 0/AA:BB:CC:DD:EE:01 "Alice's phone"
+bee-cli unbond 0/AA:BB:CC:DD:EE:01
+```
+
+The flag form is `--rename-bond <type>/<address>=<label>` and
+`--remove-bond <type>/<address>`. A label is UTF-8 text, at most 48 bytes,
+stored on the board under the identity address and removed with the pairing.
+`query bonds` prints one host per line: the address, its label (or
+`(no label)`), and `[self]` for this connection. A removal is acknowledged as
+`accepted; the board removes it shortly`; the firmware delays the unpair so the
+requester can receive the acknowledgement.
+
 A command line may contain several requests; they are sent one at a time
 because the bridge answers one management question at a time. Add `--json` for
 JSON Lines suitable for a program, and `--quiet` to suppress progress on stderr.
@@ -98,7 +117,7 @@ input ends or a request says `quit`:
 
 ```sh
 bee-cli --ble-name "Linkr Bee" --serve
-{"event":"ready","program":"bee-cli","version":"0.1.2","link":"ble:name:Linkr Bee","ops":[…]}
+{"event":"ready","program":"bee-cli","version":"1.2.0","link":"ble:name:Linkr Bee","ops":[…]}
 {"id":1,"op":"state"}
 {"event":"begin","id":1,"op":"state"}
 {"event":"result","what":"state","live":false,…}
@@ -111,7 +130,11 @@ bee-cli --ble-name "Linkr Bee" --serve
 {"event":"end","id":3,"code":0}
 ```
 
-The `ops` list in the ready event reports what the current transport can serve.
+`--serve` has its own reconnect rule: when a request that needs the link
+arrives and the link is gone, that request dials it again; there is no timer
+redialling between requests. The TUI's automatic redial is therefore
+off for this mode. The `ops` list in the ready event reports what the current
+transport can serve.
 The same operations are available as flags; `--capabilities` lists the full set
 for this build. Request fields are documented by the `capabilities` output and
 the project repository.

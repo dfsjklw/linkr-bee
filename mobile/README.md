@@ -319,6 +319,55 @@ also include the assistant, and directly serving the unbuilt `web/` directory
 loads the prebuilt bundle from `web/vendor/agent/` — rebuild it with
 `tools/build_agent_bundle.sh` after changing the runtime or upgrading the SDK.
 
+## MCP server (Android)
+
+The Android app can act as an MCP server on the local network, so external AI
+clients such as Claude Desktop, Cursor, and Codex can read the console and, after
+an approval on the phone (or with the optional no-confirmation access mode), send
+input and change bridge settings. The card lives in
+**Settings → AI** as **MCP server**; it is created only when the native bridge
+(`window.LinkrMcp`) exists, so the Web, iOS, and HarmonyOS builds have no MCP
+endpoint.
+
+- The native half is `mobile/android/app/src/main/java/guru/linkr/ble/mcp/`
+  (`McpHttpServer`, `McpServerManager`, `LinkrMcpService`, `LinkrMcpPlugin`);
+  `mobile/src/mcp-native.ts` exposes it as `window.LinkrMcp`. The protocol, tool
+  catalog, approval flow, and audit live in the shared `web/mcp_server.js` and
+  `web/mcp_ui.js`.
+- The card covers enable, read-only versus read-write access (including the
+  explicit no-confirmation mode), port, listen address, token copy and rotation,
+  a client configuration snippet, and the most recent calls. A foreground-service
+  notification keeps the process alive while the app is backgrounded and can
+  stop the listener.
+- Tools cover the target console (status, journal, search, input), Linkr Bee
+  itself (`get_bee_status`, `scan_bee_devices`, `connect_bee`, `disconnect_bee`,
+  `set_bee_name`, `set_lan_bridge`), execution tracking
+  (`get_execution_status`) and the resident assistant (`get_agent_status`,
+  `start_agent_task`, `get_agent_task`, `list_agent_tasks`, `cancel_agent_task`).
+  Starting a resident task is approved once on the phone; inside that task the
+  assistant's serial writes and accessory changes run without further prompts.
+- The same listener also exposes the resident agent over A2A: a public agent card
+  at `/.well-known/agent-card.json` and JSON-RPC tasks at `/a2a`, using the same
+  bearer token. Streaming is not supported; clients poll `GetTask`. Start with
+  `TASK_STATE`/`SendMessage`/`GetTask`/`CancelTask`; the task semantics match the
+  MCP tools. See the [A2A guide](../docs/A2A.md).
+- Caveats: Android only; the bearer token travels over plain HTTP on the LAN
+  (trusted networks only); by default writes need approval on the phone (in the
+  background that approval becomes a notification when notifications are
+  enabled; otherwise it is refused); read-only mode rejects device-changing
+  tools; there are no SSE or server-initiated messages; the server stops when the
+  app process is destroyed and running resident tasks are lost; resident tasks
+  use only AI settings saved locally in the app (a board configuration is used
+  only after the user loads it); accessory tools need the BLE management channel;
+  and serial output is untrusted device data where a successful send is delivery,
+  not command completion.
+- Verification: host-JVM tests + build verified; on a phone with a real
+  accessory, reads, the approval banner, a denied request and one approved
+  serial write are verified. Configuration changes and process death are not.
+
+Full guides: [MCP server](../docs/MCP.md) · [中文](../docs/MCP.zh-CN.md) ·
+[A2A resident agent](../docs/A2A.md) · [中文](../docs/A2A.zh-CN.md).
+
 ## Regression tests
 
 ```sh
@@ -402,8 +451,10 @@ The first release is intentionally foreground-only. Do not add iOS
 `bluetooth-central` background mode until disconnect/reconnect and power behavior
 have been tested on real hardware.
 
-For a new host on C3/C5, hold GPIO1 to GND before connecting and accept OS
-pairing. WROOM ships with pairing authorization disabled, so no GPIO4 press is
+For a new host on C3/C5, press GPIO1 and connect within 30 seconds (the
+`CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS` window, 30 s by default; the key does
+not have to stay held), then accept OS pairing. WROOM ships with pairing
+authorization disabled, so no GPIO4 press is
 needed; GPIO4 is used only when
 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`. Android checks the existing bond
 and creates one only when absent; iOS handles pairing on encrypted GATT reads.

@@ -32,6 +32,8 @@ Linkr Bee 让这条控制台随时可连，不用常驻一根 USB 串口线、�
 ## 能做什么
 
 - 浏览器、手机 App、命令行三种终端，支持 ANSI 彩色与 256 色。
+- Linkr Bee X1.0 的板载面板：RGB 状态灯、隔离光耦接点、NEC 红外收发，
+  槽位/名字都存储在板上的红外学习，板载 AI 提示词，以及可选的板载 AI 配置（地址、模型、上限；API Key 默认仍只留在主机）。
 - 连接状态下改波特率、数据位、校验位、停止位和流控，默认 `115200,8,n,1,n`。
 - 回车可按 raw、CR、LF、CRLF 发送，适配 Bootloader 和不同 Shell。
 - 日志导出、WebDAV 上传，诊断面板可查固件、UART 缓冲、WiFi 和收发计数。
@@ -39,6 +41,10 @@ Linkr Bee 让这条控制台随时可连，不用常驻一根 USB 串口线、�
 - 浏览器和手机 App 内置助手：检索串口日志，按所选审批策略执行目标命令；修改桥接器
   自身的 UART、WiFi 和日志上传设置前需确认。它会记住每台目标设备的事实、统计
   本轮消耗的 token，并可以把整个排查过程导出成 Markdown 报告。
+- Android App 可在局域网内充当 MCP 服务器与 A2A agent，Claude Desktop、Cursor 等 AI
+  客户端能读取控制台，并按所选访问权限（只读、每条命令需授权、仅高危命令需授权、
+  完全授权）发送输入、修改设置，或把任务委派给 App 内的常驻助手。见
+  [MCP 服务器指南](docs/MCP.zh-CN.md) 与 [A2A 指南](docs/A2A.zh-CN.md)。
 
 ## 选择客户端
 
@@ -54,6 +60,22 @@ Linkr Bee 让这条控制台随时可连，不用常驻一根 USB 串口线、�
 
 RISC-V 64 位和 LoongArch64 Linux 的 CLI/TUI 移植具备基础条件，尚未提供 v0.1 安装包。
 依赖、构建缺口与待验证项见[架构支持评估](docs/CLI_ARCHITECTURES.zh-CN.md)。
+
+### Agent 插件
+
+[opencode-linkr-bee](linkr-bee-opencode/README.md)（英文）为
+[OpenCode](https://opencode.ai) 2.x 的 Agent 提供五个板卡工具，共用一条实时串口控制台：
+`linkr_bee_exec` 与 `linkr_bee_send` 驱动目标控制台，`linkr_bee_query` 与
+`linkr_bee_set` 读取和修改桥接设置，`linkr_bee_console` 驱动控制台面板。控制台有三种
+界面：TUI（命令面板 **Linkr Bee: open console**、Ctrl+Shift+L 或 `/linkr-bee`）、
+OpenCode 桌面应用窗口中的面板（**Linkr Bee: toggle console**、Ctrl+\`），以及插件给出
+地址的本机浏览器页面（仅限回环、带令牌，地址来自 `webUrl`）。桌面面板不会加载在
+`opencode serve` 地址的浏览器标签页里，这种情况请用浏览器页面。
+
+需要 OpenCode 2.x（已在 2.2.7 验证）、Node.js 22 或以上，以及 `bee-cli` 1.2.0 或
+以上；执行 `opencode plugin add opencode-linkr-bee` 会把它安装到全局配置。也可以在
+项目的 `opencode.json` 的 `"plugins"` 数组中列出。DeepSeek Harness 的对应插件是
+[dsh-linkr-bee](linkr-bee-dsh/README.md)（英文）。
 
 下方手机截图展示共享 Web 界面的响应式布局，不代表已完成对应平台的真机验证；各端
 验证范围见平台文档。
@@ -72,7 +94,7 @@ RISC-V 64 位和 LoongArch64 Linux 的 CLI/TUI 移植具备基础条件，尚未
         SBC 或嵌入式设备
 ```
 
-- 一台 Linkr Bee 配件：ESP32-C3 Super Mini、ESP32-C3 DevKitM、ESP32-C3 DevKitC
+- 一台 Linkr Bee 配件：Linkr Bee X1.0（MV013）、ESP32-C3 Super Mini、ESP32-C3 DevKitM、ESP32-C3 DevKitC
   或 ESP32-C5 DevKitC。
 - 一台带 UART 控制台的目标设备，三根线：目标 TX 接配件 RX、目标 RX 接配件 TX、共地。
 - 一台运行兼容浏览器、桌面终端客户端或手机 App 的主机，按上表选择。
@@ -95,14 +117,20 @@ UART 一侧是 3.3 V 逻辑电平，不是 RS-232。自行设计硬件前先看
    [开发指南](docs/DEVELOPMENT.zh-CN.md#构建)。
 
 2. 接线：交叉连接 TX/RX，并连接 GND。ESP32-C3 Super Mini 上桥接 UART 为 GPIO20 (RX)
-   和 GPIO21 (TX)，其他板子见[硬件需求](docs/HARDWARE.md#3-引脚分配)。
+   和 GPIO21 (TX)，其他板子见[硬件需求](docs/HARDWARE.md#3-引脚分配)。Linkr Bee X1.0
+   用 J7 接目标板：1=RX、2=TX、3=GND、4=可选 5 V 输入。
 
-3. 给两侧上电。所有板子在串口收发数据时都会让板载蓝灯闪烁（WROOM 为 GPIO2）。
+3. 给两侧上电。所有板子在串口收发数据时都会让活动灯闪烁（WROOM 为 GPIO2；
+   Linkr Bee X1.0 为 GPIO8 上的单线 RGB 灯）。X1.0 上还可以用 `@l`、`@o`、`@r`
+   控制这盏灯、一个隔离干接点和 NEC 红外遥控，见
+   [X1.0 硬件说明](docs/BEE_X1.0_HARDWARE.md#5-板载外设与固件命令)。
    WROOM 的自动波特率按键为 GPIO13，只在
    `CONFIG_LINKR_BLE_BRIDGE_UART_AUTOBAUD=y` 时使用（默认构建关闭）。
 
-4. 需要物理授权的板型，把配对 GPIO 接地（C3/C5 为 **GPIO1**），连接并接受系统
-   配对提示，完成后释放。WROOM 默认关闭配对授权，不需要按 GPIO4；如需启用，
+4. 需要物理授权的板型，按一下配对键（C3/C5 为 **GPIO1**，Linkr Bee X1.0
+   为 **USER_KEY/GPIO3**），并在 30 秒内连接、接受系统配对提示。这个授权窗口由
+   `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS` 控制（默认 30 秒），不需要一直按住。
+   WROOM 默认关闭配对授权，不需要按 GPIO4；如需启用，
    打开 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`。Waveshare 面板构建上
    GPIO1 是触摸 I2C 时钟，改为点屏幕上的 **PAIR** 按钮——它会打开一个 60 秒、
    一次性的配对窗口。这台主机会被记住。
@@ -122,8 +150,11 @@ UART 一侧是 3.3 V 逻辑电平，不是 RS-232。自行设计硬件前先看
 *中文界面预览，终端内容为示例 UART 输出，未连接真实设备。*
 
 - 顶部栏：连接状态、连接 / 断开、面板开关、主题、语言。
-- 终端：点进去直接输入，工具栏提供助手入口、字号、全屏、滚动到底部与复制；清屏和
-  日志导出在设置中。
+- 终端：点进去直接输入，工具栏提供助手入口、字号、全屏、**日志**、滚动到底部与复制。
+  串口终端只显示 UART 字节；App 自身的消息（连接状态、自动重连、GATT 与管理通道错误、
+  调试跟踪）收进这个「日志」抽屉，打开它不会写进终端。拖动抽屉顶部分隔条即可调整
+  高度（聚焦后用方向键 / Home / End，双击恢复默认），高度会被记住。清屏和日志导出在
+  设置中。
 - 设置面板：左侧导航分别打开连接、串口、网络、助手与关于页面；关闭面板可把空间
   留给终端。
 
@@ -167,11 +198,17 @@ Ctrl 组合。助手根据可用空间切换为上下排列或左右分栏。
 连接期间自动获取，Python 和 C 终端会打印出来。令牌只控制访问、不做加密，`ws://` 流量
 在同网段可见，请在可信网络里使用局域网模式。
 
+**关掉令牌等于把桥接器交给整个网段。** WebSocket 监听所有网卡，固件也没有校验
+`Origin`/`Host`，因此 `@s token off`（或构建时令牌为空）会让同网段任何网页或脚本都能
+**读写**目标板串口。可信实验网络之外请始终保留令牌，详见
+[局域网安全警告](docs/DEVELOPMENT.zh-CN.md#uart-over-websocket局域网桥)。
+
 ## 配对与安全
 
-- 蓝牙链路要求加密和绑定。C3/C5 每台新主机配对时把 **GPIO1** 接地授权一次；
-  WROOM 默认关闭物理授权，不需要按 GPIO4，启用
-  `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y` 后才要求拉低 GPIO4。
+- 蓝牙链路要求加密和绑定。C3/C5 每台新主机配对时按一下 **GPIO1**，并在 30 秒内
+  发起连接（Linkr Bee X1.0 为 **GPIO3/USER_KEY**）；按键打开授权窗口，不需要一直
+  按住。WROOM 默认关闭物理授权，不需要按 GPIO4，启用
+  `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y` 后才要求按 GPIO4。
 - 最多记住八台主机，重启后保留，不会自动淘汰旧主机；要加第九台，先删掉不用的或恢复
   出厂。
 - 配对使用 LE Secure Connections Just Works，没有中间人身份核验，只在能看见配件的
@@ -185,12 +222,12 @@ Ctrl 组合。助手根据可用空间切换为上下排列或左右分栏。
 
 | 现象 | 检查 |
 | --- | --- |
-| 客户端里找不到设备 | 配件已上电、在范围内，且没有连到别的主机；同一时刻只服务一条蓝牙连接 |
+| 客户端里找不到设备 | 配件已上电、在范围内。默认固件接受两个 BLE 连接，但同一时刻只有一个会话可以输入或修改设置——见[多客户端串口会话](docs/MULTI_CLIENT.zh-CN.md) |
 | 浏览器连不上 | 用 Chrome 或 Chromium，且通过 HTTPS 或 `localhost` 打开；`tools/serve_web.sh` 用的就是 `localhost` |
 | 没有输出 | 目标 TX 接了配件 RX、目标确实在输出、波特率一致 |
 | 有输出但输入没反应 | 目标 RX 接了配件 TX；除非 CTS 和 RTS 都接了，否则关掉硬件流控 |
 | 输出乱码 | UART 格式与目标一致：波特率、数据位、校验位、停止位 |
-| 没有配对提示 | C3/C5 在连接前把 GPIO1 接地；WROOM 默认不需要按 GPIO，除非启用了可选的配对授权 |
+| 没有配对提示 | C3/C5 先按一下 GPIO1，再在 30 秒内连接（Linkr Bee X1.0 为 GPIO3/USER_KEY）；窗口过期就再按一次。WROOM 默认不需要按 GPIO，除非启用了可选的配对授权 |
 | 局域网模式连不上 | 配件在 2.4 GHz 网络上、主机同网段、令牌与蓝牙通道读到的一致 |
 
 ## 已知限制

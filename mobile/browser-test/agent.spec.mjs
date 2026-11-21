@@ -1047,6 +1047,8 @@ test("target download probes tools, reports path and hash, and blocks follow-on 
   await ask(page,'Download firmware to target /tmp/fw.bin');
   await expect(page.locator('#agentMessages')).toContainText('Awaiting your next instruction.');
   await expect(page.locator('#agentMessages')).toContainText(hash);
+  // A transfer's progress, path and checksum stay visible outside folded logs.
+  await expect(page.locator('.agent-download_to_target')).toBeVisible();
   expect(await page.evaluate(()=>window.sent.some(bytes=>new TextDecoder().decode(new Uint8Array(bytes)).includes('MUST_NOT_RUN')))).toBe(false);
 });
 
@@ -1122,7 +1124,7 @@ for (const desktop of [false, true]) test.describe(desktop ? 'desktop agent comp
     await expect(page.locator('#agentQuestion')).toBeFocused();
     expect(await page.evaluate(()=>window.sent)).toEqual([]);
     await page.locator('#agentQuestion').fill('First line');
-    await page.keyboard.press('Enter');
+    await page.keyboard.press('Shift+Enter');
     await expect(page.locator('#agentQuestion')).toHaveValue('First line\n');
     await page.locator('#agentQuestion').dispatchEvent('keydown',{key:'Enter',ctrlKey:true,isComposing:true});
     expect(requests).toBe(0);
@@ -1191,6 +1193,7 @@ for (const desktop of [false,true]) test.describe(desktop?'desktop target bindin
   await expect.poll(() => page.evaluate(() =>
     window.__test.agentJournal.read({ limit: 4000 }).text.includes("root@board:~#"))).toBe(true);
   await page.evaluate(()=>window.bindingPasswordPrompt=true);
+  await page.locator('#agentBindingCard > summary').click();
   await page.locator('#targetBind').click();
   await expect(page.locator('#targetBindingStatus')).toContainText('Enter the target sudo password');
   expect(await page.evaluate(()=>window.bindingWrites)).toEqual([]);
@@ -1231,6 +1234,11 @@ for (const matches of [true, false]) test('automatic identity waits for shell an
   bleTransport.write=async (_id,_s,_c,bytes)=>{
    pending+=new TextDecoder().decode(bytes);
    if(pending.endsWith('\r')) {
+    if(pending.startsWith('stty ')) {
+     const nonce=pending.match(/LinkrTTY=([a-f0-9]{32})/)[1];
+     const [,rows,cols]=pending.match(/^stty rows (\d+) cols (\d+)/);
+     pending='';setTimeout(()=>handleIncomingBytes(new TextEncoder().encode(`\x1b]633;P;LinkrTTY=${nonce};${rows} ${cols}\x07\r\nroot@board:~# `)),30);return;
+    }
     window.identityCommands.push(pending);
     const marker=pending.match(/LINKR_ID_[a-f0-9]+/)[0],exit=pending.match(/LINKR_EXIT_[a-f0-9]+/)[0];
     pending='';setTimeout(()=>handleIncomingBytes(new TextEncoder().encode(`\r\n${marker}:${observedId}\r\n${exit}:0\r\nroot@board:~# `)),30);

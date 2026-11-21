@@ -2,49 +2,65 @@
 
 ## 用户操作
 
-配对授权输入因板而异，均内部上拉、低电平有效，引脚为 3.3 V 逻辑。C3 默认要求
-物理授权；C5 DevKitC 与 WROOM 默认关闭。C5 的 GPIO1 上没有可按的按键，面板
-构建改由屏幕上的 **PAIR** 按钮授权：
+配对授权输入因板而异，均内部上拉、低电平有效，引脚为 3.3 V 逻辑。C3、C5
+DevKitC 与 Linkr Bee X1.0 默认要求物理授权（C5 的 GPIO1 板上没有按键，需要外接
+按钮或跳线）；WROOM 默认关闭。Waveshare 面板构建上 GPIO1 是触摸 I2C 时钟，
+改由屏幕上的 **PAIR** 按钮授权：
 
 | 板型 | 配对 GPIO | 当前 board conf |
 |------|-----------|-----------------|
 | ESP32-C3 DevKitC / DevKitM / Super Mini | GPIO1 | `PAIRING_GPIO_AUTH=y` |
-| ESP32-C5 DevKitC | GPIO1（板上无按键） | `PAIRING_GPIO_AUTH=n` |
+| ESP32-C5 DevKitC | GPIO1（板上无按键，需外接按钮/跳线） | `PAIRING_GPIO_AUTH=y` |
 | Waveshare ESP32-C5-Touch-LCD-2.8（面板构建） | 无（屏幕 PAIR 按钮） | `PAIRING_GPIO_AUTH=n` + `PAIRING_AUTH_TOUCH=y` |
+| **Linkr Bee X1.0（MV013）** | **GPIO3**（USER_KEY） | `PAIRING_GPIO_AUTH=y` |
 | ESP32-WROOM-32 DevKitC | GPIO4（可选） | `PAIRING_GPIO_AUTH=n` |
 
+C5 DevKitC 正式固件仍需在 GPIO1 外接按钮或跳线。受控台架测试可显式加载
+`dev_c5_open_pairing.conf`，但该开发镜像允许附近任何主机配对，不适合正式使用；
+构建命令和风险说明见[开发文档](DEVELOPMENT.zh-CN.md#配对-gpio持久化与恢复出厂)。
 面板构建的 PAIR 按钮打开一个限时授权窗口（默认 60 s、配对成功后立即关闭），
 详见 [Waveshare C5 LCD 面板](WAVESHARE_C5_LCD.md)。
 
 配对 GPIO 不被默认 UART、LED 或恢复出厂功能占用（WROOM 的 GPIO13 仅在启用
-autobaud 时作按键，GPIO2 为活动 LED）。用按钮或跳线将配对 GPIO 接到 Bee 的 GND。
+autobaud 时作按键，GPIO2 为活动 LED）。Linkr Bee X1.0 上 GPIO3 同时是恢复出厂
+输入：上电时按住 ≥2 秒清设置，正常运行时按下则作为配对授权。用按钮或跳线将配对 GPIO 接到 Bee 的 GND。
 
 以下步骤适用于启用授权检查的板型（C3；C5 面板构建改点屏幕 PAIR，C5 DevKitC
 与 WROOM 需先设置 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`）：
 
-1. 新主机/App 首次连接前，将配对 GPIO 接地。
-2. 在客户端选择 Bee 并连接，接受操作系统配对提示。无屏设备使用
+1. 新主机/App 首次连接前，按下配对 GPIO 后松开（X1.0 上就是 USER_KEY，按一下即可）。
+2. **在 30 秒内**在客户端选择 Bee 并连接，接受操作系统配对提示。无屏设备使用
    LE Secure Connections Just Works，没有需要输入的固定 PIN。
-3. 配对成功后释放配对 GPIO。双方保存密钥，之后重连通过加密认证，无需操作引脚。
+3. 配对成功后双方保存密钥，之后重连通过加密认证，无需再按键。
 4. 换一台主机，重复上述步骤；原主机绑定保留。默认最多保存 8 台主机，仍只允许
    一条 BLE 连接同时工作。
 
-启用授权时，配对 GPIO 在收到配对请求时采样；请求被拒绝后再接地不会让旧请求
-继续，需要重新发起。新增绑定与替换旧密钥都受此门禁约束。引脚读取失败时拒绝
-配对。低电平期间附近其他主机也可申请配对，完成后及时释放。WROOM 默认关闭
-授权，因此新主机可直接配对；GATT 仍要求加密和绑定。Just Works 不提供 MITM
-身份核验。C5 DevKitC 默认也关闭，面板构建改由屏幕 PAIR 按钮打开一个限时窗口。
+启用授权时，配对 GPIO 的按下会开启一个授权窗口：按键当前仍为低电平、或最近
+`CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS`（默认 30000 ms）内按下过，收到的
+配对请求都会被接受，因此用户不需要在整个扫描/连接/配对过程中一直按住按键。
+窗口长度可用该 Kconfig 符号调整，设为 0 则恢复"配对请求到达时必须正按住"的旧
+行为（`range 0 300000`）。每个新按键都会刷新窗口，窗口内附近其他主机也可申请
+配对，因此按下按键后不要走开。请求被拒绝后按键不会让旧请求继续，需要重新发起
+配对。新增绑定与替换旧密钥都受此门禁约束，引脚读取失败时拒绝配对。WROOM 默认
+关闭授权，因此新主机可直接配对；GATT 仍要求加密和绑定。Just Works 不提供 MITM
+身份核验。
+
+Waveshare 面板构建没有可拉的 GPIO（GPIO1 是触摸 I2C 时钟），改由屏幕 PAIR
+按钮打开一个默认 60 s、配对成功后立即关闭的单次窗口。
 
 ## 客户端
 
 - Web / iOS：读取加密的 Management Protocol 特征时由系统处理配对。
   浏览器选择设备的授权不等于蓝牙绑定。如果系统未弹出配对提示，可先在系统
   蓝牙界面配对，再重连；不同浏览器/操作系统组合需实机验证。
+  Web 终端在配对被拒绝后会停止自动重连，并提示"再按一次配对键后重新连接"，
+  不会用后台重试去撞一个必须物理授权才能通过的配对。
 - Android App：连接后检查系统绑定状态；缺少绑定时调用 `createBond`，失败则
   断开连接，不继续读写串口或管理特征。
 - Python CLI：`--pair` 在 Linux 等支持的平台主动调用系统配对；macOS 在读取
-  加密特征时弹出系统配对。首次操作时，启用授权检查的板型先用跳线拉低配对 GPIO
-  或点一次面板 PAIR（C3 为 GPIO1；C5 DevKitC 与 WROOM 默认跳过），必要时增加
+  加密特征时弹出系统配对。首次操作时，启用授权检查的板型先按下配对 GPIO
+  （C3/C5 为 GPIO1，Linkr Bee X1.0 为 GPIO3/USER_KEY；WROOM 默认跳过），
+  再在 30 秒授权窗口内重试；面板构建则先点一次屏幕 PAIR，必要时增加
   `--timeout`。
   连接或配对失败以退出码 `1` 结束（终端会话中设备断开是 `3`）；先 `--scan`
   可以确认设备是否在场（它会列出全部附近设备，包括未广播名字的）。
@@ -52,19 +68,110 @@ autobaud 时作按键，GPIO2 为活动 LED）。用按钮或跳线将配对 GPI
   agent；已有绑定不删除、不强制替换。也可先通过 `bluetoothctl` 配对。
   退出码与 Python 客户端一致：`1` 连接/配对失败，`2` 参数问题，`3` 终端会话中
   设备断开；`--scan` 可先确认设备是否在场（列出全部附近设备，含无名的）。
-- HarmonyOS：使用相同加密 GATT 服务。先在系统蓝牙界面配对后连接；自动配对
-  弹窗及恢复流程仍需真机验证。
+- HarmonyOS：建立 GATT 连接后检查系统绑定状态；未绑定时主动调用 `pairDevice`
+  并等待绑定成功，再协商 MTU、发现服务及访问加密特征。正在系统配对时不重复
+  发起请求。首次连接前先按下配对 GPIO（30 秒授权窗口内发起连接），并接受系统配对
+  提示；失败或 60 秒内未完成则断开，不继续访问服务。已绑定主机跳过配对，不删除已有绑定。
+  自动配对弹窗及恢复流程仍需真机验证。
+
+## Linux 主机（Armbian/BlueZ）接入实例
+
+以下步骤在一台 Armbian 26.11（trixie，aarch64）主机上实际执行通过。该主机使用
+板载 SDIO 蓝牙控制器和 BlueZ 5.82，没有额外安装蓝牙驱动或图形工具。
+
+### 主机自带组件
+
+Armbian 基础镜像已经包含 `bluez`（`bluetoothd`、`bluetoothctl`）、`btmgmt` 和
+已启用的 `bluetooth.service`。先用下面几条命令确认；最小化镜像缺少时执行
+`sudo apt install bluez` 即可，`btmgmt` 随 `bluez` 一起安装。
+
+```sh
+systemctl is-active bluetooth
+bluetoothctl --version
+command -v bluetoothctl btmgmt
+```
+
+`hciconfig -a` 或 `bluetoothctl show` 应能看到一个 `UP RUNNING` 的控制器。
+主机有多个控制器时，用 `bluetoothctl select <MAC>` 固定要用的那个。
+
+### 让控制器可绑定
+
+部分发行版默认不设置 `bondable`，主机侧会表现为配对立即失败。设为可绑定并
+保持上电：
+
+```sh
+sudo btmgmt power off
+sudo btmgmt bondable on
+sudo btmgmt power on
+btmgmt info | grep "current settings"   # 应包含 bondable
+```
+
+### 用默认代理完成配对
+
+`bluetoothctl` 的 `pair` 需要在会话内注册代理，否则系统确认请求无人应答，
+BlueZ 会直接回绝。主机侧能看到 `new_auth() No agent available for request`，
+最终报 `org.bluez.Error.AuthenticationFailed` 或 `Numeric comparison failed`。
+无屏主机用 `NoInputNoOutput` 代理即可：
+
+```sh
+bluetoothctl
+[bluetooth]# agent NoInputNoOutput
+[bluetooth]# default-agent
+[bluetooth]# scan on
+# 看到 Bee 的地址后
+[bluetooth]# pair CD:A2:F6:29:D3:12
+[bluetooth]# trust CD:A2:F6:29:D3:12
+[bluetooth]# info CD:A2:F6:29:D3:12
+```
+
+`info` 中出现 `Paired: yes`、`Bonded: yes`、`Trusted: yes` 即完成。首次配对需要
+按板子的配对 GPIO 打开 30 秒授权窗口（见上一节）；已绑定后重连不再需要按键。
+如果之前删除过设备记录，先 `scan on` 重新发现再 `pair`，否则会报
+`Device ... not available`。
+
+配对完成后建议先 `disconnect`，让 CLI/TUI 自己建立连接，避免两个进程争用同一条
+LE 链路：
+
+```sh
+bluetoothctl disconnect CD:A2:F6:29:D3:12
+```
+
+### 安装 CLI/TUI
+
+主机只需要可执行文件，不必安装 Rust。两种方式任选：
+
+1. 从 [Releases](https://github.com/radxa/linkr-bee/releases) 下载与本机架构匹配的
+   `linkr-bee-<version>-<target>` 压缩包（aarch64 主机用 `aarch64-unknown-linux-gnu`，
+   文件名形如 `linkr-bee-1.2.0-aarch64-unknown-linux-gnu.tar.gz`），校验
+   `SHA256SUMS` 后解压，把 `bee` 放到任意目录；
+2. 在开发机上按[主机终端说明](../tools/linkr-tui/README.md)执行
+   `cargo build --release -p linkr-tui`，再把 `target/release/bee` 复制到目标主机。
+   目标机的 glibc 版本不能低于构建机。
+
+本实例采用第二种：把同架构的 aarch64 `bee` 复制到主机的临时目录后直接运行，
+目标机没有安装 Rust 或交叉工具链。
+
+### 连接与验证
+
+```sh
+./bee --ble-address CD:A2:F6:29:D3:12 --query-info --no-terminal
+./bee --ble-address CD:A2:F6:29:D3:12        # 打开 TUI
+```
+
+`--query-info` 返回 `fw version=…` 即链路可用。未指定 `--ble-address` 时会扫描
+并列出附近设备；有多台同名 Bee 时必须用地址指定。TUI 的完整按键见
+[主机终端说明](../tools/linkr-tui/README.md)。
 
 ## 绑定丢失、存储与恢复
 
 - Bee 使用 Zephyr `BT_SETTINGS` 在 NVS 中保存绑定密钥，并在开始广播前恢复。
 - 主机端“忽略设备”不会删除 Bee 端记录；主机密钥丢失后，启用授权检查的板型
-  重新配对仍需拉低配对 GPIO，WROOM 默认不需要。
+  重新配对仍需按下配对 GPIO 并在这 30 秒窗口内发起配对，WROOM 默认不需要。
 - 默认 `BT_MAX_PAIRED=8`，`BT_KEYS_OVERWRITE_OLDEST=n`，满时不自动移除旧主机。
 - 恢复出厂会同时清除全部绑定、BLE identity 和其他保存的设置：C3 在上电时
   持续拉低 GPIO0 至少 2 秒；C5 为 GPIO28，WROOM 为 GPIO27。C3 Super Mini 的
   BOOT 引脚不是 GPIO0，请按板级接线操作。恢复出厂后主机也应忽略旧记录；
-  启用授权检查的板型再拉低配对 GPIO 重新配对，WROOM 默认直接重连。
+  启用授权检查的板型再按一下配对 GPIO 并在窗口内重新配对，WROOM 默认直接重连。
 - 配对 GPIO 仅授权配对，长期拉低不会清空已有设置。本版不提供无线删除单个绑定接口。
 
 ## 固件保证与范围
@@ -88,12 +195,13 @@ Management、Reliable UART 和兼容 NUS 的特征值及 CCC 均要求加密访�
 | 步骤 | 预期 |
 | --- | --- |
 | 清空测试主机绑定，配对 GPIO 悬空/高，尝试配对及 GATT 读写/订阅 | 拒绝配对；三个服务不泄露数据 |
-| 配对 GPIO 拉低，主机 A 配对 | 成功并可使用 UART/管理服务 |
+| 按下配对 GPIO 后松开，30 秒内主机 A 发起配对 | 成功并可使用 UART/管理服务 |
+| 按下配对 GPIO 后超过窗口（默认 30 秒）才发起配对 | 拒绝配对 |
 | 释放配对 GPIO，断开并重连 A | 复用密钥成功 |
 | Bee 断电重启，再连接 A，配对 GPIO 高 | 绑定恢复，仍可使用 |
-| 配对 GPIO 高，主机 B 申请配对 | 拒绝，A 绑定仍可用 |
-| 配对 GPIO 低，B 配对，然后释放 | A、B 均可分别重连 |
-| A 忽略绑定，配对 GPIO 高/低分别重配 | 高拒绝、低允许替换密钥 |
+| 未按键且超过授权窗口，主机 B 申请配对 | 拒绝，A 绑定仍可用 |
+| 按下配对 GPIO 后在窗口内让 B 配对 | A、B 均可分别重连 |
+| A 忽略绑定，未按键/窗口内分别重配 | 拒绝；窗口内允许替换密钥 |
 | 绑定表满后新增主机 | 拒绝，不淘汰原绑定 |
 | 普通固件更新不擦设置区后重连 | 原绑定继续有效 |
 | 执行板级恢复出厂 | 全部绑定清空，配对 GPIO 高时旧主机不能重新配对 |
@@ -102,3 +210,50 @@ Management、Reliable UART 和兼容 NUS 的特征值及 CCC 均要求加密访�
 换成屏幕 PAIR 按钮），WROOM 默认关闭授权、手工启用时才是 GPIO4。建议覆盖
 C3/C5/WROOM、Android、iOS、桌面 Chrome 与 Linux BlueZ，并在配对
 期间并发 UART 流量及 WiFi 活动验证栈和内存余量。
+
+### Manage saved hosts
+
+In **Settings → Connection → Paired devices**, refresh the list and remove an
+individual pairing. The list uses Bluetooth identity addresses (public/random),
+not host names or temporary scan addresses, and marks the current host.
+Deletion requires the current control owner and confirmation. Removing a connected
+host disconnects it; removing this host stops browser automatic reconnection.
+Forget the old pairing in the host OS before pairing again under the board's
+normal physical-authorization policy. Other hosts and target-machine bindings
+are preserved. Older firmware without this command hides the card.
+
+Each pairing can also carry a **display label** (for example "Alice's phone"),
+stored on the board in NVS under the bond's identity address. The label is
+display-only and is never authenticated. The web and phone editors report it once
+from the browser's user agent when the board stores none (a native shell cannot read the phone's own
+Bluetooth name; the connected accessory's name is the board's, not the host's),
+and the TUI reports the local user name once for this host's own pairing. The
+owner can always edit or clear it. Deleting a pairing deletes its label too.
+
+The encrypted BLE management commands are `@linkr bonds?` (read-only),
+`@linkr bonds remove <type>/<address>` (control owner only), for example
+`@linkr bonds remove 0/AA:BB:CC:DD:EE:01`, and
+`@linkr bonds label <type>/<address> [<hex>|clear]`. Type 0 is public, 1 is
+random. A label travels hex-encoded because it is UTF-8 text; a bare address is
+a read-only query (`OK bonds label=<address> none` or
+`OK bonds label=<address> hex=<hex>`), while writing or clearing another host's
+label needs the control owner.
+
+The earlier self-only form is kept for existing clients:
+`@linkr bonds name <label>` names the caller's own pairing and needs no console
+ownership, and `@linkr bonds names?` returns every stored name as
+`NAME <type>/<address> "<label>"` lines. The listing is capped at 32 bytes so
+eight maximal lines still fit one reply; the per-address form above returns the
+full label. A host can therefore rename itself without taking control, while an
+owner can still rename or clear any pairing.
+
+The firmware rejects labels that are not displayable UTF-8 (including C0/C1
+controls) and stores at most 48 bytes by default. The list never carries labels,
+because eight of them would overflow the reply: read one address at a time. The
+web and TUI clients cap their own label input at 48 bytes; a build that changes
+`LINKR_BLE_BRIDGE_BOND_LABEL_MAX` must change the clients too.
+The removal acknowledgement `OK bonds queued` means accepted, not completed;
+queries report `pending` and the last removal `result` (zero on success).
+The firmware delays removal briefly so even the current host can receive the
+acknowledgement before its encrypted connection is closed. A lost acknowledgement
+does not prove failure; reconnect and refresh to verify.

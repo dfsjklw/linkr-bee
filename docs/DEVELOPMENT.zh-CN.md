@@ -5,6 +5,8 @@
 本文集中说明固件构建与刷写、UART 集成、控制命令、测试模式、客户端工具、
 通信协议和 Kconfig 配置。
 
+多连接容量、单输入控制权及暂缓的 Linkr 适配范围见[多客户端串口会话](MULTI_CLIENT.zh-CN.md)。
+
 基于 Zephyr 的 ESP32-C3/C5/WROOM BLE 串口桥应用。第一个里程碑是一个纯粹的蓝牙 LE UART 窗口：
 
 - BLE 外设以 `Linkr Bee XXXX` 广播；`XXXX` 是硬件 MAC 最后四位十六进制
@@ -46,32 +48,44 @@ Linkr 端通过上方 BLE 配件 API 文档实现发现、串口、配网和局�
 
 ## 快速开始
 
-5 步完成固件构建和运行：
+从零准备 workspace，然后构建、刷写并连接：
 
 ```sh
-# 1. 克隆并进入工作区
-git clone https://github.com/radxa/linkr-bee.git
+# 0. 准备：Python 3、git、cmake、ninja，并安装 west
+python3 -m pip install --user west
+
+# 1. 只建一次 west workspace；manifest 把应用仓库放在 `linkr-bee` 子目录
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0、hal_espressif、mbedtls、tf-psa-crypto、hostap
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# 2. 安装 Zephyr SDK 1.0.1：RISC-V 与 Xtensa 两套工具链
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+
+# 3. 在应用目录里构建 ESP32-C3 Super Mini 固件（默认 WiFi + BLE）
+#    也可在 workspace 根目录执行 `west build -b <板型> linkr-bee`
 cd linkr-bee
+west build -b esp32c3_supermini .
 
-# 2. 构建 ESP32-C3 Super Mini 固件（默认 WiFi + BLE）
-west build -b esp32c3_supermini linkr-bee
-
-# 3. 刷写到设备
+# 4. 刷写到设备
 west flash
 
-# 4. 通过 Python 终端连接
+# 5. 通过 Python 终端连接
 python3 tools/linkr_ble_terminal.py
 
-# 5. 或启动 Web 终端
+# 6. 或启动 Web 终端
 tools/serve_web.sh  # 打开 http://127.0.0.1:8765/
 ```
 
-> **注意**：需要 Zephyr v4.4.1 west workspace，且 manifest 中包含 Espressif HAL blobs。详见[构建](#构建)章节。
+> **注意**：需要 Zephyr v4.5.0 west workspace，且 manifest 中包含 Espressif HAL blobs。详见[构建](#构建)章节。
 
 ## 支持环境
 
 - 固件目标：ESP32-C3 DevKitM、DevKitC、Super Mini 与 ESP32-C5 DevKitC
-- Zephyr：**v4.4.1**
+- Zephyr：**v4.5.0**
+- Zephyr SDK：**1.0.1**（工具链单独编号，4.5.0 是 RTOS 版本）
+- 构建主机：Python **3.12+**、CMake **3.28+**
 - 同一份固件源码包含：BLE UART bridge、WiFi station 控制、匿名 HTTP WebDAV
   日志上传与 UART-over-WebSocket 局域网访问。WebDAV 在默认 C3/C5 构建中开启；
   ESP32-WROOM 因 DRAM 不足关闭（`CONFIG_LINKR_BLE_BRIDGE_WEBDAV=n`），主机端仍保留
@@ -79,40 +93,137 @@ tools/serve_web.sh  # 打开 http://127.0.0.1:8765/
 
 ## 构建
 
-请使用 Zephyr v4.4.1 的 west workspace。默认的 WiFi 构建还要求 west manifest
-内存在 Espressif HAL blobs（`modules/hal_espressif`）。
+### 更新已有工作区
 
-在该 workspace 中：
+更新本应用后，在 west 工作区根目录执行：
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee
+west update
+python3 -m pip install -r zephyr/scripts/requirements.txt
+west blobs fetch hal_espressif
+west build -p always -b linkr_bee_x1_0 linkr-bee
 ```
 
-或 DevKitC：
+其他硬件请选用下文对应的板型。从 4.4.1 升级时用 `-p always` 重建构建目录；
+Zephyr 4.5.0 仍使用 SDK 1.0.1。本次迁移将手动 DHCP 控制改为
+`CONFIG_WIFI_STA_AUTO_DHCPV4=n`，在 HCI 驱动公共数据中安装加密事件排序回调，
+并用 `ring_buf_consume()` 丢弃 WebSocket 队列旧数据。Bee X1.0 板级定义改为
+选择通用 ESP32-C3 SoC，并显式声明 4 MB flash。
+
+Zephyr 4.5 的射频与网络代码占用更多 SRAM。默认配置保留原有服务与客户端数量，
+通过缩小有界队列适配：
+
+| 目标 | 4.5 内存预算 |
+| --- | --- |
+| C3 / Bee X1.0 | WiFi 动态 RX/TX 各 8 个、WiFi 堆预留 40 KiB、每个 BLE peer 8 块、延迟日志 4 KiB、HTTP/系统/连接线程栈各 4 KiB |
+| C5 | WiFi 动态 RX/TX 各 6 个、WiFi 堆预留 36 KiB、Bluetooth 堆预留 44000 B、12 个 MSYS-2 块、8 个 255 B 控制器 ACL 缓冲、网络缓冲各 20 个、包描述符各 10 个 |
+| WROOM | 保持 52000 B 系统堆，UART 接收 4 KiB、每个 BLE peer 4 块、LAN 环形缓冲 1 KiB、HTTP 栈 4 KiB、LAN 客户端栈 3 KiB |
+
+Bee X1.0 另外将主线程栈设为 2 KiB、日志线程栈设为 1 KiB。Zephyr 4.5 诊断镜像在
+空闲、BLE 管理与数据收发、WiFi 扫描及 1500000 波特率 UART 回环中，分别测得
+1092 B 和 732 B 的栈峰值。板级定义启用 `trng0`，使用硬件熵源；计入活动灯状态开销和
+下文 HTTP poll 预算后，正式镜像的 libc 可用堆区从 13536 B 增至 15456 B。
+其他板型保留现有栈预算。
+
+RGB 活动灯只在流量开始时和停止 40 ms 后各更新一帧。UART 每次收到数据只延长截止时间，
+不再重复写入同一颜色或提交工作，避免 WS2812 驱动的 300 微秒锁存等待反复占用系统
+工作队列。Bee X1.0 使用相同的 60 秒板端 FIFO 回环发压器，吞吐从 89278 B/s 提升到
+150034 B/s，9002240 字节全部接收，零误码、零 RX 环形缓冲丢失。名义
+1500000、8N1 配置的分频回读为 1500586 波特率；这是同板 TX/RX 回环，未使用外部仪器
+测量位时钟。发压器仅用于诊断，正式 C3 TX 仍使用 `uart_poll_out()`。
+
+Bee X1.0 保留 16 KiB UART 环形缓冲和每个 BLE peer 八块队列。持续 UART 输入可能超过
+主机 BLE 的接收速度：另一组不限速测试中，UART RX 校验正常，但 BLE 输出丢弃了
+9664576 字节。增大缓冲只能吸收突发，持续无损传输需要上游节流、流控或吞吐足够的传输链路。
+
+HTTP/WebSocket 桥接默认将 `CONFIG_ZVFS_POLL_MAX` 设为 5。HTTP/1 的 poll 需要一个唤醒
+eventfd、每个服务一个监听器，以及每个尚未完成 HTTP/升级处理的客户端一个事件；一个
+服务、两个客户端共需四个事件。该预算与 `CONFIG_ZVFS_EVENTFD_MAX=2` 的对象池独立。
+`ws_bridge.c` 在编译时检查 HTTP fd 容量，也计入额外的 HTTP/3 监听器和流；自定义增大
+客户端或服务数量时必须配套提高 poll 预算，否则同时握手可能使 poll 返回 `ENOMEM`，
+重启监听器并关闭当时尚未升级的 HTTP 连接。
+在 32 位 ESP32 上，预算从三格增至五格会使 socket-service 静态 poll 表增加 16 B；
+每次 poll 调用多两个局部 `k_poll_event`（栈帧对齐前共 40 B），线程栈配置大小保持不变。
+
+C5 保持已有实测线程栈预算，WiFi 堆与网络缓冲仍在内部 SRAM，仅应用数据使用 PSRAM。
+可选 WiFi IRAM 速度优化关闭，HAL 早期日志保留告警与错误；自定义增大射频池后会回退到
+上游堆预留值。较小的队列降低了突发承载能力，发布前需真机复测配对、扫描/连接、两个
+BLE peer、LAN 转发、WebDAV 上传、栈水位与丢包计数。
+
+请使用 Zephyr v4.5.0 的 west workspace。默认的 WiFi 构建还要求 west manifest
+内存在 Espressif HAL blobs（`modules/hal_espressif`）。
+
+刚克隆的仓库只是 workspace 的应用部分。先在 workspace 根目录完成一次性准备：
 
 ```sh
-west build -b esp32c3_devkitc linkr-bee
+python3 -m pip install --user west
+mkdir linkr-workspace && cd linkr-workspace
+west init -m https://github.com/radxa/linkr-bee.git --mr main
+west update            # Zephyr v4.5.0、hal_espressif、mbedtls、tf-psa-crypto、hostap
+west zephyr-export
+python3 -m pip install -r zephyr/scripts/requirements.txt
+
+# Zephyr SDK 1.0.1：C3/C5 用 RISC-V，WROOM 用 Xtensa
+west sdk install -t riscv64-zephyr-elf -t xtensa-espressif_esp32_zephyr-elf
+# 也可下载 zephyr-sdk-1.0.1_<host>.tar.xz 后执行其 ./setup.sh
+```
+
+`west update` 会拉取 `hal_espressif`（WiFi 构建需要的 ESP32 HAL blobs）以及
+C5 控制器配对依赖的 mbedTLS/hostap 模块；缺这些模块时 C3/C5 会直接配置失败，
+而不是悄悄丢掉配对能力。
+
+然后在应用目录里构建——下面的板型列表就是 `tools/verify.sh` 与 CI 使用的列表：
+
+```sh
+cd linkr-bee
+```
+
+ESP32-C3 DevKitM：
+
+```sh
+west build -b esp32c3_devkitm .
+```
+
+ESP32-C3 DevKitC：
+
+```sh
+west build -b esp32c3_devkitc .
 ```
 
 ESP32-C3 Super Mini：
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_supermini .
 ```
 
 ESP32-C5 DevKitC：
 
 ```sh
-west build -b esp32c5_devkitc/esp32c5/hpcore linkr-bee
+west build -b esp32c5_devkitc/esp32c5/hpcore .
+```
+
+ESP32-WROOM-32（`esp32_devkitc/esp32/procpu`）由 CI 构建；它的默认配置因 DRAM
+关闭 WebDAV，以 CI 为准：
+
+```sh
+west build -b esp32_devkitc/esp32/procpu .
+```
+
+Linkr Bee X1.0（MV013）量产板：板级定义在本仓库
+`boards/radxa/linkr_bee_x1_0`，`CMakeLists.txt` 已把应用根目录登记为
+`BOARD_ROOT`，不需要额外的 CMake 参数：
+
+```sh
+west build -b linkr_bee_x1_0 .
 ```
 
 ### GitHub Actions 构建与刷写
 
 `.github/workflows/build.yml` 使用矩阵构建五块板的默认 WiFi + BLE 配置：
-`esp32c3_supermini`、`esp32c3_devkitm`、`esp32c3_devkitc`、
+`esp32c3_supermini`、`esp32c3_devkitm`、`esp32c3_devkitc`、`linkr_bee_x1_0`、
 `esp32c5_devkitc/esp32c5/hpcore` 与 `esp32_devkitc/esp32/procpu`
 （ESP32-WROOM-32）。它会在 `main` push、pull request 和手动触发时运行，
-使用 Zephyr v4.4.1 与 Zephyr SDK 1.0.1；每个 job 只安装该板需要的工具链
+使用 Zephyr v4.5.0 与 Zephyr SDK 1.0.1；每个 job 只安装该板需要的工具链
 （RISC-V 目标用 `riscv64-zephyr-elf`，WROOM 用
 `xtensa-espressif_esp32_zephyr-elf`），不拉取完整 CI 镜像。
 
@@ -155,6 +266,38 @@ GPIO11/12 上的 `uart1`。若不存在桥专用 chosen 节点，应用回退到
 - TX：GPIO21
 - 活动 LED：GPIO8 蓝色 LED，在 UART 收发活动时闪烁
 - 恢复出厂：GPIO0，固件启用内部上拉；启动时可与 GND 短接
+
+### Linkr Bee X1.0 板级支持与板载外设
+
+`boards/radxa/linkr_bee_x1_0/` 是完整的 out-of-tree Zephyr 板级定义
+（board.yml、Kconfig、defconfig、pinctrl、DTS）：裸 ESP32-C3FH4、USB
+Serial/JTAG console、UART0（GPIO20/21）作桥接口、SW1（GPIO3）作配对/恢复
+出厂键，另外描述了三块仅本板有的外设：
+
+| devicetree 节点 / alias | binding | 硬件 | 固件 |
+| --- | --- | --- | --- |
+| `linkr-rgb` | `radxa,linkr-ws2812` | GPIO8 上的 U1 WS2812 兼容 RGBIC | `src/linkr_ws2812.c`、`src/linkr_status_led.c` |
+| `linkr-opto` | `radxa,linkr-opto-switch` | GPIO10 控制的 Q1 光耦干接点 | `src/linkr_opto.c` |
+| `linkr-ir` | `radxa,linkr-ir` | GPIO0 红外发射（LEDC 38 kHz 载波）+ GPIO1 接收 | `src/linkr_ir.c`、`src/ir_nec.c`、`src/ir_learn.c` |
+
+binding 在 `dts/bindings/linkr/`。没有对应节点的板子上这些源文件编译成桩，
+`@l`/`@o`/`@r` 命令返回 `ERR ... unsupported`，同一份固件树仍服务全部板型。
+
+Kconfig：`CONFIG_LINKR_BLE_BRIDGE_RGB_STATUS_LED`、
+`CONFIG_LINKR_BLE_BRIDGE_RGB_ACTIVITY_COLOR`、
+`CONFIG_LINKR_BLE_BRIDGE_OPTO_SWITCH`、`CONFIG_LINKR_BLE_BRIDGE_IR`、
+`CONFIG_LINKR_BLE_BRIDGE_IR_TX`、`CONFIG_LINKR_BLE_BRIDGE_IR_RX`，以及
+`CONFIG_LINKR_BLE_BRIDGE_IR_LEARN*`（原始波形学习/回放，存 NVS，槽位数、
+最大段数、静默时间与超时都可配）。
+
+没有板子时可以用 `/?demo=board` 预览：`web/demo_mode.js` 用与固件一致的回复
+模拟管理通道（包括一次红外学习过程），`mobile/browser-test/demo_mode.spec.mjs`
+保证模拟数据和面板解析同步。
+
+硬件细节、引脚表与必须在量产前修的 PCB 问题见
+[Linkr Bee X1.0 硬件说明](BEE_X1.0_HARDWARE.md)（最要紧的两条：GPIO8 上的
+C31 100 nF 必须去掉；GPIO12–17 被 FH4 封装内 flash 占用）。
+`tools/verify.sh` 会构建该板并断言 FH4 与 RGB/光耦/IR 配置。
 
 ## SBC UART 设置
 
@@ -238,7 +381,7 @@ WiFi 凭据默认只保存在 RAM，重启即丢失。仅在量产设备已经�
 普通 C3 构建即包含：
 
 ```sh
-west build -b esp32c3_supermini linkr-bee
+west build -b esp32c3_supermini .
 ```
 
 ESP32-C3 SoC WiFi 驱动是 `CONFIG_WIFI_ESP32`（定义于 `drivers/wifi/esp32/Kconfig.esp32`），它会自动 select L2/ethernet/mgmt 层和 MBEDTLS。STA 模式由 `CONFIG_WIFI_USAGE_MODE_STA` choice 选择。
@@ -250,6 +393,16 @@ ESP32-C3 SoC WiFi 驱动是 `CONFIG_WIFI_ESP32`（定义于 `drivers/wifi/esp32/
 
 `src/wifi.c` 中的应用代码使用标准 `net_mgmt` / `wifi_mgmt` API（`NET_REQUEST_WIFI_CONNECT`、`NET_EVENT_WIFI_CONNECT_RESULT`），并在连接成功时自行启动 DHCPv4，因此无需 `CONFIG_NET_CONFIG_AUTO_INIT`。
 
+`@w scan` 的看门狗时限由 `CONFIG_LINKR_BLE_BRIDGE_WIFI_SCAN_TIMEOUT_MS` 决定。
+ESP32-C5 是双频芯片，其 WiFi 驱动会忽略请求里的频段位图，因此一次完整扫描
+（实测 16–18 个 AP，含 5 GHz 信道）稳定耗时约 19.7 秒；把扫描限制到 2.4 GHz、
+把每信道驻留时间压到 60–100 ms 都不会缩短它，断开 BLE 也不影响，所以这不是
+共存调度问题。C5 板级配置把该时限提到 30 秒（默认 15 秒会让每次扫描都在驱动
+回报完成前 4–5 秒被看门狗释放，表现为 `@scan error`）；C3 扫描更快，保留默认值。
+Python CLI 的 `WIFI_SCAN_TIMEOUT` 和 Rust CLI/TUI 的 `device::SCAN_TIMEOUT` 均为 35 秒，
+为 C5 的 30 秒扫描看门狗及结果发送留出余量。Rust 的原 20 秒上限已同步调整；
+若定制固件进一步增大扫描时限，需同步调整客户端等待时间。
+
 ### UART over WebSocket(局域网桥)
 
 WiFi 拿到 IP 地址后,固件还会把桥接 UART 暴露为 WebSocket 端点,局域网客户端可完全绕过 BLE 的距离与 MTU 限制:
@@ -257,11 +410,18 @@ WiFi 拿到 IP 地址后,固件还会把桥接 UART 暴露为 WebSocket 端点,�
 - 端点:`ws://<设备 IP>/ws`(端口由 `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_PORT` 决定,默认 80)
 - 协议:二进制 WebSocket 帧双向承载原始 UART 字节,没有任何额外封装——发什么就写进 UART,UART 收到什么就广播给所有已连接客户端
 - 客户端数:最多 `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_MAX_CLIENTS` 个(默认 2),每个客户端独立 TX 环形缓冲;慢客户端丢弃最旧数据,不会拖慢桥
-- 运行时控制:`@s on|off|?`、`@s token…`;开关状态与局域网访问令牌都持久化到 settings。`@i?` 诊断包含 `@info ws state=up port=80 clients=N tx=… rx=… dropped=…`（不含令牌）
+- 运行时控制:`@s on|off|?`、`@s token…`;开关状态与局域网访问令牌都持久化到 settings。`@i?` 诊断包含 `@info ws state=up port=80 clients=N tx=… rx=… dropped=…`（不含令牌;`dropped` 在客户端连接时清零）
 - 局域网访问令牌:首次启动生成 128 位随机令牌并保存,默认不再对全网开放。`@s?` 经加密 BLE 通道返回,`@s token` 重新生成,`@s token=<32 位十六进制>` 指定,`@s token off` 回到无鉴权。握手协议见 [BLE 配件 API v1](LINKR_BLE_API.zh-CN.md) 第 8 节
 - 兼容开关:`CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN`（32 位小写十六进制）用于产线固定令牌,优先级高于自动生成
 - 可选门槛:`CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN` 要求客户端在 3 秒内把 token 作为首条文本帧发送
 - 整体关闭:`-DCONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE=n`
+
+> **警告：局域网模式关掉令牌后对整个网段开放。** 桥接器监听 `0.0.0.0`，固件也不
+> 校验 `Origin`/`Host`，能访问 `ws://<设备 IP>/ws` 的网页或脚本都能直接建立连接。
+> 执行 `@s token off`，或让 `CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN` 为空，
+> 就等于彻底关闭鉴权：同一网段的任何人都能**读写目标板串口**。除可信实验网络外，
+> 请始终保留令牌；轮换用 `@s token`，随后重新配对客户端。桥接只提供明文 `ws://`，
+> 没有 TLS。
 
 Web 终端(`web/`)的「连接」卡片里有 BLE/局域网切换;局域网模式连接 `ws://<主机>/ws`,终端输入、快捷命令、计数器照常工作,仅 BLE 专属的控制按钮(`@u`/`@w`/`@d`/`@i?`)被禁用。当 BLE 诊断拿到 IP 时,局域网地址输入框会自动预填。WebDAV 日志上传并行运行不受影响。
 
@@ -272,11 +432,28 @@ BLE 路径丢弃的数据不会在重连后补发。
 ### 配对 GPIO、持久化与恢复出厂
 
 固件启用 LE Secure Connections Just Works 配对、绑定和加密 GATT 访问。
-C3/C5 在新增主机或替换旧密钥时，需要在请求到达前将 GPIO1 拉低。WROOM 的
+C3/C5 在新增主机或替换旧密钥时，需要先按下 GPIO1 打开 30 秒授权窗口。WROOM 的
 board conf 默认 `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=n`，不需要按
 GPIO4；只有把该选项设为 `y` 时，GPIO4 才作为物理授权输入。已有绑定的加密
-重连无需操作配对 GPIO。默认最多保存 8 台主机，不自动淘汰旧绑定；满后通过
+重连无需操作配对 GPIO；新主机配对需在按下配对键后的 30 秒授权窗口内发起
+（`CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS`，设为 0 恢复“请求时必须按住”）。
+默认最多保存 8 台主机，不自动淘汰旧绑定；满后通过
 恢复出厂清空。接线、客户端操作和验收方法见[蓝牙配对](BLE_PAIRING.md)。
+
+C5 DevKitC 需要在 GPIO1 外接按钮或跳线；板载 BOOT 和 RST 不能用于配对授权。
+正式构建保留 GPIO 检查。仅在受控的 C5 台架测试中，才可显式加载独立开发配置，
+并使用单独的构建目录：
+
+```sh
+west build -p always -d build-c5-open-pairing \
+  -b esp32c5_devkitc/esp32c5/hpcore . -- \
+  -DEXTRA_CONF_FILE=dev_c5_open_pairing.conf
+```
+
+此镜像允许附近任何主机配对后访问串口和管理服务。加密、Secure Connections 和
+绑定仍是必需的，但不能据此核验主机是否为授权所有者。不要分发此镜像，也不要
+将其留在共享环境中上电。普通构建和发布 CI 不加载该片段。正式固件请使用不带
+此片段的默认构建命令，且不要复用上述开发构建目录。
 
 | 项目 | 默认值 / 持久化规则 | 清除或移交方式 |
 | --- | --- | --- |
@@ -378,6 +555,26 @@ UTF-8 会被拒绝。当前固件的名称只用于显示：主机必须按 Mana
 桌面与手机客户端先向板子查询（`@n?`），并区分 MAC 默认名与自定义名；写入后
 由板子确认并回读。C 客户端把板子的回答打印到标准输出。
 
+### 配对设备标签
+
+`@linkr bonds?` 列出已保存的身份；每个标签单独用
+`@linkr bonds label <type>/<address>` 读取，固定的回复缓冲区因此不需要一次装下
+所有标签。
+
+| 客户端 | 列表 | 改名 | 删除 |
+| --- | --- | --- | --- |
+| `bee`（TUI） | 网络视图 → *刷新已配对设备* | 同一视图的主机行 | 同一视图 → *删除此配对* |
+| `bee-cli` | `--query-bonds` / `query bonds` | `--rename-bond <id>=<label>` / `bond <id> <label>` | `--remove-bond <id>` / `unbond <id>` |
+| `bee --serve` | `{"op":"bonds"}` | `{"op":"bond-label","id":"…","label":"…"}` | `{"op":"bond-remove","id":"…"}` |
+| Web / 手机 | 连接面板 → *已配对设备* | 行上的 *改名* | *删除配对* |
+
+标签只用于显示，最多 48 个 UTF-8 字节，按身份地址存在 NVS 中，删除配对时一并
+清除。Web 和手机编辑器在板子没有标签时自动上报浏览器所属的系统；TUI 在板子没有
+标签时为当前主机自动上报一次本机用户名。保留
+`@linkr bonds name <label>` / `@linkr bonds names?` 作为只写自己配对的兼容形式，
+主机无需控制权即可命名自己；`bonds label <type>/<address>` 是管理任意配对的完整
+形式。不支持这些命令的旧固件在 Web/TUI 中隐藏该区域，而不是留下不可用的控件。
+
 ### UART 命令
 
 | 短形式 | 长形式 | 说明 |
@@ -409,17 +606,24 @@ ERR format: @u=115200,8,n,1,n
 ```
 
 诊断命令是只读操作。它会返回应用与 Zephyr 版本、运行时间、开放的 BLE
-访问/安全状态、UART 缓冲区使用量和丢字节数、WiFi/IP 状态，以及
-WebDAV 队列、丢弃、HTTP、失败和成功计数：
+访问/安全状态、UART 缓冲区使用量和丢字节数、WiFi/IP 状态、WebSocket 客户端
+与丢弃计数，以及 WebDAV 队列、丢弃、HTTP、失败和成功计数。queue、peer 和
+rel 分组分别提供 UART 发送队列丢弃、BLE 输出队列丢弃和 BLE indication 耗时：
 
 ```text
-@info fw version=0.1.2 zephyr=4.4.1
-@info sys uptime_ms=123456 owner=0 security=1
-@info uart dropped=0 buffer=0/16384
+@info fw version=0.1.2 zephyr=4.5.0
+@info sys uptime_ms=123456 owner=0 links=1 security=1
+@info uart dropped=0 dropped_no_conn=0 buffer=0/16384
 @info wifi state=connected ip=ready error=0
 @info upload state=on queue=0 dropped=0 http=201 failures=0 successes=4
+@info ws state=up port=80 clients=1 tx=1234 rx=5678 dropped=0
+@info queue dropped=0
+@info peer dropped=0
+@info rel ind=0 retry=0 busy=0 nomem=0 slept_ms=0 timeout=0 wait_max_ms=0
 @info done
 ```
+
+缓冲区大小和启用的服务以具体板级配置为准。
 
 应用版本由 `CONFIG_LINKR_BLE_BRIDGE_FIRMWARE_VERSION` 设置。
 
@@ -444,11 +648,67 @@ python3 tools/linkr_ble_terminal.py --reset-ble-name --no-terminal
 固件会拒绝的名称在接触射频之前就会失败。修改会写入板子的 settings，重启后
 仍然保留；`--reset-ble-name` 恢复由硬件 MAC 生成的 `Linkr Bee XXXX`。
 
+板载 I/O 与一次性命令：
+
+```sh
+python3 tools/linkr_ble_terminal.py --led 1a2b3c --no-terminal    # 状态灯
+python3 tools/linkr_ble_terminal.py --led off --no-terminal
+python3 tools/linkr_ble_terminal.py --opto on --no-terminal      # 隔离干接点
+python3 tools/linkr_ble_terminal.py --opto-pulse 500 --no-terminal
+python3 tools/linkr_ble_terminal.py --query-led --query-opto --no-terminal
+```
+
+`--cmd` 原样发送任意管理命令并把回复打到 stdout，脚本取到的是回复本身、
+不是传输层的回声。它可以重复给，按给出的顺序逐条执行 —— 固件里没有专用
+flag 的命令由此可达：
+
+```sh
+python3 tools/linkr_ble_terminal.py --cmd '@linkr bonds?' --no-terminal
+python3 tools/linkr_ble_terminal.py --cmd '@r slots' --cmd '@l?' --no-terminal
+```
+
+`--monitor` 只打印目标 UART、从不读键盘；`--reconnect N` 在掉线后最多重试 N 次：
+
+```sh
+python3 tools/linkr_ble_terminal.py --monitor | tee board.log
+python3 tools/linkr_ble_terminal.py --reconnect 2
+```
+
+重连会固定首次选中的 BLE 地址，并核对同一硬件 Device ID；连接和通道初始化失败
+会继续使用剩余重试次数。启动命令（包括脉冲和 `--cmd`）只执行一次，重连仅恢复通信。
+启动命令被拒绝或执行中断时会报错退出，不自动重放。
+`--scan` 与命令或 `--monitor` 组合时，扫描后会继续连接并执行。
+
+控制权与已保存的配对属于板子，不属于这个客户端：
+
+```sh
+python3 tools/linkr_ble_terminal.py --query-control --no-terminal
+python3 tools/linkr_ble_terminal.py --claim --bonds --no-terminal
+python3 tools/linkr_ble_terminal.py --claim --opto-pulse 500 --release --no-terminal
+python3 tools/linkr_ble_terminal.py --bonds-names --no-terminal
+python3 tools/linkr_ble_terminal.py --bonds-remove 0/AA:BB:CC:DD:EE:01 --no-terminal
+```
+
+`--claim` 在其余所有命令之前执行、`--release` 在它们之后执行，所以一次调用就能
+"抢控制权 → 改东西 → 交还"。不持有控制权就写入时，板子会拒绝（`ERR control=readonly`），
+与 Web 终端显示的是同一份状态。
+
+`--scan --json` 把每台设备输出成一条记录，而不是制表符分隔的列表——因为设备名
+本身可能含制表符：
+
+```json
+{"type": "device", "name": "Linkr Bee 1A2B", "address": "AA:BB:CC:DD:EE:01", "rssi": -52, "management": true}
+```
+
 脚本化与安全注意事项：
 
 - `--json` 把管理响应与事件按行输出为 JSON，例如
   `{"type":"response","requestId":1,"ok":true,"lines":["OK fw version=0.1.2"],"command":"@i?"}`；
   `@w=`/`@d=` 这类命令在 JSON 里的 `command` 字段始终是 `<redacted>`。
+- 由 flag 发出的每条命令还会多一行 `result` 记录，把回复里的 `key=value` 拆进
+  `fields`，例如
+  `{"type":"result","command":"@o?","ok":true,"text":"OK opto=closed","fields":{"opto":"closed"}}`。
+  值里带逗号或空格时（SSID、带查询串的 URL）只有 `text` 是完整的。
 - `--quiet` 只抑制进度信息（`linkr: …`），错误与 `loopback PASS/FAIL` 仍然输出。
 - `--help` 与 `--version` 不需要安装 bleak，只有真正访问设备时才导入它。
 - 密码不进 argv：用 `--wifi SSID --wifi-key-file PATH`，或环境变量
@@ -456,7 +716,8 @@ python3 tools/linkr_ble_terminal.py --reset-ble-name --no-terminal
   但会出现在 `ps` 输出里。
 - `--uart` 在本地校验（baud 300–3000000、data 5–8、parity n/o/e、stop 1/2、
   flow n/rtscts），不合法就直接报错退出，不发往设备。
-- 退出码：`0` 正常、`1` 错误、`2` 参数问题、`3` 终端会话期间设备断开。
+- 退出码：`0` 正常、`1` 错误、`2` 参数问题、`3` 终端会话期间设备断开，
+  或 `--reconnect` 的尝试次数用尽。
 
 配置命令使用 Management Service v1 二进制帧，包含 API 版本、request ID、
 逻辑长度、response ID 和 confirmed indication 分片。NUS 现在只转发原始 UART。
@@ -485,7 +746,7 @@ Web 资源——这些由 CI（`.github/workflows/build.yml`）覆盖。
 启用 UART RX 回环：
 
 ```sh
-west build -b esp32c3_devkitm linkr-bee -- \
+west build -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_uart.conf
 ```
 
@@ -499,14 +760,14 @@ west build -b esp32c3_devkitm linkr-bee -- \
 将 UART0 TX（GPIO21）和 RX（GPIO20）短接后，可构建硬件回环验证镜像：
 
 ```sh
-west build -p always -b esp32c3_devkitm linkr-bee -- \
+west build -p always -b esp32c3_devkitm . -- \
   -DEXTRA_CONF_FILE=test_loopback.conf
 ```
 
 使用同一完整固件功能集的 BLE NUS echo 诊断不需要 UART 接线：
 
 ```sh
-west build -p always -b esp32c3_supermini linkr-bee -- \
+west build -p always -b esp32c3_supermini . -- \
   -DEXTRA_CONF_FILE=test_ble_echo.conf
 ```
 
@@ -529,7 +790,7 @@ coredump 扇区。
 ├─────────────────────────────────────────────────────────────┤
 │                    BLE GATT (ATT MTU 247)                    │
 ├─────────────────────────────────────────────────────────────┤
-│             ESP32-C3/C5 固件 (Zephyr v4.4.1)                 │
+│             ESP32-C3/C5 固件 (Zephyr v4.5.0)                 │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │  BLE 协议栈  │  │  UART 桥接  │  │  WiFi/WebSocket     │ │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
@@ -615,10 +876,9 @@ cd tools && make
 ./linkr_ble_terminal_c
 ```
 
-参数面与 Python 客户端对齐，脚本可以同等对待两者：
-
-- 退出码 `0` 正常、`1` 错误、`2` 参数问题、`3` 终端会话中设备断开；
-  之前的参数错误也是 `1`，与"连不上设备"没法区分。
+退出码与 Python 客户端一致 —— `0` 正常、`1` 错误、`2` 参数问题、`3` 会话中
+设备断开 —— 脚本不必读输出就能区分两者；但**参数面并不一致**，上面那张表
+就是它暴露的全部 Management v1 能力。
 - `--version`；`--quiet` 只压进度信息，错误始终输出。
 - 长短选项都接受 `--opt=value` 写法；缺值时报 `--opt requires a value`，
   不再是误导性的 `unknown option`。
@@ -794,6 +1054,15 @@ source <(./linkr_ble_terminal_c --print-completion zsh)
 要用补全就把客户端装成命令——PyInstaller 产物 `linkr-ble-terminal`、自己包一层 wrapper，
 或把脚本放到 `PATH`。fish 尤其严格：命令不在 `PATH` 上时它根本不加载对应的补全文件。
 
+## 前端 UI 复核
+
+前端改动完成前必须做视觉复核：起 demo（`sh tools/serve_web.sh 8090`，打开
+`/?demo=board`），运行 `cd mobile && node ui-review.mjs` 生成手机/平板/桌面、
+明暗两套主题、中英两种语言的截图（在 `build-demo/ui-review/`），对照
+[DESIGN.md](../DESIGN.md) 检查裁切、对齐、字体/颜色/间距漂移和缺失状态，并在
+提交说明里记录复核范围。完整清单见 [AGENTS.md](../AGENTS.md)。前端模块按能力显示：当前板子不支持的功能要
+隐藏整张卡片（必要时连同分区），不要留下被禁用的空控件。
+
 ## Web Bluetooth 终端
 
 浏览器终端是额外选项，不替代 Python 终端。控制走 Management Service v1，
@@ -819,6 +1088,13 @@ http://127.0.0.1:8765/
 如果保存的设备已不可用，页面会清除记录，并在下一次连接时回退到系统选择器；
 不支持 `getDevices()` 的浏览器始终使用系统选择器。
 
+已经建立的链路如果意外断开（板子离开范围、断电或没电；局域网 WebSocket 关闭），
+页面会自动重拨，退避间隔为 1、2、4、8、16、30 秒（最多 6 次）。状态行显示当前
+尝试/倒计时，`Connect` 按钮变为 **取消重连**。重连成功会追加
+`[reconnect] 连接已自动恢复`，终端记录保留，断线空档仍然可见；用户主动
+`Disconnect` 不会被当成掉线，也不会重放任何输入或命令。全部尝试失败后停止，
+并提示用户点 `Reconnect` 手动重试。
+
 固件将 Management Service UUID 放在主广播包中，将广播名放在扫描响应中。
 所有板型默认名都是 `Linkr Bee XXXX`，其中 `XXXX` 是硬件 MAC 最后四位
 十六进制；可用 `@n` 改为自定义名。页面按 Management Service UUID 过滤浏览器
@@ -829,6 +1105,8 @@ http://127.0.0.1:8765/
 - 连接广播 Linkr Management Service UUID 的设备
 - 浏览器支持 `navigator.bluetooth.getDevices()` 时，在刷新后恢复上次已授权
   的 Linkr 设备并快速重连
+- 意外掉线后自动重拨 BLE 或局域网链路，退避 1/2/4/8/16/30 秒，显示当前尝试/
+  倒计时并提供取消；用户主动断开不会自动重连
 - 读取 API 版本与稳定 Device ID，分别订阅管理 indication 和 Reliable UART indication
 - 默认折叠固件/运行时诊断；展开时才查询设备，也可按需手动刷新
 - 扫描附近 2.4 GHz WiFi，将结果填入独立的 SSID/密码输入框；密码不会写入
@@ -838,7 +1116,10 @@ http://127.0.0.1:8765/
 - 用 `@u?` 和 `@u=...` 查询或设置 UART 模式
 - 调整换行和 BLE 写入块大小
 - 在系统等宽字体与常见本地 Nerd Font 之间切换，并预览 Powerline/Nerd
-  字形；所选字体会按当前浏览器来源持久化，但网页不内置字体文件
+  字形；所选字体会按当前浏览器来源持久化。Nerd 字体本身不内置；唯一内置的是
+  BabelStone Pseudographica 子集（`web/fonts/`），覆盖 Unicode 13/16 的
+  legacy computing 区块，因为桌面等宽字体栈会把这些 ANSI art 字形渲染成
+  `.notdef`
 - 通过 xterm.js 渲染终端控制序列，包括光标移动、行擦除、readline 重绘、16 色、256 色和真彩色 SGR
 - 全屏显示终端，并在 viewport 或控制面板宽度变化时自动重新计算行列
 - 识别常见 Bash/BusyBox 的 `$ ` 和 `# ` 提示符，登录后通过
@@ -871,11 +1152,25 @@ http://127.0.0.1:8765/
 | 运行环境 | 远端 TTY 尺寸 | 软键盘 | 历史与复制 |
 | --- | --- | --- | --- |
 | 浏览器 Web / Pages | 登录后和布局变化时通过 `stty` 同步 | 跟随浏览器 viewport | 滚轮、触控板或触摸拖动；选中后复制 |
+| 桌面 Rust TUI | 在下一个空闲 shell 提示符发送同一条 `stty rows <rows> cols <cols>`；窗口、侧栏或助手面板改变窗格宽度后重发 | 窗格跟随终端窗口 | 窗格历史、拖动选择与复制快捷键；详见 `tools/linkr-tui/README.md` |
 | Android / iOS / HarmonyOS 原生壳 | 安卓端完全不发送 `stty`；其他原生壳在键盘开合时也保持远端 tty 尺寸不变 | 只缩小本地 WebView 并在本地重算行数，关闭后恢复；设置侧栏滑入前先收起输入法，并用 GPU 合成层做动画 | 上下拖动滚动 `term.scrollLines()`；轻点呼出键盘；长按选中手指下的单词并显示两个可拖动圆点，分别精确调整选区两端，可按字符、跨行扩展；浮动复制按钮复制选区，且长按达到阈值后绝不呼出键盘。即使 WebView 清空自己的 DOM 选区，复制仍返回刚才选中的文字；复制不会抢走焦点。键盘已打开时长按/拖动照样选中并复制，上下拖动照样查看历史。键盘按钮跟随屏幕上实际出现的输入法 |
 
 原生壳会有意跳过 `scheduleTerminalGeometrySync()`：软键盘引起的尺寸变化只是本地显示
 状态，不应让远端控制台重新排版。安卓端因此完全不发送 `stty rows/cols`。浏览器构建仍保留
 现有的 `stty rows <rows> cols <cols>` 同步。
+
+桌面 TUI 发送的命令与 Web、Python 客户端逐字节一致，并且只在空闲 shell 提示符出现时发送：
+本地有输入、行模式缓冲区里有未提交的内容，或目标输出看起来不是提示符，都会关闭发送闸门，
+直到 shell 重新给出提示符。窗格按实际绘制出来的中心区域定尺寸，所以开关侧栏或助手面板会
+改变模拟器宽度，并把同一尺寸排进队列。目标 tty 若仍保留旧宽度，readline 会把长
+`user@host:~$` 提示符折回同一行，看起来就像那一行被覆盖了。
+
+如果窗格出现 `�` 或进度条错乱，应先检查真实诊断计数，再区分传输丢失和渲染问题。
+`@i?` 提供 UART RX 丢弃、BLE 断开期间丢弃、UART 发送队列丢弃，以及 Reliable UART
+indication 的重试、超时和最大等待时间。BLE 发送跟不上时，持续高速输出可能写满 UART RX 环。
+UART 转发、WebSocket 和日志采集仍共用一个工作线程；当前固件没有独立 BLE 发送线程，
+不能保证慢速中心设备不会阻塞其他出口。丢弃计数增长时可降低目标控制台波特率；
+TUI 的 legacy NUS 通道只是尽力而为，没有重传。
 
 构建共享资源并同步 Android/iOS 原生工程：
 
@@ -925,10 +1220,17 @@ GPIO4。浏览器设备选择授权与 BLE 绑定是两种独立状态。
 后者是实测两阶段硬件复位时间，与配置的 10 秒窗口不同。四项测试均恢复到串口桥
 就绪。测试后刷回无故障注入钩子的正式固件，镜像与 Flash 回读逐字节一致，并在
 稳定运行超过 75 秒后完成加密 BLE 诊断。原有 BLE 身份、配对密钥、目标机绑定
-记录的值保留；GATT 缓存元数据和新增默认设置正常更新。C5、WROOM 的复位行为
-仍需实机验证。
+记录的值保留；GATT 缓存元数据和新增默认设置正常更新。
 
-simple-boot 镜像现已补齐 ROM 可见部分的 SHA-256 摘要。Zephyr v4.4.1 的
+C5 的硬件恢复已在该 devkit 上验证。用临时钩子在启动 15 秒后阻塞系统工作队列，
+硬件看门狗约 13 秒后复位芯片：ROM 打印 `rst:0x7 (TG0_WDT_HPSYS)` 与
+`PRO CPU has been reset by WDT`，应用侧记录的复位原因为 `0x00000010`
+（`RESET_WATCHDOG`）。连续四次注入后，每次都在 1.3 秒内恢复到串口桥就绪，
+BLE 身份、名称与配对记录保持不变。C5 在 60 秒任务通道触发之前就走到硬件兜底，
+因此该任务看门狗路径仍由上面的 C3 一轮覆盖。测试后已刷回正式镜像，稳定运行
+75 秒未再复位。WROOM 的复位行为仍需实机验证。
+
+simple-boot 镜像现已补齐 ROM 可见部分的 SHA-256 摘要。Zephyr v4.5.0 的
 `elf2image --ram-only-header` 输出没有这份摘要；项目构建模块会利用现有零填充
 补齐摘要，并让启动代码正确跳过摘要后继续扫描 Flash 段。文件大小和隐藏 Flash
 段的地址保持不变。构建时只复制并修正构建目录中的启动代码，不修改外部 Zephyr
@@ -940,21 +1242,28 @@ simple-boot 镜像现已补齐 ROM 可见部分的 SHA-256 摘要。Zephyr v4.4.
 [ESP 镜像格式](https://docs.espressif.com/projects/esptool/en/latest/esp32c3/advanced-topics/firmware-image-format.html)，
 这份摘要覆盖 ROM 可见的 RAM 镜像，不包括隐藏的 Flash 映射段；整个文件仍由
 发布包 `SHA256SUMS` 和刷写回读检查。不能单独处理缺少配套启动代码的旧镜像。
-C3 已验证启动和故障恢复时无此告警；其他支持板型目前仅完成构建及镜像格式验证。
+此前 C3、C5 的启动与故障恢复验收使用 4.4.1。Bee X1.0 此后已完成上述 4.5 启动、
+BLE 回环、WiFi 扫描和 UART 线速接收测试；其他板型，以及 WiFi 联网、LAN 和上传负载，
+仍需对新内存预算做真机验收。
 
 ## 验证状态
 
 各层次实际验证到什么程度。构建成功、主机测试通过或模拟器启动，都不等于目标硬件上
 的端到端验收。
 
+4.5 迁移已渲染板载与关于页面：338、390、834、1440 px，中英文与浅深双主题。
+关于页面正确显示 4.5.0，未见横向溢出；截图位于 `build-demo/ui-review/`。
+
 | 层次 | 本仓库已验证 | 仍需硬件验证 |
 | --- | --- | --- |
-| 固件构建 | `esp32c3_supermini`、`esp32c3_devkitm`、`esp32c3_devkitc` 与 `esp32c5_devkitc/esp32c5/hpcore` 在 CI 中以 Zephyr v4.4.1 构建，并断言各代控制器的安全符号 | — |
+| 固件构建 | 六个目标（含 `esp32_devkitc/esp32/procpu`）均通过 Zephyr v4.5.0 本地构建及控制器安全、PSRAM 段与 ROM 摘要检查；Bee X1.0 另通过启动、BLE 二进制回环、WiFi 扫描和 60 秒 UART 线速接收及栈水位检查 | 其他板型的 4.5 运行验收、WiFi 联网/LAN/上传，以及发布后对应提交的远程 CI |
 | 协议主机测试 | `tests/` 编译并驱动生产代码中的管理协议、安全配对门禁、目标绑定、WebDAV 与 HCI 顺序逻辑，含 C3/C5 构建约束 | 真实 SMP 配对、NVS 持久化、射频行为 |
 | BLE 终端 | Web、Python、C 三套客户端，以及浏览器回归套件覆盖 Reliable UART 序号、重组与会话边界 | 各平台的配对、MTU 协商与重连行为 |
+| 浏览器烧录 | Web Streams 和浏览器回归覆盖切换波特率时释放 reader、串口复用、烧录与复位互斥、ROM 启动错误提示。原生 USB 只有读到下载模式提示才会再次发送 EN 脉冲，读到 Zephyr 启动标记才确认启动。X1.0 原生 USB 另支持 C3 看门狗复位。已检查中文烧录页在 338、390、834 和 1440 px 宽度下的明暗主题 | 实机 EN 时序、USB 重新枚举、各板型与浏览器的完整烧录流程 |
+| Rust TUI | Bee X1.0 实机验证 Reliable UART 路径（`link: Reliable UART`、`@i?` 序号计数递增、行输入进入运行中的目标 shell）、选错板后的重连修复、F6/F7/F8 顺序，以及控制权：只读/控制中徽标、空闲控制台自动接管、输入时按空闲窗口申请接管、对方正在输入时申请被拒；释放、交接、“单问题槽等待”以及 LAN 的 `@control …` 文本帧路径由主机测试覆盖；发送特征消失时停止可靠写、以及“加入时对方正忙则之后不自动接管”同样有主机测试。CLI 复用同一会话：`--query-control`、`--control …` 与发送前的控制权检查由同一批测试覆盖 | 需要第二台物理主机验证实机 `yield`/交接（单主机适配器可能把两个进程暴露成同一会话）；需要真实桥验证 LAN 控制权 |
 | WiFi、局域网桥、WebDAV | 主机测试与浏览器套件；WS 令牌握手两侧均有覆盖 | 关联过程、BLE/WiFi 共存、真实端点上传 |
 | 助手（Agent 模式） | Node 与浏览器套件覆盖执行策略、证据处理与任务恢复 | 真实目标机上的命令执行与设备档案恢复，详见 [AGENT_VALIDATION.zh-CN.md](AGENT_VALIDATION.zh-CN.md) |
-| 手机 App | 共享 Web 资源可构建并通过类型检查；Android/iOS/HarmonyOS 工程已与终端界面同步；浏览器回归套件覆盖 Termux 式触摸滚动、轻点呼出键盘、长按选区并拖动两个圆点精确调整（键盘关闭和打开时都覆盖）、浮动复制按钮、WebView 清空选区后仍能复制、整段复制保留折行与边界空格、剪贴板回退不抢焦点和选区、长按绝不呼出键盘、键盘按钮与实际输入法状态同步，以及键盘本地布局（不发送远端 `stty`） | Android、iOS、HarmonyOS 真机 Bluetooth LE |
+| 手机 App | 共享 Web 资源可构建并通过类型检查；Android/iOS/HarmonyOS 工程已与终端界面同步；浏览器回归套件覆盖 Termux 式触摸滚动、轻点呼出键盘、原生壳长按选区并拖动两个圆点精确调整（键盘关闭和打开时都覆盖）、浮动复制按钮、WebView 清空选区后仍能复制、浏览器保留原生选择且不绘制自定义圆点、无选区时不复制、复制选区保留折行与边界空格、剪贴板回退不抢焦点和选区、长按绝不呼出键盘、键盘按钮与实际输入法状态同步，以及键盘本地布局（不发送远端 `stty`） | Android、iOS、HarmonyOS 真机 Bluetooth LE |
 
 ---
 

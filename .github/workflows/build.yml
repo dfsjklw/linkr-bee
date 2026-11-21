@@ -37,6 +37,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y libdbus-1-dev pkg-config fish zsh
+          python3 -m pip install kconfiglib==14.1.0
+      # One version, everywhere. The release assembler proves the *artifacts*
+      # match the tag; this proves the tree agrees with itself (and with the
+      # tag, when a release tag is what triggered the build) before anything is
+      # compiled — the cheapest place to catch a half-done version bump.
+      - name: Version consistency
+        run: python3 tools/check_versions.py --ref "$GITHUB_REF"
       - run: python3 -m unittest discover -s tests -v
       - name: Build the C reference terminal
         run: make -C tools clean all
@@ -77,6 +84,16 @@ jobs:
 
       - name: Run bridge tests
         run: npm test
+
+      - name: Run CLI launcher and agent plugin regressions
+        run: node --test ../tools/linkr-tui/npm/test/*.test.mjs ../linkr-bee-dsh/test/*.test.mjs ../linkr-bee-opencode/test/*.test.mjs
+
+      # The OpenCode plugin ships prebuilt UI bundles in git; a missing build
+      # would only fail at plugin load, so fail here instead.
+      - name: Check committed OpenCode plugin UI bundles
+        run: |
+          test -s ../linkr-bee-opencode/dist/gui-experimental.cjs
+          test -s ../linkr-bee-opencode/dist/web-console.js
 
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium
@@ -220,6 +237,13 @@ jobs:
             toolchain: riscv64-zephyr-elf
             flash_address: "0x0"
             factory_reset: GPIO0 to GND for two seconds during boot
+          - name: Linkr Bee X1.0 (MV013)
+            board: linkr_bee_x1_0
+            slug: linkr-bee-x1-0
+            chip: esp32c3
+            toolchain: riscv64-zephyr-elf
+            flash_address: "0x0"
+            factory_reset: USER_KEY (GPIO3) to GND for two seconds during boot
           - name: ESP32-C5 DevKitC
             board: esp32c5_devkitc/esp32c5/hpcore
             slug: esp32c5-devkitc
@@ -227,6 +251,7 @@ jobs:
             toolchain: riscv64-zephyr-elf
             flash_address: "0x2000"
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
+            expect_psram: "y"
           - name: ESP32-C5 Waveshare Touch LCD 2.8
             board: esp32c5_devkitc/esp32c5/hpcore
             slug: esp32c5-waveshare-lcd
@@ -236,6 +261,7 @@ jobs:
             factory_reset: GPIO28 BOOT to GND for two seconds during boot
             extra_conf: boards/linkr_c5_touch_lcd.conf
             extra_overlay: boards/linkr_c5_touch_lcd.overlay
+            expect_psram: "y"
           - name: ESP32-WROOM-32 DevKitC
             board: esp32_devkitc/esp32/procpu
             slug: esp32-wroom-32
@@ -329,6 +355,7 @@ jobs:
           grep -qx 'CONFIG_LINKR_BLE_BRIDGE_UART_RX_DROP_NO_CONN=y' "${config}"
           grep -qx 'CONFIG_WIFI=y' "${config}"
           grep -qx 'CONFIG_NETWORKING=y' "${config}"
+          grep -qx '# CONFIG_WIFI_STA_AUTO_DHCPV4 is not set' "${config}"
           grep -qx 'CONFIG_NET_TCP=y' "${config}"
           grep -qx '# CONFIG_NET_IPV6 is not set' "${config}"
           grep -qx 'CONFIG_HTTP_SERVER=y' "${config}"
@@ -350,6 +377,14 @@ jobs:
             'import json; print(json.load(open("app/mobile/package.json"))["version"])')"
           grep -qx "CONFIG_LINKR_BLE_BRIDGE_FIRMWARE_VERSION=\"${firmware_version}\"" "${config}"
           grep -qx 'CONFIG_BT_SMP=y' "${config}"
+          # The same fast-link request every board ships: 7.5-15 ms interval.
+          grep -qx 'CONFIG_BT_GAP_AUTO_UPDATE_CONN_PARAMS=y' "${config}"
+          grep -qx 'CONFIG_BT_PERIPHERAL_PREF_MIN_INT=6' "${config}"
+          grep -qx 'CONFIG_BT_PERIPHERAL_PREF_MAX_INT=12' "${config}"
+          if grep -Eq '^CONFIG_SOC_SERIES_ESP32(C3|C5)=y$' "${config}" &&
+             ! grep -qx 'CONFIG_LINKR_LCD=y' "${config}"; then
+            grep -qx 'CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y' "${config}"
+          fi
           grep -qx 'CONFIG_BT_SMP_APP_PAIRING_ACCEPT=y' "${config}"
           grep -qx 'CONFIG_BT_BONDING_REQUIRED=y' "${config}"
           grep -qx 'CONFIG_BT_SETTINGS=y' "${config}"
@@ -375,11 +410,25 @@ jobs:
           if grep -qx 'CONFIG_SOC_SERIES_ESP32=y' "${config}"; then
             grep -qx 'CONFIG_ESP32_BT_CTLR_LE_SECURITY_ENABLE=y' "${config}"
           fi
+          # PSRAM layout. The released C5 image runs with the module's 8 MB
+          # part enabled and must keep the WiFi heap, the WiFi packet buffers
+          # and the ROM region above DRAM_SHARED_BUFFERS_END out of it.
+          if [ "${{ matrix.expect_psram }}" = "y" ]; then
+            grep -qx 'CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y' "${config}"
+            grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
+            grep -qx 'CONFIG_ESP_SPIRAM_SIZE=8388608' "${config}"
+            grep -qx 'CONFIG_SPIRAM_TYPE_ESPPSRAM64=y' "${config}"
+            grep -qx 'CONFIG_SPIRAM_SPEED_80M=y' "${config}"
+            grep -qx '# CONFIG_ESP_SPIRAM_MEMTEST is not set' "${config}"
+            grep -qx 'CONFIG_ESP_WIFI_HEAP_SYSTEM=y' "${config}"
+            grep -qx '# CONFIG_ESP_WIFI_HEAP_SPIRAM is not set' "${config}"
+            grep -qx '# CONFIG_ESP32_WIFI_NET_ALLOC_SPIRAM is not set' "${config}"
+          fi
+
           # Panel builds must keep PSRAM, LVGL and the touch stack enabled:
           # losing any of them silently turns the Waveshare image back into a
           # headless build.
           if grep -qx 'CONFIG_LINKR_LCD=y' "${config}"; then
-            grep -qx 'CONFIG_ESP_SPIRAM=y' "${config}"
             grep -qx 'CONFIG_ESP_SPIRAM_HEAP_SIZE=4194304' "${config}"
             grep -qx 'CONFIG_LVGL=y' "${config}"
             grep -qx 'CONFIG_ST7789V=y' "${config}"
@@ -389,6 +438,10 @@ jobs:
             grep -qx 'CONFIG_LV_COLOR_16_SWAP=y' "${config}"
             grep -qx 'CONFIG_LINKR_LCD_IO_EXPANDER_ADDR=0x24' "${config}"
             grep -qx 'CONFIG_ESPTOOLPY_FLASHSIZE="8MB"' "${config}"
+            # The panel authorizes pairing from the on-screen PAIR button, not
+            # the GPIO1 jumper (which carries the touch I2C clock here).
+            grep -qx 'CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=n' "${config}"
+            grep -qx 'CONFIG_LINKR_BLE_PAIRING_AUTH_TOUCH=y' "${config}"
           fi
 
       - name: Package firmware

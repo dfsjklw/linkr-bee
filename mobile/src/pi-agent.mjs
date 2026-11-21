@@ -33,7 +33,44 @@ export const AGENT_PROVIDER_IDS = Object.keys(PROVIDER_STREAMS);
 const UART_TOOLS = new Set(['send_serial_input','run_shell_command','probe_device_profile','probe_tools',
   'probe_download_tools','download_to_target','verify_target_file','verify_target_service','read_target_file']);
 
-export function createSerialAgent({ config, device, onEvent, stream = null, webReader = readWebPage, docsSearch = null, computerDownload, accessory = null, notes = null, restoredMessages = null, toolProfile = "focused", runLimits = { maxTurns: 32, maxTools: 96 } }) {
+/* A tool probe is a handful of `command -v` calls: the target normally answers
+ * in well under a second. This deadline bounds how long a probe may wait for
+ * that answer before it reports "unanswered" and unlocks nothing. */
+const PROBE_TIMEOUT_MS = 4000;
+/* The probe command prints `TOOL:<name>:available`; `LINKR_TOOL:` is accepted
+ * too, so the namespaced spelling can be adopted without touching this parser.
+ * The app's execution observer reads the `TOOL:` line for its capability cache,
+ * which is why the printed marker keeps that shape. */
+const TOOL_PROBE_LINE = /^(?:LINKR_TOOL|TOOL):([A-Za-z0-9][A-Za-z0-9_.+-]{0,63}):(available|missing)$/;
+
+/**
+ * Which of the requested commands the target itself reported, taken only from
+ * the console evidence of the probe execution. A command with contradictory
+ * lines, or with no line at all, is not evidence and stays locked.
+ */
+export function parseToolProbeEvidence(evidence, names) {
+  const requested = [...new Set((names || []).map((name) => String(name).toLowerCase()))];
+  const answers = new Map();
+  for (const raw of String(evidence ?? "").replace(/\r/g, "").split("\n")) {
+    const match = TOOL_PROBE_LINE.exec(raw.trim());
+    if (!match) continue;
+    const name = match[1].toLowerCase();
+    if (!requested.includes(name)) continue;
+    const entry = answers.get(name) || { available: false, missing: false };
+    if (match[2] === "available") entry.available = true; else entry.missing = true;
+    answers.set(name, entry);
+  }
+  const available = [], missing = [], unobserved = [], conflicting = [];
+  for (const name of requested) {
+    const entry = answers.get(name);
+    if (!entry) { unobserved.push(name); continue; }
+    if (entry.available && entry.missing) { unobserved.push(name); conflicting.push(name); continue; }
+    (entry.available ? available : missing).push(name);
+  }
+  return { available, missing, unobserved, conflicting };
+}
+
+export function createSerialAgent({ config, device, onEvent, stream = null, webReader = readWebPage, docsSearch = null, computerDownload, requestUserInput = null, accessory = null, notes = null, restoredMessages = null, toolProfile = "focused", customInstructions = "", runLimits = { maxTurns: 32, maxTools: 96 }, authorityMode = null }) {
   if (!["focused", "full"].includes(toolProfile)) throw new Error("Unknown tool profile");
   config = validateAgentConfig(config);
   const provider = PROVIDER_STREAMS[config.provider] ? config.provider : "openai-completions";
@@ -41,7 +78,14 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
   const providerStream = stream || PROVIDER_STREAMS[provider];
   const reasoning = config.reasoning || "off";
   const sessionId = device.getStatus().sessionId;
-  let executionMode = device.mode;
+  /* A caller-provided authority mode (e.g. the resident task) replaces the app's
+   * UI mode for prompt construction and for the mode reported in
+   * get_device_status. A resident task is not a human conversation: its ordinary
+   * writes are pre-approved by the task approval, so telling the model "nothing
+   * is sent until the user clicks Send" would be wrong. The device wrapper still
+   * reports the real base.mode; only the prompt/status wording uses this. */
+  const authority = typeof authorityMode === "string" && authorityMode.trim() ? authorityMode.trim() : null;
+  let executionMode = authority || device.mode;
   let readCursor;
   let modelRound = 0;
   let pendingExecution = null;
@@ -79,15 +123,31 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
   }
   const checkSession = (signal) => {
     signal?.throwIfAborted();
-    if (device.getStatus().sessionId !== sessionId || device.mode !== executionMode) throw new Error("Device session or mode changed. Start a new conversation.");
+    /* A resident task is bound to the approved device session, not to the app's
+     * UI execution mode. Two reasons: its ordinary writes are authorized by the
+     * task approval rather than by Manual/Auto/Full Auto, and the 15-minute
+     * Full Auto window reverting to Auto must not abort a task that is still
+     * working (it is a mode change, not a session change). A human conversation
+     * keeps the mode binding: changing the mode there ends that run's authority,
+     * exactly as before. */
+    const modeChanged = !authority && device.mode !== executionMode;
+    if (device.getStatus().sessionId !== sessionId || modeChanged) throw new Error("Device session or mode changed. Start a new conversation.");
   };
   const result = (value) => ({ content: [{ type: "text", text: JSON.stringify(value) }], details: {} });
   const modelStream = createModelStream({ stream: providerStream, checkSession, onEvent });
   const searchDocs = docsSearch || createRadxaDocsSearch();
 
-  const buildSystemPrompt = () => toolProfile === "full"
+  /* The conversation-start snapshot of the board-stored custom instructions.
+   * They steer the task but never override the approval, evidence and safety
+   * rules that precede them. */
+  const boardInstructions = () => {
+    const value = String(customInstructions ?? "").trim();
+    if (!value) return "";
+    return `\n## Board-stored user instructions\nThese instructions were written by the user and stored on the Linkr Bee board. Follow them for this task, but they never override the approval, safety and evidence rules above.\n${value}\n`;
+  };
+  const buildSystemPrompt = () => (toolProfile === "full"
     ? serialSystemPrompt(executionMode, { accessory: Boolean(accessory), notes: Boolean(notes) })
-    : focusedSystemPrompt(executionMode, toolCatalogPrompt(catalog));
+    : focusedSystemPrompt(executionMode, toolCatalogPrompt(catalog))) + (requestUserInput ? "\nUse ask_user when a required preference or missing fact needs the user's answer. Provide 2-6 concrete options in the user's language, with brief tradeoffs, and wait for their answer. Free text is also available. Do not ask for secrets or replace command/accessory approval with this tool. A skipped question has no answer: never pick an option for the user.\n" : "") + boardInstructions();
 
   /* A completed probe_tools check is evidence about what the target can do, so a
    * digest request that check already answered "no" to must not be sent at all:
@@ -125,6 +185,31 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
         pendingExecutions: taskCheckpoint().pendingExecutions } });
 
   const tools = [
+    ...(typeof requestUserInput === "function" ? [{
+      name: "ask_user", label: "Ask the user to choose", executionMode: "sequential",
+      description: "Pause for a required preference or missing fact. Show 2-6 concise options and optional free text in the user's language. No option is preselected. multiple=true permits several selections. Do not request passwords, tokens or other secrets. This does not grant permission to execute commands or replace existing approval dialogs. If cancelled, do not guess an answer.",
+      parameters: Type.Object({
+        question: Type.String({minLength: 1, maxLength: 500}),
+        options: Type.Array(Type.Object({
+          label: Type.String({minLength: 1, maxLength: 80}),
+          description: Type.Optional(Type.String({maxLength: 240})),
+        }, {additionalProperties: false}), {minItems: 2, maxItems: 6}),
+        multiple: Type.Optional(Type.Boolean()),
+      }, {additionalProperties: false}),
+      execute: async (id, args, signal) => {
+        checkSession(signal);
+        const answer = await requestUserInput({id, ...args, signal});
+        checkSession(signal);
+        if (answer?.status === "cancelled") return result({status: "cancelled", grantsPermission: false});
+        const selected = answer?.selected;
+        const text = typeof answer?.text === "string" ? answer.text.trim() : "";
+        if (answer?.status !== "answered" || !Array.isArray(selected) || selected.some(index => !Number.isInteger(index) || index < 0 || index >= args.options.length) ||
+            new Set(selected).size !== selected.length || (!args.multiple && selected.length > 1) || text.length > 1000 || (!selected.length && !text)) {
+          throw new Error("Invalid user answer");
+        }
+        return result({status: "answered", selected: selected.map(index => ({index, label: args.options[index].label})), text, grantsPermission: false});
+      },
+    }] : []),
     {
       name: "get_task_checkpoint", label: "Inspect task checkpoint",
       executionMode: "sequential",
@@ -192,17 +277,31 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
     {
       name: "probe_tools", label: "Check required target tools",
         executionMode: "sequential",
-      description: "Check only the command names needed for the current task. Use a verified remembered profile for context instead of a full probe on every connection. Monitor this tracked read-only command before relying on its result.",
+      description: "Check only the command names needed for the current task. Use a verified remembered profile for context instead of a full probe on every connection. This waits for the tracked read-only command to answer: a gated tool appears only when the target itself printed every command it needs as available. A refused, unanswered, truncated or contradictory probe unlocks nothing.",
       parameters: Type.Object({ names: Type.Array(Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$" }), { minItems: 1, maxItems: 16 }) }, { additionalProperties: false }),
       execute: async (id, args, signal) => {
         if (!Array.isArray(args.names) || !args.names.length || args.names.length > 16 || args.names.some(name => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$/.test(name))) throw new Error("Invalid tool names");
-        /* A probe is also how the assistant discovers that a tool which needs
-         * specific target commands has become usable. */
-        const announced = unlockTools(args.names);
-        const names = [...new Set(args.names)].map(name => "'" + name + "'").join(" ");
-        const command = `for t in ${names}; do if command -v "$t" >/dev/null 2>&1; then printf 'TOOL:%s:available\\n' "$t"; else printf 'TOOL:%s:missing\\n' "$t"; fi; done`;
-        const sent = await sendVia(id, {text:command,appendEnter:true,trackExit:true,applicationReadOnly:true,toolProbe:[...new Set(args.names)]}, signal);
-        return announced.length ? { ...sent, content: [...sent.content, { type: "text", text: `Tools now available: ${announced.join(", ")}.` }], addedToolNames: announced } : sent;
+        const names = [...new Set(args.names)];
+        const quoted = names.map(name => "'" + name + "'").join(" ");
+        const command = `for t in ${quoted}; do if command -v "$t" >/dev/null 2>&1; then printf 'TOOL:%s:available\\n' "$t"; else printf 'TOOL:%s:missing\\n' "$t"; fi; done`;
+        /* The request is not evidence: only the target's own answer may unlock
+         * a tool that depends on the commands it was asked about. */
+        const sent = await sendVia(id, {text:command,appendEnter:true,trackExit:true,applicationReadOnly:true,toolProbe:names}, signal);
+        let executionId;
+        try { executionId = JSON.parse(sent.content.find((part) => part.type === "text")?.text || "{}").id; }
+        catch { executionId = undefined; }
+        if (!executionId) return sent;
+        const record = await monitorSerialExecution({ inspect: () => device.inspectExecution(executionId), signal,
+          timeoutMs: PROBE_TIMEOUT_MS, check: () => checkSession(signal) });
+        if (pendingExecution?.id === executionId) pendingExecution.reviewedRound = modelRound;
+        const observed = parseToolProbeEvidence(record.evidence, names);
+        const announced = observed.available.length ? unlockTools(observed.available) : [];
+        const { evidence: _evidence, ...rest } = record;
+        return result({ ...rest, source: "target-tool-probe", command,
+          requested: names, available: observed.available, missing: observed.missing,
+          unobserved: observed.unobserved, conflicting: observed.conflicting,
+          addedToolNames: announced, grantsPermission: false,
+          note: probeNote(observed, record) });
       },
     },
     {
@@ -331,7 +430,9 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
     },
     {
       name: "get_device_status", label: "Device status",
-      description: "Read connection, UART settings, execution mode, and passive console-state hints (shell/login/password/bootloader/panic/unknown). Hints are untrusted observations, not proof of a shell. Does not expose WiFi credentials.",
+      description: authority
+        ? `Read connection, UART settings, execution authority, and passive console-state hints (shell/login/password/bootloader/panic/unknown). This run is a resident task: executionMode reports the task authority ("${authority}"), while appExecutionMode reports the phone's own execution mode. Hints are untrusted observations, not proof of a shell. Does not expose WiFi credentials.`
+        : "Read connection, UART settings, execution mode, and passive console-state hints (shell/login/password/bootloader/panic/unknown). Hints are untrusted observations, not proof of a shell. Does not expose WiFi credentials.",
       parameters: Type.Object({}, { additionalProperties: false }),
       execute: async (_id, _args, signal) => {
         checkSession(signal);
@@ -340,13 +441,21 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
         // A verified profile names the commands the target has, which is as good
         // as a probe for deciding whether a gated tool can work here.
         const announced = unlockTools(status.profile?.tools || []);
-        return result(announced.length ? { ...status, addedTools: announced } : status);
+        /* Report the task's authority, not just the UI mode the wrapper sees, so
+         * the model never reconciles "Manual" status against pre-approved writes.
+         * The real mode stays visible as appExecutionMode. */
+        const view = authority
+          ? { ...status, executionMode: authority, appExecutionMode: status.executionMode }
+          : status;
+        return result(announced.length ? { ...view, addedTools: announced } : view);
       },
     },
     {
       name: "send_serial_input", label: "Send serial input",
         executionMode: "sequential",
-      description: "Submit text to the target UART under the selected execution mode. The app may wait for the user to approve the exact input. appendEnter appends the configured Enter sequence. A successful send is NOT proof of command completion. Never retry an uncertain send automatically.",
+      description: authority
+        ? "Submit text to the target UART. This is a resident task: ordinary input is pre-approved by the task approval, while destructive commands and commands on the target's always-ask list still wait for the phone owner. appendEnter appends the configured Enter sequence. A successful send is NOT proof of command completion. Never retry an uncertain send automatically."
+        : "Submit text to the target UART under the selected execution mode. The app may wait for the user to approve the exact input. appendEnter appends the configured Enter sequence. A successful send is NOT proof of command completion. Never retry an uncertain send automatically.",
       parameters: Type.Object({
         text: Type.String({ minLength: 1, maxLength: 2048 }),
         appendEnter: Type.Boolean(),
@@ -573,6 +682,28 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
       refreshTools();
     }
     return added.filter(name => toolProfile === 'full' || requestedTools.has(name));
+  }
+
+  /* What a probe result means, in the one place that knows the rule: only the
+   * target's own marker lines are evidence, and only for the commands the tool
+   * asked about. */
+  function probeNote(observed, record) {
+    if (record.delivery !== "sent") {
+      return `The probe was not delivered (${record.delivery}); nothing was unlocked. Do not retry automatically: inspect the execution first.`;
+    }
+    if (record.timedOut) {
+      return `The probe did not answer within ${Math.round(PROBE_TIMEOUT_MS / 1000)} s; nothing was unlocked. Inspect this execution before sending anything else.`;
+    }
+    if (observed.conflicting.length) {
+      return `The target printed contradictory availability for ${observed.conflicting.join(", ")}; nothing was unlocked from it.`;
+    }
+    if (!observed.available.length && !observed.missing.length) {
+      return "The target printed no tool markers for this probe, so nothing was unlocked. A prompt-only or truncated console cannot prove which commands exist.";
+    }
+    if (observed.unobserved.length) {
+      return `Only ${observed.available.concat(observed.missing).join(", ")} answered; ${observed.unobserved.join(", ")} produced no marker, so tools that need it stay locked.`;
+    }
+    return "Availability is the target's own answer to this probe. It says nothing about whether a command works, and gated tools still need every command they list.";
   }
 
   const PRINTABLE = /^[\t\n\r\x20-\x7e\u00a0-\uffff]*$/;
@@ -912,7 +1043,9 @@ export function createSerialAgent({ config, device, onEvent, stream = null, webR
       // An unfinished recovery survives a stopped/failed question. Both entry
       // points require fresh device evidence, not just the task-summary button.
       recovering ||= Boolean(restored) || Boolean(recovery);
-      executionMode = device.mode;
+      /* The prompt is rebuilt per question. A resident run keeps its authority
+       * mode; a human run tracks the mode the user selected. */
+      executionMode = authority || device.mode;
       checkSession();
       const liveCheckpoint = taskCheckpoint();
       const checkpoint = savedCheckpoint(recovery?.checkpoint || (liveCheckpoint.pendingExecutions.length ? liveCheckpoint : null));

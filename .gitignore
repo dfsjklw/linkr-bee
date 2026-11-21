@@ -22,9 +22,21 @@ log_*.txt
 
 # Local tooling state
 .reasonix/
+# Dependencies installed into the linked agent plugins (npm install linkr-bee-cli)
+linkr-bee-dsh/node_modules/
+linkr-bee-opencode/node_modules/
+# The OpenCode plugin commits its prebuilt UI bundles and ships them in npm, so
+# keep them despite the generic dist/ rule above.
+!linkr-bee-opencode/dist/
+!linkr-bee-opencode/dist/*
+
+# Local screen captures from KVM automation runs
+.linkr/
 
 # Mobile app dependencies and generated output
 mobile/node_modules/
+# tools/build_agent_bundle.sh installs esbuild here
+web/node_modules/
 mobile/dist/
 mobile/test-results/
 mobile/playwright-report/
@@ -35,6 +47,8 @@ harmonyos/oh_modules/
 harmonyos/local.properties
 harmonyos/entry/oh_modules/
 harmonyos/signing/
+# Signing material is per-machine: the tree ships the template, DevEco writes this.
+harmonyos/build-profile.json5
 harmonyos/**/*.cer
 harmonyos/**/*.p12
 harmonyos/**/*.p7b
@@ -50,3 +64,9 @@ harmonyos/**/*.p7b
 
 # Binaries built for a machine to try
 bin/
+# …except an npm package's launcher, which lives in bin/ by npm's own convention.
+!tools/linkr-tui/npm/bin/
+!tools/linkr-tui/npm/bin/**
+# Firmware images and the manifest behind flash.html are staged by
+# tools/build_firmware_manifest.py (CI runs it against the release artifacts).
+web/firmware/

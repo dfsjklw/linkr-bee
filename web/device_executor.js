@@ -1,4 +1,5 @@
-import { requiresInputApproval } from "./agent_execution_policy.js";
+import { SHELL_FUNCTION, shellIntegrationCommand, shellQuote } from "./shell_integration.js";
+import { createInputLineTracker, requiresInputApproval, serialInputReview } from "./agent_execution_policy.js";
 import { parseDeviceProfile } from "./device_profile.js";
 import { inspectSerialConsole } from "./serial_console.js";
 import { inputFingerprint } from "./agent_task_state.js";
@@ -12,7 +13,7 @@ const cancelled = () => new Error("Operation cancelled. Do not retry automatical
  * so no UI path can leave the mode armed. */
 export const FULL_AUTO_WINDOW_MS = 15 * 60 * 1000;
 
-export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInput, onRecord,
+export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInput, onRecord, readExecutionEvents = null,
   getCommandPolicy = () => ({ alwaysAsk: [], allow: [] }), onModeTimeout = null,
   fullAutoWindowMs = FULL_AUTO_WINDOW_MS }) {
   let mode = "auto";
@@ -24,6 +25,61 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
   const records = [];
   let profile = null;
   let toolCapabilities = {};
+  let shellIntegration = null;
+  /* The unfinished console input line, per device session. A serial console is
+   * a line editor, so a write is only a command in combination with what the
+   * next write completes; this is what lets `r` followed by `m -rf /tmp/x` be
+   * classified as the `rm -rf /tmp/x` it is. */
+  const inputLines = createInputLineTracker();
+  function shellStatus() {
+    const status = getStatus();
+    if (shellIntegration && (shellIntegration.sessionId !== status.sessionId || !status.connected)) shellIntegration = null;
+    if (shellIntegration?.status === "ready") {
+      const integration = shellIntegration;
+      const recent = readLog({after:integration.cursor, limit:1});
+      if (recent.truncated) shellIntegration = null;
+      else if (recent.latestCursor > integration.cursor) {
+        const events = readExecutionEvents?.({before:recent.latestCursor}) || [];
+        // Boot-like text inside an observed command is ordinary command output,
+        // e.g. cat /proc/version. Scan only ambient spans outside its C/D frame.
+        const ranges = records.flatMap(record => {
+          const tracking = record.shellTracking;
+          if (record.sessionId !== status.sessionId || tracking?.nonce !== integration.nonce || tracking.phase !== "command") return [];
+          const matches = events.filter(event => event.nonce === tracking.nonce && event.sequence === tracking.sequence && event.start >= record.logStart);
+          const start = record.shellStartedAt ?? matches.find(event => event.phase === "C")?.end;
+          if (start === undefined) return [];
+          const end = matches.find(event => event.phase === "D" && event.start >= start)?.end ??
+            (record.observationClosed ? record.observedEnd : recent.latestCursor);
+          return end > start ? [[start, end]] : [];
+        }).sort((left, right) => left[0] - right[0]);
+        let cursor = integration.cursor, tail = integration.healthTail || "";
+        const scan = until => {
+          while (cursor < until) {
+            const page = readLog({after:cursor, limit:Math.min(16000, until - cursor)});
+            if (page.truncated || page.cursor <= cursor) { shellIntegration = null; return false; }
+            const text = tail + page.text;
+            if (/(?:^|\n)(?:Linux version |U-Boot |.* login:)/.test(text)) { shellIntegration = null; return false; }
+            // Carry a bounded line prefix across BLE fragments and paged reads.
+            tail = text.slice(text.lastIndexOf("\n") + 1).slice(0, 512);
+            cursor = page.cursor;
+          }
+          return true;
+        };
+        for (const [start, end] of ranges) {
+          if (end <= cursor || start >= recent.latestCursor) continue;
+          if (!scan(Math.min(start, recent.latestCursor))) break;
+          cursor = Math.max(cursor, Math.min(end, recent.latestCursor));
+          tail = "";
+        }
+        if (shellIntegration && scan(recent.latestCursor)) {
+          integration.cursor = cursor;
+          integration.healthTail = tail;
+        }
+      }
+    }
+    return shellIntegration ? {status:shellIntegration.status, sequence:shellIntegration.sequence} : {status:"disabled"};
+  }
+
   const snapshot = (record) => structuredClone(record);
   const publish = (record) => { if (records.includes(record)) onRecord?.(snapshot(record)); };
   function consoleState() {
@@ -118,9 +174,40 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
         if (bytes) record.download.bytes = Number(bytes[1]);
       }
       if (record.completionToken) {
-        const match = record.evidence.match(new RegExp(`(?:^|\\n)${record.completionToken}:([0-9]{1,3})\\r?\\n`));
-        if (match && Number(match[1]) <= 255) {
-          record.exitCode = Number(match[1]);
+        let exitCode;
+        if (record.shellTracking) {
+          const tracking = record.shellTracking;
+          const events = (readExecutionEvents?.({after:record.logStart, before:record.observedEnd}) || [])
+            .filter(event => event.nonce === tracking.nonce);
+          if (tracking.phase === "setup") {
+            if (events.some(event => event.sequence === 0 && event.phase === "R")) {
+              exitCode = 0;
+              shellIntegration = {status:"ready", nonce:tracking.nonce, sequence:0, sessionId:record.sessionId, cursor:record.observedEnd};
+            }
+          } else {
+            const started = events.find(event => event.sequence === tracking.sequence && event.phase === "C");
+            if (started) record.shellStartedAt ??= started.end;
+            const finished = events.filter(event => event.sequence === tracking.sequence && event.phase === "D" && event.start >= record.shellStartedAt);
+            if (finished.length === 1) exitCode = finished[0].exitCode;
+            if (exitCode === undefined && hint.kind === "shell" && record.evidence) {
+              // A prompt alone never proves completion. The helper may have
+              // disappeared or an intermediate terminal may have stripped OSC.
+              shellIntegration = null;
+              record.error = "Shell boundary unconfirmed; integration disabled for future commands. Input was not retried.";
+            }
+            if (events.some(event => event.sequence > tracking.sequence)) {
+              exitCode = undefined; shellIntegration = null;
+              record.observation = "interrupted"; record.observationClosed = true;
+              record.error = "Shell integration sequence changed; input was not retried.";
+            }
+          }
+        } else {
+          const match = record.evidence.match(new RegExp(`(?:^|\\n)${record.completionToken}:([0-9]{1,3})\\r?\\n`));
+          if (match && Number(match[1]) <= 255) exitCode = Number(match[1]);
+        }
+        if (exitCode !== undefined) {
+          if (record.error?.startsWith("Shell boundary unconfirmed")) delete record.error;
+          record.exitCode = exitCode;
           record.executionStatus = "completed";
           record.observationClosed = true;
           if (record.toolProbe && record.exitCode === 0 && !record.evidenceTruncated) {
@@ -167,7 +254,7 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       }
     }
   }
-  return {
+  const api = {
     get mode() { return mode; },
     setMode(value) {
       if (!["auto", "manual", "full-auto"].includes(value)) throw new Error("Unknown execution mode.");
@@ -180,9 +267,26 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       else clearModeTimer();
     },
     cancel,
+    enableShellIntegration(signal) {
+      if (!readExecutionEvents) throw new Error("This client cannot read shell integration markers.");
+      if (active || needsObservation()) throw new Error("Finish or stop observing the current execution before enabling shell integration.");
+      const nonce = crypto.randomUUID().replaceAll("-", "");
+      return api.execute({text:shellIntegrationCommand(nonce), appendEnter:true}, signal, {userApproved:true, shellSetup:nonce});
+    },
+    disableShellIntegration() { shellIntegration = null; },
+    expireShellIntegration(id) {
+      const record = records.find(item => item.id === id && item.shellTracking?.phase === "setup");
+      if (!record || record.observationClosed) return;
+      record.observationClosed = true;
+      record.error = "Shell integration handshake was not received; input was not retried.";
+      shellIntegration = null;
+      publish(record);
+    },
     forgetProfile() { profile = null; toolCapabilities = {}; },
     reset() {
       cancel();
+      shellIntegration = null;
+      inputLines.reset();
       clearModeTimer();
       // A new conversation/session ends the unattended execution window.
       if (mode === "full-auto") mode = "auto";
@@ -203,10 +307,14 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
           /(?:^|\n)(?:Linux version |U-Boot |.* login:)/.test(recent.text || '');
         capability.cursor = recent.cursor ?? capability.cursor;
       }
-      return { ...status, executionMode: mode, executionModeExpiresAt: mode === "full-auto" ? modeExpiresAt : 0,
+      return { ...status, shellIntegration:shellStatus(), executionMode: mode, executionModeExpiresAt: mode === "full-auto" ? modeExpiresAt : 0,
         console: consoleState(), profile, toolCapabilities:structuredClone(toolCapabilities) };
     },
     readLog(options) { return readLog(options); },
+    /* The unfinished console input line this executor has seen for the current
+     * session. A caller that must classify a write before asking (the MCP gate)
+     * reads it here so its decision matches the one this executor makes. */
+    pendingInputLine() { return inputLines.current(getStatus().sessionId); },
     getRecords() { return records.filter((record) => record.sessionId === getStatus().sessionId).map(snapshot); },
     inspectExecution,
     needsObservation,
@@ -224,7 +332,20 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       active.rejectApproval(new Error("User rejected this input. Do not request it again."));
       return true;
     },
-    async execute(args, signal, { userApproved = false } = {}) {
+    /* `userApproved` is an ordinary-command approval, and it is text-scoped: the
+     * caller showed this exact text on its own surface (the MCP phone card, a
+     * resident task's sensitive-command card, or a button the user pressed that
+     * sends an app-built command such as the target-identity bind). The executor
+     * re-applies the destructive guard and honours the approval only while the
+     * write runs that same string.
+     *
+     * The trade-off is deliberate: a write that continues the console's
+     * unfinished input line executes a different, longer string, so the approval
+     * is ignored there — destructive text that only emerges after the join is
+     * never covered. That is the shard bypass. A caller that classified the
+     * joined line itself may assert coverage with `sensitiveApproved`
+     * (web/mcp_server.js does, from the same console line this executor sees). */
+    async execute(args, signal, { userApproved = false, sensitiveApproved = false, approvalInputState = null, shellSetup = null, hideTerminalEcho = false } = {}) {
       signal?.throwIfAborted();
       if (active) throw new Error("Another serial action is still active.");
       if (typeof args?.text !== "string" || !args.text.length || args.text.length > 2048 || typeof args.appendEnter !== "boolean") {
@@ -232,6 +353,21 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       }
       const status = getStatus();
       if (!status.connected) throw new Error("Device is disconnected.");
+      /* A phone approval covers the input line as it stood when it was shown,
+       * not just these bytes. Copy the snapshot so a caller cannot update its
+       * meaning while hashing the request or waiting on another approval. */
+      const approvedInput = approvalInputState === null ? null : { ...approvalInputState };
+      const checkApprovedInput = () => {
+        if (approvedInput === null) return;
+        const current = getStatus();
+        if (!current.connected || current.sessionId !== approvedInput.sessionId ||
+            current.inputRevision !== approvedInput.inputRevision ||
+            (current.inputPending === true) !== approvedInput.inputPending ||
+            inputLines.current(current.sessionId) !== approvedInput.pendingLine) {
+          throw new Error("Terminal input changed after approval; request a new command before sending.");
+        }
+      };
+      checkApprovedInput();
       const download = args.download;
       const profileProbe = args.profileProbe;
       const toolProbe = args.toolProbe;
@@ -242,18 +378,41 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       // Hash the requested operation before wrapping it with a fresh exit token.
       // A reloaded executor can reuse serial-1; executorId prevents false matches.
       const requestedInput = {text:args.text, appendEnter:args.appendEnter};
-      let completionToken;
-      if (args.trackExit) {
+      /* Commands this app builds itself (its probes, the verification,
+       * file-read and download builders, and the shell handshake) are constants,
+       * not model text: their quoting cannot hide a command, and the read-only
+       * builders contain words the deliberately broad guard matches by accident
+       * (`dd` in a file read). They stay exempt from the opaque-input rule and
+       * from the ordinary-approval re-check; the mode gate still classifies
+       * them. Read the marker before the tracked wrapper replaces `args`. */
+      const appComposed = shellSetup !== null || args.applicationReadOnly === true ||
+        Boolean(profileProbe) || Boolean(toolProbe) || Boolean(download);
+      // Keep application-owned housekeeping on its execution card. This is
+      // display metadata only: approvals, wire bytes and evidence stay intact.
+      // A model/user command is never hidden just because it is read-only.
+      const terminalEcho = hideTerminalEcho || shellSetup !== null || args.applicationReadOnly === true ||
+        Boolean(profileProbe) || Boolean(toolProbe) ? "hidden" : "command";
+      let completionToken, shellTracking;
+      shellStatus();
+      if (args.trackExit || shellSetup) {
         if (status.inputPending || consoleState().kind !== "shell" || !args.appendEnter) {
           throw new Error("Tracked commands require an idle, observed POSIX shell prompt.");
         }
-        completionToken = `LINKR_EXIT_${crypto.randomUUID().replaceAll("-", "")}`;
-        const quoted = "'" + args.text.replaceAll("'", "'\\''") + "'";
-        args = { text: `sh -c ${quoted}; printf '\\n%s:%s\\n' '${completionToken}' "$?"`, appendEnter: true };
+        if (shellSetup || shellIntegration?.status === "ready") {
+          const nonce = shellSetup || shellIntegration.nonce;
+          const sequence = shellSetup ? 0 : shellIntegration.sequence + 1;
+          if (sequence > 999999999) { shellIntegration = null; throw new Error("Shell counter exhausted; enable integration again."); }
+          shellTracking = {protocol:"osc", nonce, sequence, phase:shellSetup ? "setup" : "command"};
+          completionToken = `LINKR_OSC_${nonce}_${sequence}`;
+          if (!shellSetup) args = {text:`${SHELL_FUNCTION} ${shellQuote(args.text)}`, appendEnter:true};
+        } else {
+          completionToken = `LINKR_EXIT_${crypto.randomUUID().replaceAll("-", "")}`;
+          args = {text:`sh -c ${shellQuote(args.text)}; printf '\\n%s:%s\\n' '${completionToken}' "$?"`, appendEnter:true};
+        }
         if (args.text.length > 2048) throw new Error("Tracked command is too long after shell quoting.");
       }
-      const record = { executorId, profileProbe, toolProbe:toolProbe?.slice(), download, completionToken, id: `serial-${++nextId}`, sessionId: status.sessionId, inputRevision: status.inputRevision,
-        payload: prepareInput(args), mode, console: consoleState(), state: "proposed", delivery: "not-sent",
+      const record = { executorId, profileProbe, toolProbe:toolProbe?.slice(), download, completionToken, shellTracking, id: `serial-${++nextId}`, sessionId: status.sessionId, inputRevision: status.inputRevision,
+        command: requestedInput.text, terminalEcho, payload: prepareInput(args), mode, console: consoleState(), state: "proposed", delivery: "not-sent",
         executionStatus: "unknown", createdAt: new Date().toISOString(), evidence: "", observation: "no-output" };
       const controller = new AbortController();
       const operation = { record, controller };
@@ -262,8 +421,23 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       signal?.addEventListener("abort", abort, { once: true });
       records.push(record);
       if (records.length > 50) records.shift();
+      /* Classify the write against the console state as a whole: the unfinished
+       * input line is what makes the fragment-plus-completion path visible to
+       * the guard. */
+      const inputReview = serialInputReview({
+        text: requestedInput.text, appendEnter: requestedInput.appendEnter, payload: record.payload,
+        pendingLine: inputLines.current(status.sessionId), inputPending: status.inputPending === true,
+      });
+      /* Approval is text-scoped: it is honoured only while the write runs the
+       * string the caller showed, never when a pending line makes the executed
+       * command a different one. */
+      const needsApproval = userApproved
+        ? !sensitiveApproved && !appComposed && inputReview.continuesPendingLine && inputReview.needsReview
+        : requiresInputApproval(mode, {...args, text:requestedInput.text}, record.payload,
+          status.inputPending, getCommandPolicy(), appComposed ? null : inputReview) ||
+          inputReview.destructive || (mode === "auto" && record.console.kind !== "shell");
       try {
-        if (!userApproved && (requiresInputApproval(mode, args, record.payload, status.inputPending, getCommandPolicy()) || (mode === "auto" && record.console.kind !== "shell"))) {
+        if (needsApproval) {
           record.state = "awaiting-approval";
           await new Promise((resolve, reject) => {
             let settled = false;
@@ -283,14 +457,38 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
         check(record, controller.signal);
         record.requestFingerprint = await inputFingerprint(requestedInput);
         check(record, controller.signal);
+        checkApprovedInput();
         // Close older observations before another command can contribute output.
         observe();
+        // Observing a prior incomplete operation can invalidate the helper.
+        if (shellTracking?.phase === "command" && (shellIntegration?.status !== "ready" ||
+            shellIntegration.nonce !== shellTracking.nonce || shellIntegration.sequence + 1 !== shellTracking.sequence)) {
+          throw new Error("Shell integration changed; request a new command before sending.");
+        }
         for (const previous of records) if (previous !== record) previous.observationClosed = true;
         record.logStart = readLog({ limit: 1 }).latestCursor;
         record.observedEnd = record.logStart;
         record.state = "sending";
         record.delivery = "unknown";
-        publish(record);
+        try {
+          /* Persist the fingerprint and uncertain reference before bytes can
+           * reach the wire, so a reload cannot silently replay the operation. */
+          publish(record);
+          /* The synchronous observer may itself change terminal input. Keep
+           * approval validation after it and immediately before dispatch. */
+          controller.signal.throwIfAborted();
+          checkApprovedInput();
+        } catch (error) {
+          // Nothing was attempted: retract the tentative pending reference.
+          record.delivery = "not-sent";
+          throw error;
+        }
+        if (shellTracking) shellIntegration = {status:shellSetup ? "enabling" : "ready", nonce:shellTracking.nonce,
+          sequence:shellTracking.sequence, sessionId:record.sessionId, cursor:record.logStart, healthTail:shellIntegration?.healthTail || ""};
+        /* Remember what the console input line becomes before transport: a
+         * failed write may still have reached it, and over-remembering a
+         * fragment only costs one extra confirmation on the next write. */
+        inputLines.record(record.sessionId, record.payload);
         const receipt = await sendInput(record.payload, record.sessionId, controller.signal, record.inputRevision);
         record.delivery = "sent";
         record.sentRevision = receipt?.inputRevision ?? getStatus().inputRevision;
@@ -301,6 +499,7 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
         publish(record);
         return inspectExecution(record.id);
       } catch (error) {
+        if (shellTracking && record.delivery !== "not-sent") shellIntegration = null;
         if (record.state !== "denied") record.state = controller.signal.aborted ? "cancelled" : "failed";
         record.error = error.message;
         record.observationClosed = true;
@@ -312,4 +511,5 @@ export function createDeviceExecutor({ getStatus, readLog, prepareInput, sendInp
       }
     },
   };
+  return api;
 }

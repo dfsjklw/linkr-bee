@@ -15,7 +15,9 @@ BLE access and exposes it through the JSON-RPC contract in
   requests `ohos.permission.ACCESS_BLUETOOTH` at runtime;
 - Management Service-filtered scan and native device picker;
 - GATT connect, service discovery, MTU 247 request, serialized reads/writes, and
-  indication subscriptions;
+  subscriptions that pick notification or indication from the characteristic's
+  declared properties (NUS TX is notify-only; Management/Reliable UART use
+  indications);
 - ArkWeb-to-ArkTS request dispatch plus notification and disconnect events;
 - shared web resource build and automatic copy into `resources/rawfile/`.
 
@@ -62,9 +64,25 @@ with the project owner's HUAWEI ID, and wait for DevEco Studio to populate the
 debug signing configuration. The resulting certificates, keystore, and profile
 files are ignored by Git and must not be committed.
 
+The tree ships `build-profile.json5.template`, whose signing material is
+placeholder text: copy it to `build-profile.json5` (gitignored) and let DevEco
+Studio fill the paths and passwords on your machine, or let DevEco generate the
+file from scratch. A committed `build-profile.json5` is a mistake: it carries
+one person's absolute paths and encrypted passwords, and it makes the project
+unbuildable everywhere else.
+
 After signing is configured, use DevEco Studio's **Run** action for a simulator
 or device. The command-line build continues to produce an unsigned HAP unless
 the generated `signingConfigs` entry is available to hvigor.
+
+BLE pairing uses `ohos.permission.ACCESS_BLUETOOTH`. The app does not use the
+persistent device-address APIs, so it does not declare
+`ohos.permission.PERSISTENT_BLUETOOTH_PEERS_MAC`. That permission is intended for
+persistent device identifiers, requires an authorized ACL in the signing
+profile, and does not replace the Bluetooth runtime permission. Only add it
+alongside an implementation of that feature and the corresponding signing
+instructions; declaring it for ordinary pairing can prevent installation with a
+profile that lacks the ACL.
 
 ## Host-side verification
 
@@ -76,13 +94,17 @@ npm test
 ```
 
 These tests cover request/result correlation, binary read/write conversion,
-indication forwarding, host errors, remote disconnect cleanup, and the 30-second
-native request timeout.
+indication forwarding, host errors, remote disconnect cleanup, and method-specific
+native request timeouts. Host callback tests also cover explicit first-host
+pairing, bonded reconnects, rejection, timeout, and stale-session cancellation.
 
 ## Validation boundary
 
-Firmware now requires encrypted, bonded BLE access. On C3/C5, hold GPIO1 to GND
-and pair in the system Bluetooth UI before connecting a new host. WROOM ships
+Firmware requires encrypted, bonded BLE access. On C3/C5, hold GPIO1 to GND
+before connecting a new host and accept the system pairing prompt. The app
+explicitly requests pairing for an unbonded host and waits up to 60 seconds for
+the bond before negotiating MTU or accessing GATT services. It reuses an existing
+bond and never deletes old bonds automatically. WROOM ships
 with pairing authorization disabled, so no GPIO4 press is needed there; GPIO4 is
 used only when `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y`. Existing bonded
 hosts do not need the pairing GPIO.

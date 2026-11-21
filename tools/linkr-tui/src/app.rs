@@ -33,6 +33,16 @@ use crate::{dialogs, palette};
 /// link cannot exist without the chrome having a word for it.
 pub use crate::transport::LinkKind as Transport;
 
+/// A board's way of saying it does not know a command.
+///
+/// The firmware's generic refusal is `ERR unknown command`; an optional block
+/// that is compiled out says `unsupported`. Both mean the same thing to a
+/// capability probe: hide the controls, do not report a failure.
+fn is_unsupported_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("unknown command") || error.contains("unsupported")
+}
+
 /// Whether this session has a LAN token in hand, for the sidebar to say.
 ///
 /// Three states rather than a bool, because "no token" and "there is no token
@@ -201,8 +211,34 @@ pub struct DialJob {
     /// Whether this dial was the startup scan's own; its arrival is not
     /// announced. See [`App::quiet_connect`].
     pub quiet: bool,
+    cancelled: bool,
     /// Where the thread posts the opened link, or why it could not.
     rx: std::sync::mpsc::Receiver<io::Result<OpenedLink>>,
+}
+
+// A quit can drop the app before poll_dial sees a queued or pending result.
+// Release that result off the UI thread as well; dropping the receiver alone
+// would abandon a successfully opened BLE connection.
+impl Drop for DialJob {
+    fn drop(&mut self) {
+        let (_, empty) = std::sync::mpsc::channel();
+        let rx = std::mem::replace(&mut self.rx, empty);
+        match rx.try_recv() {
+            Ok(Ok(opened)) => {
+                std::thread::spawn(move || {
+                    let _ = opened.hang_up();
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::spawn(move || {
+                    if let Ok(Ok(opened)) = rx.recv() {
+                        let _ = opened.hang_up();
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 impl std::fmt::Debug for DialJob {
@@ -213,6 +249,81 @@ impl std::fmt::Debug for DialJob {
             .field("dial", &self.dial)
             .field("quiet", &self.quiet)
             .finish()
+    }
+}
+
+/// How long the automatic redial waits before each attempt, in order.
+///
+/// Six attempts spread over a little under two minutes: long enough for a
+/// board that is rebooting or a bridge that is restarting, short enough that a
+/// board which is simply switched off does not keep a program dialling all
+/// afternoon. The sequence is bounded on purpose — a redial that never gave up
+/// would be a program that never told the user the link was gone, and the
+/// last word here is the one the interface owes them. See [`AutoReconnect`].
+pub const AUTO_RECONNECT_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+
+/// The wait before automatic attempt number `attempt` (zero-based), or `None`
+/// once the six are spent.
+///
+/// Pure on purpose: the schedule is the part of reconnection worth testing,
+/// and a test that had to sit through a minute and a half to read it would not
+/// be run. The state machine that spends these waits — [`AutoReconnect`] — is
+/// the only caller, and it asks this rather than keeping its own copy.
+pub fn auto_reconnect_delay(attempt: usize) -> Option<Duration> {
+    AUTO_RECONNECT_DELAYS.get(attempt).copied()
+}
+
+/// The automatic redial that follows an unexpected link loss.
+///
+/// One of these exists only between the loss and the first of the three things
+/// that end it: the link comes back, the user takes the wheel, or the sixth
+/// attempt fails. It owns the dial being repeated, so a LAN token stays inside
+/// it and never reaches a notice — what the interface shows is
+/// [`Dial::describe`], which leaves the token out by construction. See
+/// [`App::begin_auto_reconnect`] for where it starts and
+/// [`App::cancel_reconnect`] for every way out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReconnect {
+    /// The dial that last opened the link. Repeated verbatim, token included.
+    dial: Dial,
+    /// How many attempts have been launched, which is also the index of the
+    /// next wait in [`AUTO_RECONNECT_DELAYS`].
+    attempt: usize,
+    /// When the next attempt is due.
+    due: Instant,
+    /// Whether the attempt that was due has been launched and the dial it
+    /// started is in flight. While this is set the wait is not consulted; what
+    /// ends the wait is the landing, collected by [`App::poll_dial`].
+    in_flight: bool,
+}
+
+impl AutoReconnect {
+    /// The dial this redial repeats.
+    pub fn dial(&self) -> &Dial {
+        &self.dial
+    }
+
+    /// How many attempts have been launched so far, out of
+    /// [`AUTO_RECONNECT_DELAYS`]'s length.
+    pub fn attempt(&self) -> usize {
+        self.attempt
+    }
+
+    /// Whether an attempt is on the wire right now.
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    /// When the next attempt is due. Meaningless while [`Self::in_flight`].
+    pub fn due(&self) -> Instant {
+        self.due
     }
 }
 
@@ -374,6 +485,11 @@ const WIFI_EVENT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(
 /// it is a join.
 const WIFI_BUSY_RETRIES: u32 = 4;
 
+/// How often a session asks who owns the console. The firmware has no push
+/// event for a hand-over, so a client that stopped asking would keep painting
+/// "In control" after another session took it.
+const CONTROL_POLL: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// The pause before the attempt that follows `spent` refused ones.
 ///
 /// It lengthens: the first attempt is for the second or two a join takes to
@@ -531,6 +647,14 @@ impl WifiOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelLayout {
+    pub sidebar: bool,
+    pub assistant: bool,
+    pub view: View,
+    pub focus: Focus,
+}
+
 /// Everything one frame paints.
 ///
 /// Not `Clone`: the session owns a live link, and a second copy of a session is
@@ -562,6 +686,7 @@ pub struct App {
     /// squeezing the pane, and the full-width assistant view (F5) is where a
     /// small window reads a conversation.
     pub assistant_panel: bool,
+    pub layout_restore: Option<PanelLayout>,
     /// Whether frames are painted for the legacy Windows console (conhost).
     ///
     /// Set once by the event loop before the first paint, and false everywhere
@@ -614,6 +739,8 @@ pub struct App {
     pub traffic: crate::traffic::Traffic,
     /// The link speed once the device has reported one.
     pub baud: Option<u32>,
+    /// The full format reported by the bridge, for management clients.
+    pub uart_settings: Option<accessory::UartSettings>,
     /// The signal the link is carrying, in dBm. Unknown until connected.
     pub signal_dbm: Option<i32>,
     pub autoscroll: bool,
@@ -662,6 +789,62 @@ pub struct App {
     /// The scan whose answer has not arrived, or that is owed another attempt
     /// after being refused. See [`ScanRetry`].
     pub scan_retry: Option<ScanRetry>,
+    /// Identity addresses whose paired-device labels are still to be read after
+    /// a `bonds?` answer. One management question at a time, so they queue.
+    pub bond_label_queue: VecDeque<String>,
+    /// A link came up while the network view was open, and the paired-device
+    /// list has not been read yet. It waits for a free question slot.
+    pub bonds_read_pending: bool,
+    /// Which session owns the shared console, when the board arbitrates it.
+    /// A board advertising arbitration must report a grant before input is writable.
+    pub control: Option<crate::device::ControlStatus>,
+    /// A link came up and ownership has not been asked about yet. It goes
+    /// first, before the name and the token: whether this session may type is
+    /// the answer every later action depends on.
+    pub control_read_pending: bool,
+    /// The next ownership answer may take the console when nobody owns it.
+    /// Set for the connect-time query only, so a session that deliberately
+    /// released control is not handed it back by the next poll.
+    pub control_auto_claim: bool,
+    /// Bytes typed while read-only, waiting for the idle claim that would let
+    /// them through.
+    pub held_input: Vec<u8>,
+    /// An idle claim is in flight for [`App::held_input`].
+    pub control_claim_in_flight: bool,
+    /// When the next quiet ownership poll is due. Polling is how this session
+    /// notices that another client took the console, which the firmware has no
+    /// push event for.
+    pub control_poll_due: Option<Instant>,
+    /// The session this one took the console from, if any, so "hand over" has
+    /// somewhere to hand it back to.
+    pub control_handover: Option<u32>,
+    /// A release or hand-over is out, so losing control is what was asked for
+    /// and must not be announced as another session seizing it.
+    pub control_yield: bool,
+    /// The LAN bridge has announced ownership, by sending its first
+    /// `OK control …` frame after authentication.
+    ///
+    /// The socket has no capability word, so this announcement is the feature
+    /// flag: an old bridge never sends it and the TUI never probes with a
+    /// command it would not understand.
+    pub control_announced: bool,
+    /// A CLI caller already waited for this LAN connection's optional announcement.
+    pub control_announcement_waited: bool,
+    /// Why the last ownership command was refused (`busy`, `not_owner`, …).
+    /// Kept for callers without a toast stack — a script must be able to say
+    /// what the bridge said instead of printing a mode that did not move.
+    pub control_error: Option<String>,
+    /// When a delayed removal is due to be read back; see [`App::pump`].
+    pub bond_refresh_due: Option<Instant>,
+    /// Whether the label command in flight is the automatic "this host has no
+    /// label yet" report, whose refusal is not worth a notice.
+    pub bond_self_write: bool,
+    /// An explicit label write/removal needs its own acknowledgement; the
+    /// view's cached value and the end of a wait cannot confirm it.
+    pub bond_mutation_pending: bool,
+    pub bond_mutation_result: Option<Result<String, String>>,
+    /// Whether this link has already tried to report this host's label.
+    pub bond_self_reported: bool,
     /// The LAN access state `@s?` reported, token included.
     pub lan_status: LanStatus,
     /// Whether a token is in hand, which is what the sidebar shows.
@@ -690,6 +873,14 @@ pub struct App {
     /// announced to nobody: a program that announces its own routine has a
     /// corner full of its own voice.
     pub quiet_connect: bool,
+    /// Whether an unexpected loss is dialled again on its own. On by default;
+    /// `--no-auto-reconnect` turns it off for a session that wants a dropped
+    /// link to stay dropped.
+    pub auto_reconnect: bool,
+    /// The automatic redial in progress, if any. See [`AutoReconnect`]: it
+    /// exists only after a link that had been live died, and every hand on the
+    /// wheel puts it away.
+    pub reconnecting: Option<AutoReconnect>,
     /// The assistant's session state for the assistant view.
     pub assistant: crate::views::assistant::AssistantState,
     /// The agent's durable state: tasks, notes and the saved session.
@@ -735,6 +926,12 @@ pub struct App {
     pub agent_replies: Vec<crate::agent::runtime::PendingReply>,
     /// The device's own output, as the serial pane shows it.
     pub terminal: TerminalPane,
+    /// The target tty's size, and whether it is safe to tell it yet.
+    ///
+    /// Kept beside the pane because the two must agree: the pane wraps at the
+    /// width it was sized to, and the remote shell wraps at the width it was
+    /// last told. See [`crate::serial::geometry`].
+    pub geometry: crate::serial::geometry::TerminalGeometrySync,
     /// Whether the pane's first undecodable byte has already been announced.
     ///
     /// Said once, not once per read: a device that speaks something that is
@@ -799,6 +996,17 @@ pub struct App {
     pub collect_output: bool,
     /// What the target has said, kept only while [`Self::collect_output`] is on.
     pub output: VecDeque<Vec<u8>>,
+    /// Whether a `watch` caller wants the console's raw byte stream.
+    ///
+    /// Apart from [`Self::collect_output`] because the two answer different
+    /// questions: a script run wants the bytes *it* caused, a watched console
+    /// wants every byte the target says — escape sequences included, which the
+    /// journal masks to NUL and a terminal on the far end needs for colour.
+    pub watch_armed: bool,
+    /// Raw bytes said while [`Self::watch_armed`], drained by the session's
+    /// watcher on every idle tick. Bounded by chunk count, which the watcher
+    /// never approaches because it drains on the beat it fills.
+    pub watch_bytes: VecDeque<Vec<u8>>,
     /// The live link, when one is open. Owns the threads and the counters; the
     /// frame only ever reads what the pump folded out of it.
     pub session: Session,
@@ -830,6 +1038,7 @@ impl Default for App {
             latch: Latch::default(),
             sidebar_visible: true,
             assistant_panel: true,
+            layout_restore: None,
             legacy_console: false,
             no_splash: false,
             splash_until: None,
@@ -843,6 +1052,7 @@ impl Default for App {
             tx: 0,
             traffic: crate::traffic::Traffic::default(),
             baud: None,
+            uart_settings: None,
             signal_dbm: None,
             autoscroll: true,
             clock: "00:00:00".to_string(),
@@ -851,13 +1061,7 @@ impl Default for App {
             // No frame has been drawn yet; the event loop fills this in on its
             // first tick, before any key can arrive.
             screen: Rect::default(),
-            quick_send: vec![
-                QuickSend::new("help"),
-                QuickSend::new("version"),
-                QuickSend::new("uname -a"),
-                QuickSend::new("df -h"),
-                QuickSend::guarded("reboot"),
-            ],
+            quick_send: Vec::new(),
             watch: Vec::new(),
             notices: Vec::new(),
             toast_until: Vec::new(),
@@ -869,6 +1073,24 @@ impl Default for App {
             ble_name_read_pending: false,
             lan_token_read_pending: false,
             scan_retry: None,
+            bond_label_queue: VecDeque::new(),
+            bonds_read_pending: false,
+            control: None,
+            control_read_pending: false,
+            control_auto_claim: false,
+            held_input: Vec::new(),
+            control_claim_in_flight: false,
+            control_poll_due: None,
+            control_handover: None,
+            control_yield: false,
+            control_announced: false,
+            control_announcement_waited: false,
+            control_error: None,
+            bond_refresh_due: None,
+            bond_self_write: false,
+            bond_mutation_pending: false,
+            bond_mutation_result: None,
+            bond_self_reported: false,
             lan_status: LanStatus::default(),
             lan_captured: LanCapture::default(),
             lan_host: String::new(),
@@ -877,6 +1099,8 @@ impl Default for App {
             scan_connects_one: false,
             dialing: None,
             quiet_connect: false,
+            auto_reconnect: true,
+            reconnecting: None,
             assistant: crate::views::assistant::AssistantState::default(),
             agent_store: None,
             agent_device: "unknown".to_string(),
@@ -890,6 +1114,7 @@ impl Default for App {
             agent_client: None,
             agent_replies: Vec::new(),
             terminal: TerminalPane::new(),
+            geometry: crate::serial::geometry::TerminalGeometrySync::new(80, 24),
             decode_loss_noticed: false,
             enter: crate::serial::keys::EnterMode::default(),
             escape: 0x1d,
@@ -899,6 +1124,8 @@ impl Default for App {
             trace_file: None,
             collect_output: false,
             output: VecDeque::new(),
+            watch_armed: false,
+            watch_bytes: VecDeque::new(),
             talk: Conversation::new(),
             management: crate::protocol::ManagementReassembler::default(),
             watch_engine: SerialWatch::new(WatchOptions::default()),
@@ -1054,63 +1281,105 @@ impl App {
     ///
     /// Closing it while the keyboard is on a sidebar row would leave the arrows
     /// driving a rail the user cannot see, so focus follows the rail to the
-    /// terminal. Opening it leaves the focus alone: whichever pane was last used
-    /// is usually the one being returned to.
+    /// terminal. On small windows it opens a drawer and gives it the keyboard.
     pub fn toggle_sidebar(&mut self) -> Notice {
-        self.sidebar_visible = !self.sidebar_visible;
-        let s = self.strings();
-        let text = if self.sidebar_visible {
-            s.sidebar_shown.to_string()
+        crate::views::assistant::clear_selection(self);
+        self.layout_restore = None;
+        let assistant_was_visible = self.panel_wanted() && self.panel_fits();
+        let narrow = self.screen.width > 0
+            && crate::ui::regions_for(
+                crate::ui::legacy::drawing_area(self.screen, self.legacy_console),
+                true,
+                self.panel_wanted(),
+            )
+            .sidebar
+            .width
+                == 0;
+        if narrow && !(self.sidebar_visible && self.focus == Focus::Sidebar) {
+            self.sidebar_visible = true;
+            self.focus = Focus::Sidebar;
         } else {
-            s.sidebar_hidden.to_string()
-        };
-        if !self.sidebar_visible && self.focus == Focus::Sidebar {
-            self.focus = Focus::Terminal;
+            self.sidebar_visible = !self.sidebar_visible;
+            if !self.sidebar_visible && self.focus == Focus::Sidebar {
+                self.focus = Focus::Terminal;
+            }
         }
+        // Reclaiming navigation space must not resurrect an auto-collapsed AI.
+        if self.view == View::Terminal
+            && !assistant_was_visible
+            && self.assistant_panel
+            && self.panel_fits()
+        {
+            self.assistant_panel = false;
+        }
+        if self.focus == Focus::Assistant && (!self.assistant_panel || !self.panel_fits()) {
+            self.set_view(View::Assistant);
+        }
+        self.save_settings();
+        let s = self.strings();
         Notice {
-            text,
+            text: if self.sidebar_visible {
+                s.sidebar_shown
+            } else {
+                s.sidebar_hidden
+            }
+            .to_string(),
             level: NoticeLevel::Info,
         }
     }
 
-    /// Open or close the docked assistant panel.
-    ///
-    /// Closing it while the keyboard is in the panel would leave the keys
-    /// typing into a column the user cannot see, so focus follows it back to
-    /// the terminal — the same bargain [`Self::toggle_sidebar`] makes.
-    ///
-    /// Opening goes two ways beyond the plain flip. From another view it
-    /// brings the terminal back, because the column belongs to that view and
-    /// opening it anywhere else would put the screen in a state that says
-    /// nothing. On a window with no room for the column it opens nothing and
-    /// says why: the painter would drop what the key just opened, and a key
-    /// that answers with an unchanged screen looks broken. A window that *has*
-    /// the room still needs no notice — the column appears, and the screen is
-    /// the announcement.
+    /// Toggle the visible assistant. Small windows use its full-width workspace.
     pub fn toggle_assistant_panel(&mut self) {
-        // A run of text the pointer drew belongs to a paint; the panel
-        // appearing or going changes which paints are on screen, so the run
-        // goes with it.
+        self.layout_restore = None;
         crate::views::assistant::clear_selection(self);
-        if self.assistant_panel {
+        if self.view == View::Assistant {
+            self.assistant_panel = false;
+            self.set_view(View::Terminal);
+            self.focus = Focus::Terminal;
+        } else if self.view == View::Terminal && self.assistant_panel && self.panel_fits() {
             self.assistant_panel = false;
             if self.focus == Focus::Assistant {
                 self.focus = Focus::Terminal;
             }
-            return;
+        } else {
+            self.assistant_panel = true;
+            if self.panel_fits() {
+                self.set_view(View::Terminal);
+            } else {
+                self.set_view(View::Assistant);
+            }
         }
-        if !self.panel_fits() {
-            let text = self.strings().asst_panel_narrow.to_string();
-            self.push_notice(Notice {
-                text,
-                level: NoticeLevel::Info,
-            });
-            return;
+        self.save_settings();
+    }
+
+    /// Maximize the content being used, then restore the previous layout and focus.
+    pub fn toggle_focus_layout(&mut self) {
+        crate::views::assistant::clear_selection(self);
+        if let Some(previous) = self.layout_restore.take() {
+            self.sidebar_visible = previous.sidebar;
+            self.assistant_panel = previous.assistant;
+            self.set_view(previous.view);
+            self.focus = previous.focus;
+            if self.focus == Focus::Assistant && (!self.panel_fits() || !self.assistant_panel) {
+                self.set_view(View::Assistant);
+            }
+        } else {
+            let previous = PanelLayout {
+                sidebar: self.sidebar_visible,
+                assistant: self.assistant_panel,
+                view: self.view,
+                focus: self.focus,
+            };
+            let assistant_focused = self.assistant_panel_focused();
+            self.layout_restore = Some(previous);
+            self.sidebar_visible = false;
+            self.assistant_panel = false;
+            self.focus = Focus::Terminal;
+            if assistant_focused {
+                self.set_view(View::Assistant);
+            }
         }
-        if self.view != View::Terminal {
-            self.set_view(View::Terminal);
-        }
-        self.assistant_panel = true;
+        self.save_settings();
     }
 
     /// Whether the keyboard is in the docked panel.
@@ -1138,9 +1407,13 @@ impl App {
     /// the alternative is a focus moved into a column the painter then drops,
     /// which is a caret nobody can see and keys that look broken.
     pub fn panel_fits(&self) -> bool {
-        crate::ui::regions_for(self.screen, self.sidebar_visible, true)
-            .assistant
-            .width
+        crate::ui::regions_for(
+            crate::ui::legacy::drawing_area(self.screen, self.legacy_console),
+            self.sidebar_visible,
+            true,
+        )
+        .assistant
+        .width
             > 0
     }
 
@@ -1265,6 +1538,10 @@ impl App {
     /// a command-line flag decided it, or a dial did, and a keypress that
     /// quietly overrode either would make the sidebar's `locked` suffix a lie.
     pub fn toggle_transport(&mut self) -> Notice {
+        // Moving off the transport a redial is repeating makes the pending
+        // attempt moot: the user has already decided the next link is a
+        // different one.
+        self.cancel_reconnect();
         if self.transport_locked {
             return Notice {
                 text: self.strings().transport_is_locked.to_string(),
@@ -1301,6 +1578,8 @@ impl App {
     /// palette's `quit` action and the `Ctrl+Q` chord end the session the same
     /// way.
     pub fn request_quit(&mut self) {
+        // A redial in flight would outlive the interface that asked for it.
+        self.cancel_reconnect();
         self.quit = true;
     }
 
@@ -1411,7 +1690,36 @@ impl App {
         if self.focus == Focus::Assistant && view != View::Terminal {
             self.focus = Focus::Terminal;
         }
+        // Selecting a view from the rail must hand the keyboard to that view.
+        // Leaving the focus on the rail sends the next arrow key back into the
+        // list the user just left, so the pane never receives input.
+        if self.focus == Focus::Sidebar {
+            self.focus = Focus::Terminal;
+        }
         self.save_settings();
+        self.read_bonds_when_opened();
+    }
+
+    /// Read the paired-device drawer when the network view opens.
+    ///
+    /// It is not an automatic read on every link: only the network view shows
+    /// the list, and a question asked of a board nobody is looking at is
+    /// traffic with no reader. A question already in flight takes priority;
+    /// the read is queued for the next free slot instead of replacing it.
+    fn read_bonds_when_opened(&mut self) {
+        if self.view != View::Network || !self.ble_connected() || !self.network.paired_supported {
+            return;
+        }
+        // A removal already has a read scheduled after the board's delayed
+        // unpair; reading now would show the row it is about to delete.
+        if self.bond_refresh_due.is_some() {
+            return;
+        }
+        if self.waiting_on_device() {
+            self.bonds_read_pending = true;
+            return;
+        }
+        let _ = self.refresh_bonds();
     }
 
     /// Whether a typed key belongs to the pane: the rail is not focused, and
@@ -1484,28 +1792,26 @@ impl App {
             lan_host: self.lan_host.clone(),
             address,
             device_name,
-            view: Some(self.view),
+            view: Some(self.layout_restore.map_or(self.view, |layout| layout.view)),
             theme: Some(self.theme),
             lang: Some(self.lang),
             enter: Some(self.enter),
             debug_io: self.trace.tracing(),
             no_splash: self.no_splash,
+            sidebar_visible: Some(
+                self.layout_restore
+                    .map_or(self.sidebar_visible, |layout| layout.sidebar),
+            ),
+            assistant_panel: Some(
+                self.layout_restore
+                    .map_or(self.assistant_panel, |layout| layout.assistant),
+            ),
         });
     }
 
-    /// How many sidebar rows the cursor can reach: the transport row, the
-    /// connect row, then either the switch-device row or the LAN host and
-    /// token rows, one per view, and one per quick send. This is the same
-    /// number [`crate::ui::sidebar::targets`] produces, and a test pins the
-    /// two together so navigation can never walk off the list.
+    /// Cursor bounds come from the same navigation plan that supplies labels.
     pub fn sidebar_rows(&self) -> usize {
-        let connection = match self.transport {
-            // The LAN block trades the switch-device row for two of its own:
-            // an address and a token are what a LAN dial is built from.
-            Transport::Lan => 4,
-            _ => 3,
-        };
-        connection + View::ALL.len() + self.quick_send.len()
+        crate::ui::sidebar::targets(self).len()
     }
 
     /// Move the sidebar cursor down one row, stopping on the last.
@@ -1531,6 +1837,7 @@ impl App {
     pub fn next_view(&mut self) {
         let index = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0);
         self.view = View::ALL[(index + 1) % View::ALL.len()];
+        self.read_bonds_when_opened();
     }
 
     /// Step to the previous view in the rota, wrapping at the start.
@@ -1538,6 +1845,7 @@ impl App {
         let index = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0);
         let last = View::ALL.len() - 1;
         self.view = View::ALL[(index + last) % View::ALL.len()];
+        self.read_bonds_when_opened();
     }
 
     // --- the link ----------------------------------------------------------
@@ -1549,6 +1857,9 @@ impl App {
     /// Opens on the calling thread. A caller that cannot afford the wait dials
     /// through [`App::dial_async`] instead, which lands the same way.
     pub fn connect(&mut self, link: Box<dyn Link>) -> io::Result<()> {
+        // A link handed in whole is not something a redial should be holding
+        // the session for.
+        self.cancel_reconnect();
         self.adopt(OpenedLink::open(link)?);
         Ok(())
     }
@@ -1560,11 +1871,18 @@ impl App {
     /// opened, and the state says `connecting` until the link's threads report
     /// it — the same beat-by-beat arrival a synchronous open gets.
     fn adopt(&mut self, opened: OpenedLink) {
+        if let (Some(id), Some(Dial::Ble(_, within))) = (&opened.ble_device_id, &self.last_dial) {
+            self.last_dial = Some(Dial::Ble(
+                crate::transport::ble::Selection::Address(id.clone()),
+                *within,
+            ));
+        }
         crate::views::assistant::switch_device(self, &opened.description);
         self.agent_serial =
             crate::serial::journal::SerialJournal::new(crate::serial::journal::DEFAULT_CAPACITY);
         self.agent_decoder = crate::views::terminal::Utf8Stream::default();
         let kind = opened.kind;
+        self.reset_control();
         self.session.adopt(opened);
         self.transport = kind;
         self.state = ConnectionState::Connecting;
@@ -1790,6 +2108,9 @@ impl App {
 
     /// Dial what the command line asked for.
     pub fn dial(&mut self, dial: &Dial) -> io::Result<()> {
+        // A dial that is about to happen is the answer to "is the link coming
+        // back", so a pending redial has nothing left to do.
+        self.cancel_reconnect();
         // A LAN dial needs the token, and `@s?` is the only place there is to
         // get one. Asked while the old link is still up — before the new one
         // closes it — so a user who was on Bluetooth and picks LAN from the
@@ -1817,15 +2138,19 @@ impl App {
         Ok(())
     }
 
-    /// Open the link again, or say why there is nothing to open.
-    ///
-    /// This is the palette's `connect` and the sidebar's `Connect` row. A LAN
-    /// dial is built from the rows the user is looking at; anything else
-    /// re-dials the last link rather than inventing one, so the actions can
-    /// never dial something the command line did not name. One dial at a time:
-    /// a link takes seconds to come up, and a second press while the first is
-    /// still in the air is answered with a sentence rather than a race.
+    /// Whether BLE needs a device choice before a connection can be attempted.
+    pub fn needs_device_choice(&self) -> bool {
+        self.transport == Transport::Ble
+            && !matches!(self.last_dial, Some(Dial::Ble(..)))
+            && !self.session.is_live()
+    }
+
+    /// Connect using the visible LAN settings or the last saved dial. A first
+    /// BLE connection opens discovery; an in-flight attempt is never duplicated.
     pub fn reconnect(&mut self) {
+        // A manual Connect is the user taking the wheel: whatever the automatic
+        // redial was waiting for, this is what they want instead.
+        self.cancel_reconnect();
         if self.session.is_live() {
             return;
         }
@@ -1835,6 +2160,15 @@ impl App {
                 text,
                 level: NoticeLevel::Warn,
             });
+            return;
+        }
+        if self.needs_device_choice() {
+            if let Err(why) = self.start_ble_scan() {
+                self.push_notice(Notice {
+                    text: format!("{}: {why}", self.strings().ble_scan_failed),
+                    level: NoticeLevel::Error,
+                });
+            }
             return;
         }
         let dial = match self.dial_for_connect() {
@@ -1848,6 +2182,165 @@ impl App {
             }
         };
         self.dial_async(&dial, false);
+    }
+
+    /// Invalidate an automatic dial even when the OS is still connecting.
+    /// Keep the job until its result is released, avoiding overlapping BLE dials.
+    pub fn cancel_reconnect(&mut self) {
+        if let Some(state) = self.reconnecting.take() {
+            if state.in_flight {
+                if let Some(job) = self.dialing.as_mut() {
+                    job.cancelled = true;
+                    self.state = ConnectionState::Disconnected;
+                }
+            }
+        }
+    }
+
+    /// Begin the automatic redial after a link that had been live died.
+    ///
+    /// Called from the pump's own loss edge, which is the only place that knows
+    /// the difference between a link the user ended and one that ended itself.
+    /// Returns whether a redial was started, so the caller can fall back to the
+    /// ordinary "link closed" wording when this is not the right answer.
+    ///
+    /// Nothing is started when the switch is off, when no dial was ever
+    /// remembered, or when the remembered dial is a child process: a bridge
+    /// that was asked to run is not a bridge to run again, and a command line
+    /// that exited did not lose a link — it finished one. Only Bluetooth and
+    /// LAN can be re-opened without replaying somebody's command.
+    fn begin_auto_reconnect(&mut self, describe: &str) -> bool {
+        if self.reconnecting.is_some() || !self.auto_reconnect {
+            return false;
+        }
+        let Some(dial) = self.last_dial.clone() else {
+            return false;
+        };
+        if matches!(
+            dial,
+            Dial::Stdio(_)
+                | Dial::Ble(
+                    crate::transport::ble::Selection::Any
+                        | crate::transport::ble::Selection::Name(_),
+                    _
+                )
+        ) {
+            return false;
+        }
+        let Some(delay) = auto_reconnect_delay(0) else {
+            return false;
+        };
+        self.reconnecting = Some(AutoReconnect {
+            dial,
+            attempt: 0,
+            due: Instant::now() + delay,
+            in_flight: false,
+        });
+        let text = format!("{}{describe}", self.strings().auto_reconnect_lost);
+        self.push_notice(Notice {
+            text,
+            level: NoticeLevel::Warn,
+        });
+        true
+    }
+
+    /// Launch the next automatic attempt when its wait is over.
+    ///
+    /// `now` is passed rather than read so a test can walk the whole backoff
+    /// without waiting through it; the pump passes the clock it already has.
+    /// The dial is quiet because the link coming up is announced as a
+    /// *restoration*, below, and not as a fresh connection — the sentence
+    /// belongs to the event and not to the mechanism that produced it.
+    fn drive_reconnect(&mut self, now: Instant) {
+        let Some((due, in_flight, attempt, dial)) = self.reconnecting.as_ref().map(|state| {
+            (
+                state.due,
+                state.in_flight,
+                state.attempt,
+                state.dial.clone(),
+            )
+        }) else {
+            return;
+        };
+        if self.session.is_live() {
+            // Something brought the link back outside this machinery — a
+            // link the user opened, most likely — so there is nothing left to
+            // drive.
+            self.cancel_reconnect();
+            return;
+        }
+        if in_flight || self.dialing.is_some() || now < due {
+            return;
+        }
+        let attempt = attempt + 1;
+        let total = AUTO_RECONNECT_DELAYS.len();
+        let text = format!(
+            "{} {attempt}/{total}",
+            self.strings().auto_reconnect_attempt
+        );
+        self.push_notice(Notice {
+            text,
+            level: NoticeLevel::Info,
+        });
+        if !self.start_dial(&dial, true) {
+            return;
+        }
+        if let Some(state) = self.reconnecting.as_mut() {
+            state.attempt = attempt;
+            state.in_flight = true;
+        }
+    }
+
+    /// File a failed automatic attempt: wait again, or give up.
+    ///
+    /// Called from [`App::poll_dial`] rather than from the timer, because only
+    /// the landing knows whether the board answered. The generic "connect
+    /// failed" notice is not raised for these: a line per failed attempt is the
+    /// noise the feature exists not to make, and the give-up sentence below is
+    /// the one that asks the user to act.
+    fn note_reconnect_failure(&mut self, now: Instant) {
+        let Some(attempt) = self.reconnecting.as_ref().map(|state| state.attempt) else {
+            return;
+        };
+        match auto_reconnect_delay(attempt) {
+            Some(delay) => {
+                if let Some(state) = self.reconnecting.as_mut() {
+                    state.in_flight = false;
+                    state.due = now + delay;
+                }
+            }
+            None => {
+                self.reconnecting = None;
+                let text = self.strings().auto_reconnect_gave_up.to_string();
+                self.push_notice(Notice {
+                    text,
+                    level: NoticeLevel::Error,
+                });
+            }
+        }
+    }
+
+    /// File the link the automatic redial brought back.
+    ///
+    /// Called from [`App::poll_dial`] before the link is adopted, because the
+    /// state machine and the notice both belong to the landing and not to a
+    /// later frame. `false` means the dial that landed was not the redial's,
+    /// which is the caller's answer to whether to announce it as one.
+    fn note_reconnect_success(&mut self, describe: &str) -> bool {
+        if !self
+            .reconnecting
+            .as_ref()
+            .is_some_and(|state| state.in_flight)
+        {
+            return false;
+        }
+        self.reconnecting = None;
+        let text = format!("{}{describe}", self.strings().auto_reconnect_restored);
+        self.push_notice(Notice {
+            text,
+            level: NoticeLevel::Info,
+        });
+        true
     }
 
     /// The dial Connect would make.
@@ -2054,7 +2547,18 @@ impl App {
     /// pump collects the answer, because the open is where a Bluetooth dial
     /// spends its seconds. Returns whether the dial was started: a second
     /// Connect pressed while one is in flight is not a second dial.
+    ///
+    /// A dial started from here is the user's, so it cancels any automatic
+    /// redial that was waiting: starting another dial is another way of taking
+    /// the wheel.
     pub fn dial_async(&mut self, dial: &Dial, quiet: bool) -> bool {
+        self.cancel_reconnect();
+        self.start_dial(dial, quiet)
+    }
+
+    /// Start the dial itself, for a caller that has already decided who owns
+    /// the wheel — the automatic redial starts its own attempts through here.
+    fn start_dial(&mut self, dial: &Dial, quiet: bool) -> bool {
         if self.dialing.is_some() {
             return false;
         }
@@ -2064,7 +2568,11 @@ impl App {
         // seconds to come up, and the open is the seconds. All the frame sees
         // of it is `connecting` in the state row.
         std::thread::spawn(move || {
-            let _ = tx.send(opening.opened());
+            if let Err(error) = tx.send(opening.opened()) {
+                if let Ok(opened) = error.0 {
+                    let _ = opened.hang_up();
+                }
+            }
         });
         // The lock goes on at the *press*, not at the catch: what it protects
         // is the choice the dial was built from, and a transport switched
@@ -2079,6 +2587,7 @@ impl App {
         self.dialing = Some(DialJob {
             dial: dial.clone(),
             quiet,
+            cancelled: false,
             rx,
         });
         true
@@ -2100,15 +2609,30 @@ impl App {
             }
         };
         let job = self.dialing.take().expect("checked just above");
+        if job.cancelled {
+            if let Ok(opened) = outcome {
+                let _ = opened.hang_up();
+            }
+            if !self.session.is_live() {
+                self.state = ConnectionState::Disconnected;
+                self.transport_locked = self.transport_pinned;
+            }
+            return;
+        }
         match outcome {
             Ok(opened) => {
+                // A landing that belongs to the automatic redial says so
+                // before the link replaces the session: the sentence is about
+                // the wait that just ended, and the adopt below is what ends
+                // it.
+                self.note_reconnect_success(&opened.description);
                 // Remembered only once the link opened: a dial that failed is
                 // not something `reconnect` should try again behind the user's
                 // back.
-                self.last_dial = Some(job.dial);
-                self.save_settings();
+                self.last_dial = Some(job.dial.clone());
                 self.quiet_connect = job.quiet;
                 self.adopt(opened);
+                self.save_settings();
             }
             Err(why) => {
                 // The lock went on at the press; a dial that failed gives it
@@ -2116,11 +2640,22 @@ impl App {
                 self.quiet_connect = false;
                 self.transport_locked = self.transport_pinned;
                 self.session.fail();
-                let text = format!("{}{why}", self.strings().link_failed);
-                self.push_notice(Notice {
-                    text,
-                    level: NoticeLevel::Error,
-                });
+                // An attempt of the automatic redial reports by its own
+                // schedule — the next wait, or the sentence that gives up —
+                // rather than by one error toast per try.
+                if self
+                    .reconnecting
+                    .as_ref()
+                    .is_some_and(|state| state.in_flight)
+                {
+                    self.note_reconnect_failure(Instant::now());
+                } else {
+                    let text = format!("{}{why}", self.strings().link_failed);
+                    self.push_notice(Notice {
+                        text,
+                        level: NoticeLevel::Error,
+                    });
+                }
             }
         }
     }
@@ -2128,6 +2663,11 @@ impl App {
     /// Hang up, and say so once. Announcing it here rather than in the pump is
     /// what keeps a deliberate hang-up from reading as a dropped link.
     pub fn disconnect(&mut self) {
+        // A deliberate hang-up is the opposite of a loss to reconnect: the
+        // automatic redial stops here whether or not there is a link left to
+        // end (a redial waiting on a dead link is exactly what Disconnect is
+        // pressed to call off).
+        self.cancel_reconnect();
         if !self.session.is_live() {
             return;
         }
@@ -2141,6 +2681,7 @@ impl App {
         self.state = ConnectionState::Disconnected;
         self.wifi_write = None;
         self.scan_retry = None;
+        self.clear_bond_view();
         // The lock a dial took out went with the dial: with the link down
         // there is nothing left for it to protect, and switching the transport
         // is exactly what hanging up is for. A transport the command line
@@ -2160,12 +2701,38 @@ impl App {
     /// free the moment this process is" is a promise the next client depends
     /// on. No notice and no state: nobody is left to read one.
     pub fn hang_up(&mut self, grace: Duration) -> bool {
+        // Nobody is left to read a "restored" notice: the redial goes with the
+        // session.
+        self.cancel_reconnect();
         let ended = self.session.hang_up(grace);
         self.state = ConnectionState::Disconnected;
         self.transport_locked = self.transport_pinned;
         self.wifi_write = None;
         self.scan_retry = None;
+        self.clear_bond_view();
         ended
+    }
+
+    /// Forget everything the network view learned about paired hosts.
+    ///
+    /// Called on every link ending and every transport switch: a list from the
+    /// board that was just left must not be shown as if it belonged to the next
+    /// one, and a board that does not support the commands must be re-probed.
+    fn clear_bond_view(&mut self) {
+        self.bond_label_queue.clear();
+        self.bonds_read_pending = false;
+        self.bond_refresh_due = None;
+        self.bond_self_write = false;
+        self.bond_mutation_pending = false;
+        self.bond_mutation_result = None;
+        self.bond_self_reported = false;
+        self.network.bonds = None;
+        self.network.bonds_pending = false;
+        self.network.bonds_result = 0;
+        self.network.paired_supported = true;
+        self.network.labels_supported = true;
+        self.network.loading = false;
+        self.network.error = None;
     }
 
     /// One pump: fold whatever the link produced into the frame, and announce
@@ -2382,6 +2949,10 @@ impl App {
         // already in `was_live` — the tick that catches a dial is the tick the
         // link came up on, not one that finds it already there.
         self.poll_dial();
+        // The automatic redial's own clock, on the same beat as the rest: a
+        // wait that is over launches its attempt here, and a pump that only
+        // painted would never bring the link back.
+        self.drive_reconnect(Instant::now());
         // The toasts' own clock, on the same beat as everything else. The
         // log keeps every word; the corner empties.
         self.expire_notices(Instant::now());
@@ -2399,10 +2970,20 @@ impl App {
                 LinkEvent::Data(bytes) => {
                     self.agent_serial.append(&self.agent_decoder.push(&bytes));
                     self.terminal.push(&bytes);
+                    self.geometry.observe_screen(self.terminal.vt());
                     self.note_decode_loss();
                     self.trace.rx(&bytes);
                     if self.collect_output {
                         self.output.push_back(bytes.clone());
+                    }
+                    if self.watch_armed {
+                        // Whole, escape sequences and all: a terminal on the far
+                        // end needs them for colour and cursor movement, and the
+                        // journal's copy masks them to NUL.
+                        self.watch_bytes.push_back(bytes.clone());
+                        while self.watch_bytes.len() > 4096 {
+                            self.watch_bytes.pop_front();
+                        }
                     }
                     {
                         // The same bytes, read a second time by the watch. It
@@ -2480,6 +3061,26 @@ impl App {
                         }
                     }
                 }
+                // The LAN bridge's ownership frame. The first one after
+                // authentication is the feature announcement: an old bridge
+                // sends none, and this client never probes one with a command
+                // it would reject.
+                LinkEvent::Control(text) => {
+                    self.trace.rx_reply(&crate::lan_token_store::redact(&text));
+                    if !self.control_announced {
+                        if let Some(status) = crate::device::parse_control_status(&text) {
+                            self.control_announced = true;
+                            // A free console on arrival is taken, the way the
+                            // web client takes it. A console somebody is using
+                            // stays theirs until this session asks; a keystroke
+                            // is the other path, and it asks for an idle
+                            // hand-over rather than a preemptive claim.
+                            self.control_auto_claim =
+                                status.mode == crate::device::ControlMode::Available;
+                        }
+                    }
+                    self.apply_control_text(&text);
+                }
                 // A link coming up or going down is a new console. A write
                 // still waiting on the board is dropped with the link
                 // it belonged to — the record holds a password, and a board
@@ -2488,6 +3089,9 @@ impl App {
                 LinkEvent::Opened | LinkEvent::Closed(_) => {
                     self.wifi_write = None;
                     self.scan_retry = None;
+                    // A new link is a new tty: whatever the last one was told
+                    // says nothing about this one.
+                    self.geometry.reset_session();
                 }
             }
         }
@@ -2512,6 +3116,9 @@ impl App {
         // And so is a scan nobody answered, for the same reason: the gate it
         // was refused by clears on its own.
         self.send_due_scan_retry(now);
+        // A delayed removal answers `OK bonds queued`; the list is read back
+        // after the firmware's own 500 ms window, not before it.
+        self.send_due_bond_refresh(now);
         // A program that asks a question — where is the cursor, how wide is the
         // screen — blocks until it hears back, so the emulator's answers go out
         // on the tick that produced them. Always *after* the feed: an answer is
@@ -2522,8 +3129,16 @@ impl App {
         for reply in self.terminal.take_replies() {
             self.session.send(&reply);
         }
+        // The target's tty is its own screen: it keeps the size an earlier
+        // client gave it until someone says otherwise. Say so now that the
+        // prompt is idle — never while a command owns the line, or the line
+        // would be typed into that command. After the replies, because those
+        // are answers a program is blocked on and this is housekeeping.
+        self.sync_terminal_geometry();
         let now_live = self.session.is_live();
-        if self.dialing.is_some() {
+        if self.dialing.as_ref().is_some_and(|job| job.cancelled) {
+            self.state = ConnectionState::Disconnected;
+        } else if self.dialing.is_some() {
             // A dial in flight is what the screen is about to be: the open
             // waits on a radio, and the state the session last knew — the link
             // before this one, or nothing at all — would paint a calm
@@ -2556,20 +3171,50 @@ impl App {
             // showing a name the board no longer has. The name goes first and
             // the token follows it, because only one question is in flight at
             // a time.
+            // Ownership comes first: whether this session may type is the
+            // answer every later action depends on. A board without the
+            // capability keeps `None`, which means "do not gate input".
+            //
+            // A LAN link is the exception: its first ownership frame may have
+            // arrived on this same pump, before this edge was noticed, so the
+            // state it carried is already this link's answer.
+            self.control_read_pending = self.ble_connected() && self.supports_control();
+            // A LAN bridge announces ownership as a text frame, which may have
+            // arrived on this pump before the state moved to connected. The
+            // claim it asks for is sent now that there is a link to send it
+            // over.
+            if self.transport == Transport::Lan
+                && std::mem::take(&mut self.control_auto_claim)
+                && self
+                    .control
+                    .is_some_and(|status| status.mode == crate::device::ControlMode::Available)
+            {
+                let _ = self.request_control("claim idle");
+            }
             self.ble_name_read_pending = self.ble_connected();
             self.lan_token_read_pending = self.ble_connected();
+            self.bonds_read_pending = self.ble_connected() && self.view == View::Network;
         } else if was_live && !now_live {
             // A quiet dial that died before it was ever announced has nothing
             // left to be quiet about; the next connection is its own news.
             self.quiet_connect = false;
-            let s = self.strings();
-            let (prefix, level) = if self.state == ConnectionState::Failed {
-                (s.link_failed, NoticeLevel::Error)
-            } else {
-                (s.link_closed, NoticeLevel::Warn)
-            };
-            let text = format!("{prefix}{describe}");
-            self.push_notice(Notice { text, level });
+            // This edge is the one place that knows a loss was *not* asked
+            // for: a deliberate hang-up drops the handle before the pump can
+            // see it, so reaching here means the link ended by itself. The
+            // last dial is tried again, unless the switch is off or there is
+            // nothing re-openable to try; when it is, the loss notice is the
+            // redial's own (it names the retry, which the generic one would
+            // not) and the generic notice is left out rather than doubled.
+            if !self.begin_auto_reconnect(&describe) {
+                let s = self.strings();
+                let (prefix, level) = if self.state == ConnectionState::Failed {
+                    (s.link_failed, NoticeLevel::Error)
+                } else {
+                    (s.link_closed, NoticeLevel::Warn)
+                };
+                let text = format!("{prefix}{describe}");
+                self.push_notice(Notice { text, level });
+            }
         }
         if was_live && !now_live {
             // The last thing a target says very often has no newline after it —
@@ -2587,9 +3232,11 @@ impl App {
             }
             self.talk.reset();
             self.management.reset();
+            self.reset_control();
             self.ble_name_write_pending = false;
             self.ble_name_read_pending = false;
             self.lan_token_read_pending = false;
+            self.clear_bond_view();
             // And the half-typed line goes with it.
             self.pending_line.clear();
         }
@@ -2599,9 +3246,16 @@ impl App {
         if !now_live && self.dialing.is_none() {
             self.signal_dbm = None;
         }
+        // A keystroke that waited for a question to finish asks now, on this
+        // pump, rather than behind the background reads — whether the console
+        // may be typed into is the more urgent question.
+        self.claim_idle_if_held();
         // Optional reads resume whenever the request slot becomes free,
         // including after a refusal, timeout, or intervening user request.
         self.ask_pending_reads();
+        // Ownership is not pushed by the firmware, so a quiet poll is how this
+        // session learns that another client took (or released) the console.
+        self.poll_control(now);
         self.rx = self.session.rx();
         self.tx = self.session.tx();
         // The same beat the counters moved on: the graph is a clock, and this
@@ -2613,6 +3267,18 @@ impl App {
     /// pane of its own. See [`App::collect_output`].
     pub fn take_output(&mut self) -> Vec<Vec<u8>> {
         self.output.drain(..).collect()
+    }
+
+    /// Start or stop collecting the console's raw byte stream, dropping what is
+    /// already queued: a watcher subscribes, it does not replay.
+    pub fn watch_stream(&mut self, on: bool) {
+        self.watch_armed = on;
+        self.watch_bytes.clear();
+    }
+
+    /// The raw console bytes said since the last call, whole and in order.
+    pub fn take_watch_bytes(&mut self) -> Vec<Vec<u8>> {
+        self.watch_bytes.drain(..).collect()
     }
 
     /// Whether a question this view asked is still outstanding.
@@ -2699,6 +3365,9 @@ impl App {
     /// the answer's other half — where the startup scan has nothing to say
     /// until it has heard something to say.
     fn begin_ble_scan(&mut self, first_board: bool) -> Result<(), String> {
+        // Looking for a board is a hand on the wheel too: a redial of the last
+        // one would race the pick the user is about to make.
+        self.cancel_reconnect();
         self.ble_scan.reset();
         if first_board {
             self.ble_scan.start_first_board(BLE_SCAN_TIMEOUT)?;
@@ -2755,9 +3424,17 @@ impl App {
         quiet: bool,
     ) {
         let selection = crate::transport::ble::Selection::Address(address.to_string());
-        if !self.dial_async(&crate::session::Dial::Ble(selection, None), quiet) {
+        let dial = crate::session::Dial::Ble(selection, None);
+        if !self.dial_async(&dial, quiet) {
             return;
         }
+        // The picker's answer to "which one" is the board Connect must aim at
+        // next, even if this attempt fails. A successful link remembers itself
+        // in `poll_dial`; a failed one would otherwise leave `last_dial` on
+        // the board the user just disconnected from, so pressing Connect
+        // again would silently dial the old board while the row still showed
+        // the new one.
+        self.last_dial = Some(dial);
         // Set *after* the dial, so the dial's own naming of its target cannot
         // undo it: the name the scan heard is a better answer than the address
         // the dial was aimed with, and it is not known to the dial. The name
@@ -2940,6 +3617,469 @@ impl App {
         self.ble_scan.reset();
     }
 
+    fn reset_control(&mut self) {
+        self.control = None;
+        self.control_read_pending = false;
+        self.control_auto_claim = false;
+        self.control_claim_in_flight = false;
+        self.held_input.clear();
+        self.control_poll_due = None;
+        self.control_handover = None;
+        self.control_yield = false;
+        self.control_announced = false;
+        self.control_error = None;
+        self.control_announcement_waited = false;
+    }
+
+    /// Whether the open board arbitrates console ownership.
+    ///
+    /// Bluetooth answers with capability bit 7; the LAN socket has no
+    /// capability word and announces itself by sending `OK control …` once
+    /// after authentication. An absent answer from either means old firmware:
+    /// this client keeps the historical single-session behaviour rather than
+    /// inventing a control badge from nothing.
+    pub fn supports_control(&self) -> bool {
+        if self.transport == Transport::Lan {
+            return self.control_announced;
+        }
+        self.session
+            .capabilities()
+            .is_some_and(|caps| caps & crate::protocol::MGMT_CAP_MULTI_SESSION != 0)
+    }
+
+    /// Whether typing right now would be refused for want of control.
+    pub fn control_readonly(&self) -> bool {
+        self.supports_control()
+            && (self.control_yield
+                || self.control_mode() != Some(crate::device::ControlMode::Control))
+    }
+
+    /// The console's mode, when the board or bridge has said what it is.
+    ///
+    /// `None` is also the answer for firmware without ownership arbitration:
+    /// the historical behaviour is to let typing through, and the callers that
+    /// gate input treat it that way.
+    pub fn control_mode(&self) -> Option<crate::device::ControlMode> {
+        self.control.map(|status| status.mode)
+    }
+
+    /// Why the last ownership command was refused, if it was.
+    pub fn control_refusal(&self) -> Option<&str> {
+        self.control_error.as_deref()
+    }
+
+    /// The top bar's ownership badge, and the mode it describes.
+    pub fn control_badge(&self) -> Option<(String, crate::device::ControlMode)> {
+        let status = self.control?;
+        let s = self.strings();
+        let text = match status.mode {
+            crate::device::ControlMode::Control => s.control_owned,
+            crate::device::ControlMode::Readonly => s.control_readonly,
+            crate::device::ControlMode::Available => s.control_available,
+        };
+        Some((text.to_string(), status.mode))
+    }
+
+    /// Send one ownership command, quiet: the caller decides what to say.
+    ///
+    /// Ownership is asked of the bridge, not the target. Bluetooth spells it
+    /// `@c …` inside a management frame; the LAN socket spells it `@control …`
+    /// in a text frame. BLE commands wait for the current management request.
+    fn send_control(&mut self, action: &str) -> Result<(), String> {
+        if !self.connected() {
+            return Err(self.strings().not_connected.to_string());
+        }
+        if !self.supports_control() {
+            return Err(self.strings().control_unsupported.to_string());
+        }
+        // One question at a time is the protocol's rule, and a control command
+        // must not throw away the answer somebody else is waiting for — a bond
+        // write displaced this way would never finish. The caller retries; the
+        // typing path holds its bytes and asks on the next pump.
+        if self.talk.waiting().is_some() {
+            return Err(self.strings().control_wait.to_string());
+        }
+        // A refusal answers the command being sent now, not the one before it.
+        if action != "?" {
+            self.control_error = None;
+        }
+        if self.transport == Transport::Lan {
+            let command = format!("@control {action}");
+            if !self.session.send_control(command.clone()) {
+                return Err(self.strings().not_connected.to_string());
+            }
+            self.trace.tx_command(&command);
+            self.control_poll_due = None;
+            return Ok(());
+        }
+        if !self.ble_connected() {
+            return Err(self.strings().diag_no_ble.to_string());
+        }
+        let command = if action == "?" {
+            Query::Control.command().to_string()
+        } else {
+            format!("@c {action}")
+        };
+        let id = self.talk.ask_id(Query::Control, Instant::now());
+        let frame = match crate::protocol::encode_management_request(id, command.as_bytes()) {
+            Ok(frame) => frame,
+            Err(why) => {
+                self.talk.reset();
+                return Err(why.message(false).to_string());
+            }
+        };
+        if !self.session.send_management(frame) {
+            self.talk.reset();
+            return Err(self.strings().not_connected.to_string());
+        }
+        self.trace.tx_command(&command);
+        // The poll that was already due is overtaken by this question.
+        self.control_poll_due = None;
+        Ok(())
+    }
+
+    /// Ask the bridge for the console. `claim` preempts an active typist;
+    /// `claim idle` takes it only when the current owner has been quiet.
+    fn request_control(&mut self, action: &str) -> Result<(), String> {
+        self.send_control(action)
+    }
+
+    /// Take the console now, and say what was asked.
+    pub fn take_control(&mut self) -> Notice {
+        let s = self.strings();
+        self.control_error = None;
+        if !self.supports_control() {
+            return Notice {
+                text: s.control_unsupported.to_string(),
+                level: NoticeLevel::Warn,
+            };
+        }
+        if self
+            .control
+            .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        {
+            return Notice {
+                text: s.control_owned.to_string(),
+                level: NoticeLevel::Info,
+            };
+        }
+        match self.request_control("claim") {
+            Ok(()) => Notice {
+                text: s.control_requested.to_string(),
+                level: NoticeLevel::Info,
+            },
+            Err(why) => Notice {
+                text: why,
+                level: NoticeLevel::Warn,
+            },
+        }
+    }
+
+    /// Ask for the console only if its owner has stopped typing.
+    ///
+    /// This is the keystroke path without a keystroke: a script that is about
+    /// to type gets the same rule a person does, and a refused claim leaves
+    /// the console where it was.
+    pub fn take_control_when_idle(&mut self) -> Notice {
+        let s = self.strings();
+        self.control_error = None;
+        if !self.supports_control() {
+            return Notice {
+                text: s.control_unsupported.to_string(),
+                level: NoticeLevel::Warn,
+            };
+        }
+        if self
+            .control
+            .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        {
+            return Notice {
+                text: s.control_owned.to_string(),
+                level: NoticeLevel::Info,
+            };
+        }
+        match self.request_control("claim idle") {
+            Ok(()) => {
+                self.control_claim_in_flight = true;
+                Notice {
+                    text: s.control_requested.to_string(),
+                    level: NoticeLevel::Info,
+                }
+            }
+            Err(why) => Notice {
+                text: why,
+                level: NoticeLevel::Warn,
+            },
+        }
+    }
+
+    /// Give the console up; the next session may take it.
+    pub fn release_control(&mut self) -> Notice {
+        let s = self.strings();
+        let holds = self
+            .control
+            .is_some_and(|status| status.mode == crate::device::ControlMode::Control);
+        if !holds {
+            return Notice {
+                text: s.control_not_owner.to_string(),
+                level: NoticeLevel::Warn,
+            };
+        }
+        match self.request_control("release") {
+            Ok(()) => {
+                self.control_yield = true;
+                self.held_input.clear();
+                self.control_claim_in_flight = false;
+                Notice {
+                    text: s.control_released.to_string(),
+                    level: NoticeLevel::Info,
+                }
+            }
+            Err(why) => Notice {
+                text: why,
+                level: NoticeLevel::Warn,
+            },
+        }
+    }
+
+    /// Hand the console back to the session this one took it from.
+    pub fn hand_over_control(&mut self) -> Notice {
+        let s = self.strings();
+        let holds = self
+            .control
+            .is_some_and(|status| status.mode == crate::device::ControlMode::Control);
+        if !holds {
+            return Notice {
+                text: s.control_not_owner.to_string(),
+                level: NoticeLevel::Warn,
+            };
+        }
+        let Some(target) = self
+            .control_handover
+            .filter(|target| *target != self.control.map(|c| c.self_id).unwrap_or(0))
+        else {
+            return Notice {
+                text: s.control_no_handover.to_string(),
+                level: NoticeLevel::Warn,
+            };
+        };
+        match self.request_control(&format!("yield {target}")) {
+            Ok(()) => {
+                self.control_yield = true;
+                Notice {
+                    text: format!("{}{target}", s.control_handover),
+                    level: NoticeLevel::Info,
+                }
+            }
+            Err(why) => Notice {
+                text: why,
+                level: NoticeLevel::Warn,
+            },
+        }
+    }
+
+    /// Ask who owns the console if the session is due a quiet check.
+    ///
+    /// The first query after a link comes up is the important one; the poll is
+    /// what keeps the badge honest afterwards. It never displaces a question
+    /// already in flight — the next tick tries again.
+    fn poll_control(&mut self, now: Instant) {
+        if !self.supports_control() || !self.connected() {
+            self.control_poll_due = None;
+            return;
+        }
+        if self.talk.waiting().is_some() {
+            return;
+        }
+        match self.control_poll_due {
+            None => self.control_poll_due = Some(now + CONTROL_POLL),
+            Some(due) if now >= due => {
+                if self.send_control("?").is_ok() {
+                    self.control_poll_due = Some(now + CONTROL_POLL);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Fold one `@c` answer in.
+    ///
+    /// Two shapes arrive here: a status (`OK control …`), which updates the
+    /// badge and settles a held keystroke, and a refusal (`ERR control=…`),
+    /// which leaves the pusher read-only and says why.
+    fn apply_control_reply(&mut self, reply: &Reply) {
+        self.apply_control_text(&reply.lines.join("\n"));
+    }
+
+    /// Fold the text of one ownership answer in, whichever bearer carried it.
+    fn apply_control_text(&mut self, text: &str) {
+        let s = self.strings();
+        if let Some(status) = crate::device::parse_control_status(text) {
+            let previous = self.control;
+            // Taking the console from somebody is recorded so "hand over" can
+            // give it back to that session rather than to a guess.
+            if let Some(previous) = previous {
+                if previous.mode != crate::device::ControlMode::Control
+                    && status.mode == crate::device::ControlMode::Control
+                    && previous.owner != 0
+                    && previous.owner != status.self_id
+                {
+                    self.control_handover = Some(previous.owner);
+                }
+                if previous.mode == crate::device::ControlMode::Control
+                    && status.mode != crate::device::ControlMode::Control
+                    && !self.control_yield
+                {
+                    self.push_notice(Notice {
+                        text: s.control_taken.to_string(),
+                        level: NoticeLevel::Warn,
+                    });
+                }
+            }
+            // An older poll may answer while release/yield is on the wire.
+            if self.control_yield
+                && previous.is_some_and(|before| before.epoch == status.epoch)
+                && status.mode == crate::device::ControlMode::Control
+            {
+                return;
+            }
+            self.control = Some(status);
+            self.control_poll_due = Some(Instant::now() + CONTROL_POLL);
+            match status.mode {
+                crate::device::ControlMode::Control => {
+                    self.control_claim_in_flight = false;
+                    self.flush_held_input();
+                }
+                crate::device::ControlMode::Readonly => {
+                    if self.control_claim_in_flight {
+                        self.control_claim_in_flight = false;
+                        self.held_input.clear();
+                        self.push_notice(Notice {
+                            text: s.control_busy.to_string(),
+                            level: NoticeLevel::Warn,
+                        });
+                    }
+                }
+                crate::device::ControlMode::Available => {
+                    if self.control_claim_in_flight {
+                        // The claim that was out did not stick: ask again on
+                        // the strength of the keystroke that is still held.
+                        self.control_claim_in_flight = false;
+                        if self.request_control("claim idle").is_ok() {
+                            self.control_claim_in_flight = true;
+                        } else {
+                            self.held_input.clear();
+                        }
+                    } else if std::mem::take(&mut self.control_auto_claim) {
+                        // A session that has just joined takes a free console,
+                        // the way the web client does. If the link is not up
+                        // yet the claim is not lost: it is put back, and the
+                        // connect edge or the next status sends it.
+                        if self.request_control("claim idle").is_err() {
+                            self.control_auto_claim = true;
+                        }
+                    }
+                }
+            }
+            // The automatic claim belongs to the connect-time answer only: a
+            // console somebody was using is theirs until this session asks.
+            // Without this, a later `available` poll would hand it over on a
+            // claim the user never made. The web client decides the same way.
+            if status.mode != crate::device::ControlMode::Available {
+                self.control_auto_claim = false;
+            }
+            self.control_yield = false;
+            return;
+        }
+        if let Some(reason) = crate::device::control_refusal(text) {
+            if self.control_yield
+                || matches!(reason, "readonly" | "not_owner" | "stale_epoch" | "busy")
+            {
+                // The bridge rejected this session; only a fresh status can name the owner.
+                self.control = None;
+                self.control_poll_due = Some(Instant::now());
+            }
+            let was_holding_keystrokes = std::mem::take(&mut self.control_claim_in_flight);
+            self.control_yield = false;
+            self.held_input.clear();
+            self.control_error = Some(reason.to_string());
+            self.push_notice(Notice {
+                text: if was_holding_keystrokes && reason == "busy" {
+                    s.control_busy.to_string()
+                } else {
+                    format!("{}{reason}", s.control_refused)
+                },
+                level: NoticeLevel::Warn,
+            });
+        }
+    }
+
+    /// Type as the user asked, holding the bytes when the console is not ours.
+    ///
+    /// The first keystroke asks for an **idle** hand-over: the bridge grants it
+    /// only when the current owner has stopped writing, so watching a session
+    /// never interrupts an active typist. The bytes go out on the `OK`, and are
+    /// dropped — with a sentence — when the bridge says the other side is busy.
+    fn send_user_input(&mut self, bytes: &[u8]) -> bool {
+        if self.control_readonly() {
+            return self.hold_while_readonly(bytes);
+        }
+        self.send_bytes(bytes)
+    }
+
+    fn hold_while_readonly(&mut self, bytes: &[u8]) -> bool {
+        if !self.connected() {
+            return false;
+        }
+        if bytes.is_empty() {
+            return true;
+        }
+        self.held_input.extend_from_slice(bytes);
+        // A held keystroke is still the user's typing: echo it the way
+        // `send_bytes` would have, unless line mode already did.
+        if !self.line_mode && self.terminal.echo {
+            self.terminal.push(bytes);
+        }
+        self.claim_idle_if_held();
+        !self.held_input.is_empty() || !self.control_readonly()
+    }
+
+    /// Ask for the console on behalf of keystrokes that are waiting for it.
+    ///
+    /// Never displaces a question already in flight: the protocol has one
+    /// answer slot, and taking it from a bond write or a diagnostics read
+    /// would lose that answer. The bytes stay held and the next pump tries
+    /// again once the bridge has replied.
+    fn claim_idle_if_held(&mut self) {
+        if !self.control_readonly()
+            || self.control.is_none()
+            || self.control_yield
+            || self.held_input.is_empty()
+            || self.control_claim_in_flight
+            || self.talk.waiting().is_some()
+        {
+            return;
+        }
+        self.control_claim_in_flight = true;
+        if self.request_control("claim idle").is_err() {
+            self.control_claim_in_flight = false;
+            self.held_input.clear();
+        }
+    }
+
+    /// Send the keystrokes that waited for the console.
+    fn flush_held_input(&mut self) {
+        let bytes = std::mem::take(&mut self.held_input);
+        if bytes.is_empty() {
+            return;
+        }
+        if self.session.send(&bytes) {
+            self.geometry.note_input(&bytes);
+            self.trace.tx(&bytes);
+            self.tx = self.session.tx();
+        }
+    }
+
     /// Ask for the LAN access token if nobody has yet, and let the caller
     /// ignore the answer: the capture lands on whichever pump it arrives on.
     ///
@@ -3013,7 +4153,13 @@ impl App {
                 self.diagnostics.loading = true;
                 self.diagnostics.error = None;
             }
-            Query::Uart | Query::Wifi | Query::WifiScan | Query::Webdav | Query::BleName => {
+            Query::Uart
+            | Query::Wifi
+            | Query::WifiScan
+            | Query::Webdav
+            | Query::BleName
+            | Query::Bonds
+            | Query::BondLabel => {
                 self.network.loading = true;
                 self.network.error = None;
             }
@@ -3021,6 +4167,9 @@ impl App {
             // fills and not the network view: a token that appears on screen
             // next to a wifi name is a token in a screenshot.
             Query::Lan => self.lan_status.loading = true,
+            // Ownership is a quiet question with a top-bar badge for an
+            // answer; no view opens a spinner for it.
+            Query::Control => {}
         }
         // A scan is the one question the app may ask again by itself, so it
         // carries the record of what it is owed. A fresh scan gets the whole
@@ -3074,6 +4223,103 @@ impl App {
         self.send_accessory(&command, Query::Webdav)
     }
 
+    /// Read the bonded hosts. Their labels are read one address at a time
+    /// after the list arrives, so the fixed reply buffer never has to hold
+    /// them all.
+    pub fn refresh_bonds(&mut self) -> Result<(), String> {
+        self.bond_label_queue.clear();
+        self.bond_refresh_due = None;
+        self.bond_self_write = false;
+        self.bond_mutation_pending = false;
+        self.bond_mutation_result = None;
+        self.ask_device(Query::Bonds)
+    }
+
+    /// Store a display label for one bonded host and read it back.
+    pub fn set_bond_label(&mut self, address: &str, label: &str) -> Result<(), String> {
+        let command = accessory::bond_label_set_command(address, label);
+        self.send_bond_mutation(&command)
+    }
+
+    /// Ask the bridge to remove one pairing.
+    ///
+    /// The approval card owns this one: removing a pairing drops a connection.
+    /// Its `OK bonds queued` is not a label: the answer path schedules a read
+    /// after the firmware's delayed unpair instead of folding a label, see
+    /// [`App::apply_reply`].
+    pub fn remove_bond(&mut self, address: &str) -> Result<(), String> {
+        self.send_bond_mutation(&format!("@linkr bonds remove {address}"))
+    }
+
+    fn send_bond_mutation(&mut self, command: &str) -> Result<(), String> {
+        self.bond_label_queue.clear();
+        self.bond_self_write = false;
+        self.bond_mutation_result = None;
+        self.bond_mutation_pending = false;
+        self.send_accessory(command, Query::BondLabel)?;
+        self.bond_mutation_pending = true;
+        Ok(())
+    }
+
+    /// A finished wait may mean a rejection, timeout, or disconnect. Only a
+    /// matching, valid device acknowledgement is evidence of success.
+    pub fn take_bond_mutation_result(&mut self) -> Option<Result<String, String>> {
+        self.bond_mutation_pending = false;
+        self.bond_mutation_result.take()
+    }
+
+    /// Ask for the next queued label, if the link is still up.
+    fn ask_next_bond_label(&mut self) {
+        if !self.ble_connected() {
+            self.bond_label_queue.clear();
+            return;
+        }
+        let Some(address) = self.bond_label_queue.pop_front() else {
+            self.maybe_report_self_label();
+            return;
+        };
+        let command = accessory::bond_label_query_command(&address);
+        if let Err(why) = self.send_accessory(&command, Query::BondLabel) {
+            self.network.error = Some(why);
+            self.bond_label_queue.clear();
+        }
+    }
+
+    /// Report the local user name for this host's own pairing when the board
+    /// stores no label yet.
+    ///
+    /// The web client does the same with the browser's user agent. A label the
+    /// owner already stored is never touched, and a read-only refusal is
+    /// silent: this is a convenience, not a setting the user asked for.
+    fn maybe_report_self_label(&mut self) {
+        if self.bond_self_reported
+            || !self.ble_connected()
+            || !self.network.labels_supported
+            || self.waiting_on_device()
+        {
+            return;
+        }
+        let Some(bonds) = self.network.bonds.as_deref() else {
+            return;
+        };
+        let Some(own) = bonds.iter().find(|bond| bond.is_self) else {
+            return;
+        };
+        self.bond_self_reported = true;
+        if own.label.as_deref().is_some_and(|label| !label.is_empty()) {
+            return;
+        }
+        let name = crate::user::preferred_name();
+        if name.is_empty() {
+            return;
+        }
+        let address = own.id.clone();
+        match self.set_bond_label(&address, &name) {
+            Ok(()) => self.bond_self_write = true,
+            Err(why) => self.network.error = Some(why),
+        }
+    }
+
     /// Set the advertised BLE name and read it back.
     ///
     /// The read is the confirmation: the bridge advertises what it stored, and
@@ -3111,6 +4357,12 @@ impl App {
             b"@w" => Query::Wifi,
             b"@d" => Query::Webdav,
             b"@n" => Query::BleName,
+            b"@linkr" => {
+                if let Some(address) = command.strip_prefix("@linkr bonds remove ") {
+                    return self.remove_bond(address);
+                }
+                return Err(self.strings().net_bad_command.to_string());
+            }
             _ => return Err(self.strings().net_bad_command.to_string()),
         };
         self.ble_name_write_pending = query == Query::BleName;
@@ -3164,7 +4416,7 @@ impl App {
         if let Some(previous) = self.talk.waiting() {
             self.stop_waiting(previous);
         }
-        let (id, _) = self.talk.ask(query, now);
+        let id = self.talk.ask_id(query, now);
         let frame = match crate::protocol::encode_management_request(id, command.as_bytes()) {
             Ok(frame) => frame,
             Err(why) => {
@@ -3199,10 +4451,14 @@ impl App {
             Query::WifiScan => self.strings().net_scan,
             _ => self.strings().net_status,
         };
-        self.push_notice(Notice {
-            text: format!("{prefix} {shown}"),
-            level: NoticeLevel::Info,
-        });
+        // Paired-device labels are read in a quiet series after the list; a
+        // notice per address would bury the log. The rows show the result.
+        if !command.starts_with("@linkr bonds ") {
+            self.push_notice(Notice {
+                text: format!("{prefix} {shown}"),
+                level: NoticeLevel::Info,
+            });
+        }
         Ok(())
     }
 
@@ -3211,7 +4467,25 @@ impl App {
         // Whatever happened, nothing is waiting for it any more — and clearing
         // that first is what stops a failed read from leaving its view reading
         // "loading…" underneath an error.
+        let mutation = reply.query == Query::BondLabel && self.bond_mutation_pending;
         self.stop_waiting(reply.query);
+        if reply.query == Query::Control {
+            self.apply_control_reply(&reply);
+            return;
+        }
+        if mutation {
+            self.bond_mutation_pending = false;
+            let text = reply.lines.join("\n");
+            self.bond_mutation_result = Some(if !reply.status.ok {
+                Err(reply.status.error.clone())
+            } else if let Some(label) = accessory::parse_bond_label(&text) {
+                Ok(label.label.unwrap_or_default())
+            } else if text.trim() == "OK bonds queued" {
+                Ok("accepted; the board removes it shortly".to_string())
+            } else {
+                Err(self.strings().net_paired_bad_reply.to_string())
+            });
+        }
         if !reply.status.ok {
             // A busy refusal is not a failure to report: the board's gate is
             // held by whatever WiFi work is in flight, and it clears on its
@@ -3236,6 +4510,43 @@ impl App {
             }
             if reply.query == Query::BleName {
                 self.ble_name_write_pending = false;
+            }
+            // A board without the paired-device commands should lose the
+            // section, not keep an empty one with a refresh button that can
+            // only fail. The same rule for the label subcommand: the list and
+            // removal still work, so only rename goes.
+            if reply.query == Query::Bonds && is_unsupported_error(&reply.status.error) {
+                self.network.paired_supported = false;
+                self.network.bonds = None;
+                self.network.bonds_pending = false;
+                self.network.bonds_result = 0;
+                self.bonds_read_pending = false;
+                self.network.error = None;
+                return;
+            }
+            // The automatic "this host has no label" write is best effort: a
+            // read-only refusal leaves the address showing and says nothing.
+            if reply.query == Query::BondLabel && self.bond_self_write {
+                self.bond_self_write = false;
+                self.network.error = None;
+                return;
+            }
+            if reply.query == Query::BondLabel {
+                let error = reply.status.error.to_ascii_lowercase();
+                if error.contains("unknown command") || error.contains("unsupported") {
+                    self.bond_label_queue.clear();
+                    self.network.labels_supported = false;
+                    self.network.error = None;
+                    self.network.settle_focus();
+                    return;
+                }
+                // The bond went away between the list and its label read.
+                // That is not the end of the series; the next address is.
+                if error.contains("not found") && !mutation {
+                    self.ask_next_bond_label();
+                    return;
+                }
+                self.bond_label_queue.clear();
             }
             // Whatever the refusal was, a scan it named is not owed anything
             // by it: the record goes, so that a scan asked later starts with
@@ -3305,6 +4616,9 @@ impl App {
         }
         let text = reply.lines.join("\n");
         match reply.query {
+            // Already handled above, before the shared refusal and answer
+            // paths: ownership is not a view and has nothing to fold in here.
+            Query::Control => {}
             Query::Diagnostics => self.diagnostics.apply(&reply.lines, stamp.to_string()),
             // A read is how the frame learns the wire's own rate. Asking the
             // target would be asking somebody who does not know: this is the
@@ -3312,6 +4626,7 @@ impl App {
             Query::Uart => {
                 if let Some(settings) = accessory::parse_uart_settings(&text) {
                     self.baud = Some(settings.baud);
+                    self.uart_settings = Some(settings);
                 }
                 // The UART window, when it is the one that asked, shows the
                 // bridge's own answer and takes the rate from it.
@@ -3388,6 +4703,68 @@ impl App {
                     self.network.ble_name = Some(status);
                 }
             }
+            Query::Bonds => {
+                if let Some(list) = accessory::parse_bonds(&text) {
+                    let bonds: Vec<crate::views::network::BondEntry> = list
+                        .peers
+                        .into_iter()
+                        .map(|peer| crate::views::network::BondEntry {
+                            id: peer.id,
+                            is_self: peer.is_self,
+                            label: None,
+                        })
+                        .collect();
+                    self.network.bonds_pending = list.pending;
+                    self.network.bonds_result = list.result;
+                    self.network.paired_supported = true;
+                    self.bond_label_queue = if self.network.labels_supported {
+                        bonds.iter().map(|bond| bond.id.clone()).collect()
+                    } else {
+                        VecDeque::new()
+                    };
+                    self.network.bonds = Some(bonds);
+                    self.network.settle_focus();
+                    self.ask_next_bond_label();
+                }
+            }
+            Query::BondLabel => {
+                if let Some(parsed) = accessory::parse_bond_label(&text) {
+                    self.bond_self_write = false;
+                    self.network.labels_supported = true;
+                    if let Some(bonds) = self.network.bonds.as_mut() {
+                        if let Some(entry) = bonds
+                            .iter_mut()
+                            .find(|bond| bond.id.eq_ignore_ascii_case(&parsed.id))
+                        {
+                            entry.label = parsed.label;
+                        }
+                    }
+                    if !mutation {
+                        self.ask_next_bond_label();
+                    }
+                } else if text.trim() == "OK bonds queued" {
+                    // Removal is accepted but the firmware unplugs 500 ms
+                    // later. Read the list after that window, not now.
+                    self.bond_label_queue.clear();
+                    self.network.bonds_pending = true;
+                    self.bond_refresh_due = Some(Instant::now() + Duration::from_millis(700));
+                    self.push_notice(Notice {
+                        text: self.strings().net_paired_pending.to_string(),
+                        level: NoticeLevel::Info,
+                    });
+                } else {
+                    // An `OK` that is neither a label nor the removal
+                    // acknowledgement (for example a label stored by another
+                    // client as invalid UTF-8). Do not re-read the list: that
+                    // would loop on the same unreadable label forever.
+                    self.bond_label_queue.clear();
+                    if self.bond_self_write {
+                        self.bond_self_write = false;
+                        return;
+                    }
+                    self.network.error = Some(self.strings().net_paired_bad_reply.to_string());
+                }
+            }
             // `@s?` is the only place the bridge reports its LAN access
             // token, and a client that does not ask has no way to learn one.
             // Capturing it here — during the BLE session that is already open
@@ -3442,6 +4819,17 @@ impl App {
         if !self.ble_connected() || self.waiting_on_device() {
             return;
         }
+        if self.control_read_pending {
+            self.control_read_pending = false;
+            // Taking a free console on arrival is what the web client does;
+            // a console somebody is using stays theirs and this session is
+            // read-only until it asks or the other side goes idle.
+            self.control_auto_claim = true;
+            if self.send_control("?").is_err() {
+                self.control_auto_claim = false;
+            }
+            return;
+        }
         if self.ble_name_read_pending {
             self.ble_name_read_pending = false;
             let _ = self.ask_device(Query::BleName);
@@ -3450,6 +4838,21 @@ impl App {
         if self.lan_token_read_pending {
             self.lan_token_read_pending = false;
             let _ = self.ensure_lan_token();
+            // The token read owns the slot now; the bond read waits for the
+            // next free one rather than being dropped.
+            if self.waiting_on_device() {
+                return;
+            }
+        }
+        if self.bonds_read_pending {
+            self.bonds_read_pending = false;
+            if self.view == View::Network
+                && self.network.paired_supported
+                && self.bond_refresh_due.is_none()
+                && !self.waiting_on_device()
+            {
+                let _ = self.refresh_bonds();
+            }
         }
     }
 
@@ -3712,6 +5115,28 @@ impl App {
         }
     }
 
+    /// Read the paired-device list again after the firmware's delayed removal
+    /// window has passed.
+    ///
+    /// A removal answers `OK bonds queued` before it runs; reading immediately
+    /// would show the row that is about to disappear and read its label again.
+    fn send_due_bond_refresh(&mut self, now: Instant) {
+        let Some(at) = self.bond_refresh_due else {
+            return;
+        };
+        if !self.ble_connected() {
+            self.bond_refresh_due = None;
+            return;
+        }
+        if now < at || self.waiting_on_device() {
+            return;
+        }
+        self.bond_refresh_due = None;
+        if self.network.paired_supported {
+            let _ = self.refresh_bonds();
+        }
+    }
+
     /// Give up on an `@event wifi` ending that never came, at `now`.
     ///
     /// Uncertain bridges are read, not waited out: when the window passes,
@@ -3765,6 +5190,26 @@ impl App {
             // by hand and the store may already have one — and firmware that
             // does not know the question should not get a toast per link.
             Query::Lan => return,
+            // A quiet ownership poll that went unanswered is not worth a
+            // toast; the next poll tries again and the badge keeps its last
+            // known state. A claim, though, was holding keystrokes, and a
+            // claim nobody answered must not leave them held for ever.
+            Query::Control => {
+                if self.control_yield {
+                    self.control = None;
+                    self.control_yield = false;
+                    self.control_poll_due = Some(now);
+                }
+                if self.control_claim_in_flight || !self.held_input.is_empty() {
+                    self.control_claim_in_flight = false;
+                    self.held_input.clear();
+                    self.push_notice(Notice {
+                        text: s.mgmt_no_answer.to_string(),
+                        level: NoticeLevel::Warn,
+                    });
+                }
+                return;
+            }
             _ => self.network.error = Some(text.clone()),
         }
         self.push_notice(Notice {
@@ -3775,12 +5220,20 @@ impl App {
 
     /// Clear the in-flight flag this question set, whichever view it set it on.
     fn stop_waiting(&mut self, query: Query) {
+        if query == Query::BondLabel {
+            self.bond_mutation_pending = false;
+        }
         match query {
             Query::Diagnostics => self.diagnostics.loading = false,
-            Query::Uart | Query::Wifi | Query::WifiScan | Query::Webdav | Query::BleName => {
-                self.network.loading = false
-            }
+            Query::Uart
+            | Query::Wifi
+            | Query::WifiScan
+            | Query::Webdav
+            | Query::BleName
+            | Query::Bonds
+            | Query::BondLabel => self.network.loading = false,
             Query::Lan => self.lan_status.loading = false,
+            Query::Control => {}
         }
     }
 
@@ -3850,15 +5303,48 @@ impl App {
         }
     }
 
+    /// Tell the target its tty size, if a size is due and the prompt is idle.
+    ///
+    /// Sent straight down the session rather than through [`Self::send_bytes`]:
+    /// this is housekeeping, not user input. A send that fails leaves the
+    /// size owed, so the next parsed idle prompt offers another chance.
+    pub(crate) fn sync_terminal_geometry(&mut self) {
+        // A script run owns the line from its first byte to its last answer.
+        // A prompt-looking tail in its output — a banner, an echo, the shell
+        // waiting for a password — is not an idle pane, and an `stty` typed
+        // into it would be a command the caller never asked for.
+        if self.collect_output
+            || !self.connected()
+            || !self.pending_line.is_empty()
+            || self.control_readonly()
+        {
+            return;
+        }
+        let Some(command) = self.geometry.take_pending_command() else {
+            return;
+        };
+        let bytes = command.as_bytes();
+        if self.session.send(bytes) {
+            self.geometry.confirm_sent();
+            self.trace.tx(bytes);
+            self.tx = self.session.tx();
+        } else {
+            self.geometry.abort_sent();
+        }
+    }
+
     /// Send raw bytes. Silent when there is no link, because this is the path a
     /// *keystroke* takes and a toast per character would bury the screen.
     pub fn send_bytes(&mut self, bytes: &[u8]) -> bool {
-        if !self.connected() {
+        if !self.connected() || self.control_readonly() {
             return false;
         }
         if !self.session.send(bytes) {
             return false;
         }
+        // Typed input is a command line in the making; an `stty` line must not
+        // land in the middle of it.
+        self.geometry.note_input(bytes);
         self.trace.tx(bytes);
         // The counter is part of the *frame*, so it moves here rather than at
         // the next pump: a keystroke's byte should show in the top bar on the
@@ -3887,9 +5373,13 @@ impl App {
         // be written off-screen for the user to miss.
         self.scroll_terminal_to_bottom();
         if !self.line_mode {
-            return self.send_bytes(bytes.as_bytes());
+            return self.send_user_input(bytes.as_bytes());
         }
         if !ends_line && !bytes.is_empty() {
+            // Held locally, but still a command line the user is composing:
+            // the remote prompt is not idle any more as far as the size sync
+            // is concerned, even though nothing has been sent yet.
+            self.geometry.mark_busy();
             self.pending_line.push_str(bytes);
             // Echoed as it is held, so the line can be read back before it is
             // sent: local echo is the point of line mode, and a held line that
@@ -3901,7 +5391,7 @@ impl App {
         }
         let mut line = std::mem::take(&mut self.pending_line);
         line.push_str(bytes);
-        self.send_bytes(line.as_bytes())
+        self.send_user_input(line.as_bytes())
     }
 
     /// Send a whole command, and say so when there is nothing to send it over.
@@ -3924,7 +5414,7 @@ impl App {
         if !payload.ends_with(b"\n") && !payload.ends_with(b"\r") {
             payload.extend_from_slice(self.enter.bytes().unwrap_or("\r").as_bytes());
         }
-        self.send_bytes(&payload)
+        self.send_user_input(&payload)
     }
 
     /// Throw the pane's history away. The device is not told.
@@ -3957,7 +5447,16 @@ impl App {
             return;
         }
         self.decode_loss_noticed = true;
-        let text = crate::text::fill(self.strings().decode_loss_notice, &[lost.to_string()]);
+        let s = self.strings();
+        let mut text = crate::text::fill(s.decode_loss_notice, &[lost.to_string()]);
+        // A radio or a LAN bridge can drop bytes before they ever reach the
+        // decoder, so a loss that is not the device's own encoding is worth
+        // naming for those links. `stdio` is a pipe or a process the user
+        // started themselves: there is no bridge in the middle to blame.
+        if matches!(self.transport, Transport::Ble | Transport::Lan) {
+            text.push(' ');
+            text.push_str(s.decode_loss_bridge_hint);
+        }
         self.push_notice(Notice {
             text,
             level: NoticeLevel::Warn,
@@ -4223,17 +5722,14 @@ mod tests {
         assert!(app.notices.is_empty());
         assert!(app.watch.is_empty());
         let commands: Vec<&str> = app.quick_send.iter().map(|q| q.command.as_str()).collect();
-        assert_eq!(
-            commands,
-            vec!["help", "version", "uname -a", "df -h", "reboot"]
-        );
+        assert_eq!(commands, Vec::<&str>::new());
         let guarded: Vec<&str> = app
             .quick_send
             .iter()
             .filter(|q| q.dangerous)
             .map(|q| q.command.as_str())
             .collect();
-        assert_eq!(guarded, vec!["reboot"]);
+        assert!(guarded.is_empty());
     }
 
     /// The transport row shows the `◂▸` that says Enter flips it, and the lock
@@ -4307,6 +5803,21 @@ mod tests {
         assert!(app.sidebar_visible);
         assert_eq!(app.focus, Focus::Sidebar);
         assert_eq!(notice.text, app.strings().sidebar_shown);
+    }
+
+    /// Choosing a view from the rail hands the keyboard to the content. The
+    /// rail keeps the focus only while it is the pane being used.
+    #[test]
+    fn choosing_a_view_from_the_rail_moves_focus_to_the_content() {
+        for view in View::ALL {
+            let mut app = App {
+                focus: Focus::Sidebar,
+                ..App::default()
+            };
+            app.set_view(view);
+            assert_eq!(app.focus, Focus::Terminal, "{view:?}");
+            assert_eq!(app.view, view);
+        }
     }
 
     /// A paste is a typing gesture, so line mode holds it until Enter exactly
@@ -5153,6 +6664,7 @@ mod tests {
     fn reconnect_without_a_dial_says_so() {
         let mut app = App {
             lang: Lang::En,
+            transport: Transport::Stdio,
             ..App::default()
         };
         app.reconnect();
@@ -5373,6 +6885,36 @@ mod tests {
         assert!(app.last_dial.is_none(), "nothing was remembered");
     }
 
+    /// Picking a board that then fails must not leave Connect aiming at the
+    /// board the user just left: the row shows the new pick, so pressing
+    /// Connect again has to retry it instead of silently dialling the old one.
+    #[test]
+    fn a_failed_pick_is_still_what_connect_aims_at() {
+        use crate::transport::ble::Selection;
+
+        let mut app = App {
+            lang: Lang::En,
+            ..App::default()
+        };
+        app.last_dial = Some(Dial::Ble(
+            Selection::Address("FB:F6:91:14:33:3A".into()),
+            None,
+        ));
+        app.connect_to_board("nonsense", None, None, false);
+        assert!(
+            pump_until(&mut app, |app| app.dialing.is_none()),
+            "the dial comes back"
+        );
+        assert_eq!(app.state, ConnectionState::Failed);
+        assert!(
+            matches!(
+                app.dial_for_connect(),
+                Ok(Dial::Ble(Selection::Address(address), _)) if address == "nonsense"
+            ),
+            "Connect must aim at the board on screen, not the previous link"
+        );
+    }
+
     /// Connect pressed twice dials once: the second press is answered with a
     /// sentence, not a race for the same link.
     #[test]
@@ -5504,6 +7046,137 @@ mod tests {
         (app, wire)
     }
 
+    /// The target's tty is told the pane's size at an idle prompt, and not told
+    /// the same size twice: a shell that reprints its prompt is not a resize.
+    #[test]
+    fn the_target_is_told_the_panes_size_at_an_idle_prompt() {
+        let (mut app, wire) = connected(Lang::En);
+        app.geometry.set_size(117, 40);
+
+        // A boot banner is not a prompt.
+        wire.feed(b"Linux target 6.6.0\r\n");
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert!(wire.take_sent().is_empty(), "the banner is not a prompt");
+
+        wire.feed(b"root@target:~$ ");
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(
+            wire.take_sent(),
+            b"stty rows 40 cols 117 >/dev/null 2>&1\r".to_vec()
+        );
+
+        // The prompt the shell prints after running it changes nothing.
+        wire.feed(b"root@target:~$ ");
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert!(
+            wire.take_sent().is_empty(),
+            "a reprint of the same size is not a resize"
+        );
+    }
+
+    /// A resize waits for the next idle prompt, and typing in the meantime is
+    /// what makes that wait necessary: the line is not fed into a command.
+    #[test]
+    fn a_resize_waits_until_the_user_and_the_target_are_idle() {
+        let (mut app, wire) = connected(Lang::En);
+        app.geometry.set_size(100, 30);
+        wire.feed(b"root@target:~$ ");
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        let _ = wire.take_sent();
+
+        app.geometry.set_size(120, 40);
+        assert!(app.type_bytes(true, "ls"));
+        // The writer runs on its own thread: wait for the typed bytes to land
+        // before clearing them, or they reappear in the next assertion.
+        assert!(pump_until(&mut app, |_| wire.sent_len() >= 2));
+        assert_eq!(wire.take_sent(), b"ls".to_vec());
+        assert!(app.send_bytes(b"\r"));
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"\r".to_vec());
+        // The echo of the typed command is not an idle prompt.
+        wire.feed(b"ls\r\n");
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert!(
+            !wire.take_sent().windows(4).any(|window| window == b"stty"),
+            "the size was typed into the command"
+        );
+
+        wire.feed(b"root@target:~$ ");
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(
+            wire.take_sent(),
+            b"stty rows 40 cols 120 >/dev/null 2>&1\r".to_vec()
+        );
+    }
+
+    /// A scripted run owns the line: a prompt in its output is not an idle pane.
+    /// Sending the size while `--exec` waits would type `stty` into whatever is
+    /// running — the password prompt in the field report was one such command.
+    #[test]
+    fn a_scripted_run_is_not_told_the_panes_size() {
+        let (mut app, wire) = connected(Lang::En);
+        app.collect_output = true;
+        app.geometry.set_size(117, 40);
+
+        wire.feed(b"[sudo] password for root: ");
+        assert!(pump_until(&mut app, |app| app.rx > 0));
+        // Give the writer thread every chance to put a queued `stty` on the
+        // wire, so the negative assertion is about what was sent, not timing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert!(
+            !wire.take_sent().windows(4).any(|window| window == b"stty"),
+            "the size was typed into a command the script is waiting on"
+        );
+
+        // The byte the caller asked for still goes out untouched.
+        assert!(app.send_bytes(b"secret\r"));
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"secret\r".to_vec());
+    }
+
+    #[test]
+    fn geometry_never_submits_a_redrawn_command_or_an_alternate_screen() {
+        for output in [
+            "root@target:~$ ls",
+            "root@target:~$ ls\x1b[2D",
+            "\x1b[?1049hroot@target:~$ ",
+        ] {
+            let (mut app, wire) = connected(Lang::En);
+            app.geometry.set_size(117, 40);
+            wire.feed(output.as_bytes());
+            assert!(pump_until(&mut app, |app| app.rx >= output.len() as u64));
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            app.pump();
+            assert!(
+                wire.take_sent().is_empty(),
+                "geometry wrote into {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_preserves_a_locally_buffered_line_when_the_prompt_reappears() {
+        let (mut app, wire) = connected(Lang::En);
+        app.line_mode = true;
+        app.geometry.set_size(117, 40);
+        assert!(app.type_bytes(false, "ls"));
+        wire.feed(b"root@target:~$ ");
+        assert!(pump_until(&mut app, |app| app.rx > 0));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        app.pump();
+        assert!(wire.take_sent().is_empty());
+        assert_eq!(app.pending_line, "ls");
+    }
+
     /// Undecodable bytes are what a device speaking something that is not
     /// UTF-8 — or a serial frame that does not match what the device sends —
     /// looks like from inside the app: the pane paints `�` for each byte, and
@@ -5559,6 +7232,33 @@ mod tests {
         assert_eq!(telling(&app), 2, "a fresh screen gets a fresh sentence");
     }
 
+    /// A link with a bridge in the middle gets the extra sentence about the
+    /// bridge dropping bytes; a direct `stdio` link does not, because there is
+    /// nothing there but a pipe the user opened.
+    #[test]
+    fn only_a_bridged_link_blames_the_bridge_for_lost_bytes() {
+        let (mut app, wire) = connected_over_ble(Lang::En);
+        wire.feed(b"\xff\xfe");
+        assert!(pump_until(&mut app, |app| app.terminal.decode_lost() == 2));
+        let notice = app.notices.last().expect("the notice");
+        assert!(
+            notice.text.contains("the bridge may have dropped them"),
+            "a radio link says what can drop bytes: {:?}",
+            notice.text
+        );
+
+        let (mut app, wire) = connected(Lang::En);
+        assert_eq!(app.transport, Transport::Stdio);
+        wire.feed(b"\xff\xfe");
+        assert!(pump_until(&mut app, |app| app.terminal.decode_lost() == 2));
+        let notice = app.notices.last().expect("the notice");
+        assert!(
+            !notice.text.contains("the bridge may have dropped them"),
+            "a pipe is not a bridge: {:?}",
+            notice.text
+        );
+    }
+
     /// Asking the bridge what it is must fill the grid it is drawn from.
     ///
     /// This is the whole point of the management channel, and it is worth an
@@ -5604,6 +7304,10 @@ mod tests {
         // on-connect reads, and the one after this is still in flight. What
         // this read itself left behind is the baud, and that is what landed.
         assert_eq!(app.baud, Some(230400));
+        assert_eq!(
+            app.uart_settings.as_ref().unwrap().spec(),
+            "230400,8,n,1,none"
+        );
     }
 
     /// A WiFi read lands in the network view rather than in a toast nobody
@@ -7360,6 +9064,170 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The TUI reports the local user name for this host when the board has no
+    /// label, and a read-only refusal is silent rather than an error.
+    #[test]
+    fn this_hosts_label_is_reported_when_the_board_has_none() {
+        let previous = std::env::var("LINKR_USER_NAME").ok();
+        std::env::set_var("LINKR_USER_NAME", "Auto Tester");
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.talk.reset();
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: true,
+            label: None,
+        }]);
+        app.ask_next_bond_label();
+        assert_eq!(app.talk.waiting(), Some(Query::BondLabel));
+        assert!(app.bond_self_write);
+        assert!(app.bond_self_reported);
+
+        app.apply_reply(
+            crate::device::Reply {
+                query: Query::BondLabel,
+                status: crate::accessory::reply_status("ERR control=readonly"),
+                lines: vec!["ERR control=readonly".to_string()],
+            },
+            "",
+        );
+        assert!(!app.bond_self_write);
+        assert!(app.network.error.is_none(), "a refusal is not an error");
+        match previous {
+            Some(value) => std::env::set_var("LINKR_USER_NAME", value),
+            None => std::env::remove_var("LINKR_USER_NAME"),
+        }
+    }
+
+    /// A label the owner already stored is never replaced by the local name.
+    #[test]
+    fn an_existing_label_is_not_overwritten() {
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.talk.reset();
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: true,
+            label: Some("Alice".into()),
+        }]);
+        app.ask_next_bond_label();
+        assert_eq!(app.talk.waiting(), None);
+        assert!(app.bond_self_reported);
+        assert!(!app.bond_self_write);
+    }
+
+    /// A removal is acknowledged before the board unpairs. The list is read
+    /// back on the delayed window, not immediately, or the row that is about
+    /// to go would still be there and no feedback would say otherwise.
+    #[test]
+    fn a_removal_is_read_back_after_the_boards_delay() {
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.talk.reset();
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: false,
+            label: Some("Alice".into()),
+        }]);
+        app.apply_reply(
+            crate::device::Reply {
+                query: Query::BondLabel,
+                status: crate::accessory::reply_status("OK bonds queued"),
+                lines: vec!["OK bonds queued".to_string()],
+            },
+            "",
+        );
+        assert!(
+            app.network.bonds_pending,
+            "the row says a removal is pending"
+        );
+        assert!(app.bond_refresh_due.is_some(), "the read is scheduled");
+        assert_eq!(
+            app.talk.waiting(),
+            None,
+            "the list is not read before the firmware runs"
+        );
+
+        app.send_due_bond_refresh(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            app.talk.waiting(),
+            Some(Query::Bonds),
+            "the scheduled read asks for the list again"
+        );
+    }
+
+    /// An unreadable label reply stops the label series instead of asking for
+    /// the list again. Re-reading would loop forever on the same bad label.
+    #[test]
+    fn an_unreadable_label_stops_the_series() {
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.talk.reset();
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: false,
+            label: None,
+        }]);
+        app.bond_label_queue.push_back("0/AA:BB:CC:DD:EE:01".into());
+        app.apply_reply(
+            crate::device::Reply {
+                query: Query::BondLabel,
+                status: crate::accessory::reply_status(
+                    "OK bonds label=0/AA:BB:CC:DD:EE:01 hex=c328",
+                ),
+                lines: vec!["OK bonds label=0/AA:BB:CC:DD:EE:01 hex=c328".to_string()],
+            },
+            "",
+        );
+        assert!(app.bond_label_queue.is_empty());
+        assert_eq!(
+            app.network.error.as_deref(),
+            Some(app.strings().net_paired_bad_reply)
+        );
+        assert_eq!(app.talk.waiting(), None);
+    }
+
+    /// A board without the pairing commands loses the section rather than
+    /// keeping an empty one with a refresh that can only fail.
+    #[test]
+    fn an_unsupported_bond_command_hides_the_section() {
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: true,
+            label: None,
+        }]);
+        app.apply_reply(
+            crate::device::Reply {
+                query: Query::Bonds,
+                status: crate::accessory::reply_status("ERR unknown command"),
+                lines: vec!["ERR unknown command".to_string()],
+            },
+            "",
+        );
+        assert!(!app.network.paired_supported);
+        assert!(app.network.bonds.is_none());
+        assert!(app.network.error.is_none(), "not a failure to report");
+    }
+
+    /// A link ending forgets the previous board's pairing list and re-probes
+    /// capabilities on the next one.
+    #[test]
+    fn a_link_ending_forgets_the_paired_devices() {
+        let mut app = App::default();
+        app.network.bonds = Some(vec![crate::views::network::BondEntry {
+            id: "0/AA:BB:CC:DD:EE:01".into(),
+            is_self: true,
+            label: Some("Alice".into()),
+        }]);
+        app.network.paired_supported = false;
+        app.network.labels_supported = false;
+        app.network.bonds_pending = true;
+        app.network.bonds_result = -2;
+        app.clear_bond_view();
+        assert!(app.network.bonds.is_none());
+        assert!(app.network.paired_supported);
+        assert!(app.network.labels_supported);
+        assert!(!app.network.bonds_pending);
+        assert_eq!(app.network.bonds_result, 0);
+    }
+
     /// A rename made here is confirmed by the board, and the answer is the
     /// new name: the row does not keep showing the name the board had before
     /// the write.
@@ -7454,5 +9322,999 @@ mod tests {
                 "the row shows the name the board reported: {name:?}"
             );
         }
+    }
+
+    // --- automatic reconnection -------------------------------------------
+
+    /// The address the in-memory board in these tests is named by. It is not a
+    /// reachable MAC on purpose: the redial tests are about the schedule, and
+    /// a dial to it must fail at once rather than touch a radio.
+    const LOST_BOARD: &str = "nonsense";
+
+    /// An app whose last link died by itself, with the redial armed — the
+    /// starting point for the scheduling tests.
+    fn armed_after_a_loss(lang: Lang) -> App {
+        let mut app = App {
+            lang,
+            ..App::default()
+        };
+        let dial = Dial::Ble(
+            crate::transport::ble::Selection::Address(LOST_BOARD.to_string()),
+            None,
+        );
+        app.last_dial = Some(dial);
+        live_until_it_was_not(&mut app);
+        app
+    }
+
+    /// Open an in-memory Bluetooth link, wait for the interface to say it is
+    /// up, then close the device end so the next pump sees a loss, and leave
+    /// the app at the loss's edge with the redial armed.
+    fn live_until_it_was_not(app: &mut App) {
+        let wire = crate::transport::testing::MemoryLink::ble_addressed("NONSENSE");
+        app.adopt(crate::transport::OpenedLink::open(wire.link()).expect("opens"));
+        assert!(pump_until(app, |app| app.state == ConnectionState::Connected));
+        wire.close();
+        assert!(
+            pump_until(app, |app| {
+                !app.session.is_live() && app.reconnecting.is_some()
+            }),
+            "the loss was noticed and the redial armed"
+        );
+    }
+
+    /// The contract a test can hold without waiting through it: 1, 2, 4, 8,
+    /// 16, 30 seconds, and then no seventh attempt.
+    #[test]
+    fn the_automatic_redial_backs_off_and_ends() {
+        let waits: Vec<u64> = (0..AUTO_RECONNECT_DELAYS.len())
+            .map(|attempt| {
+                auto_reconnect_delay(attempt)
+                    .expect("an attempt has a wait")
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 30]);
+        assert_eq!(
+            auto_reconnect_delay(AUTO_RECONNECT_DELAYS.len()),
+            None,
+            "there is no attempt after the last wait"
+        );
+    }
+
+    /// A link that had been live and then died by itself arms the redial: the
+    /// loss is announced once, the dial being repeated is the last successful
+    /// one, and the generic failure wording is not stacked on top of it.
+    #[test]
+    fn an_unexpected_loss_arms_the_automatic_redial() {
+        let app = armed_after_a_loss(Lang::En);
+        let state = app.reconnecting.as_ref().expect("the redial is armed");
+        assert_eq!(
+            state.dial(),
+            &Dial::Ble(
+                crate::transport::ble::Selection::Address(LOST_BOARD.to_string()),
+                None
+            ),
+            "the dial that last opened is the one repeated"
+        );
+        assert_eq!(state.attempt(), 0, "no attempt has been made yet");
+        assert!(!state.in_flight(), "the first wait is still running");
+        assert!(
+            state.due().saturating_duration_since(Instant::now()) <= Duration::from_secs(1),
+            "the first wait is a second"
+        );
+        let text = app.log.last().expect("the loss was announced").text.clone();
+        assert_eq!(text, "link lost, reconnecting automatically: ble:NONSENSE");
+        assert!(
+            !app.log
+                .iter()
+                .any(|notice| notice.text.starts_with("connect failed: ")),
+            "the loss is announced once: {:?}",
+            app.log
+        );
+    }
+
+    /// A deliberate hang-up is not a loss: the user asked for the link to end,
+    /// and a program that dialled it back would be arguing with them.
+    #[test]
+    fn a_deliberate_hang_up_is_not_redialled() {
+        let mut app = App {
+            lang: Lang::En,
+            ..App::default()
+        };
+        app.dial(&Dial::Stdio("-".into()))
+            .expect("the loopback opens");
+        assert!(pump_until(&mut app, |app| {
+            app.state == ConnectionState::Connected
+        }));
+        app.disconnect();
+        for _ in 0..4 {
+            app.pump();
+        }
+        assert!(
+            app.reconnecting.is_none(),
+            "a hang-up is not a dropped link"
+        );
+    }
+
+    /// And Disconnect calls off a redial that is already waiting: the row is
+    /// the same key whether there is a link to end or a wait to end.
+    #[test]
+    fn disconnect_calls_off_a_pending_redial() {
+        let mut app = armed_after_a_loss(Lang::En);
+        assert!(app.reconnecting.is_some());
+        app.disconnect();
+        assert!(app.reconnecting.is_none(), "called off");
+        app.pump();
+        assert!(app.reconnecting.is_none(), "the pump does not arm it again");
+    }
+
+    /// The switch turns the whole feature off: the loss keeps its ordinary
+    /// wording and no timer is armed.
+    #[test]
+    fn auto_reconnect_can_be_switched_off() {
+        let mut app = App {
+            lang: Lang::En,
+            auto_reconnect: false,
+            ..App::default()
+        };
+        app.last_dial = Some(Dial::Ble(
+            crate::transport::ble::Selection::Address(LOST_BOARD.to_string()),
+            None,
+        ));
+        let wire = crate::transport::testing::MemoryLink::ble_addressed("NONSENSE");
+        app.adopt(crate::transport::OpenedLink::open(wire.link()).expect("opens"));
+        assert!(pump_until(&mut app, |app| {
+            app.state == ConnectionState::Connected
+        }));
+        wire.close();
+        assert!(pump_until(&mut app, |app| !app.session.is_live()));
+        for _ in 0..3 {
+            app.pump();
+        }
+        assert!(app.reconnecting.is_none(), "the switch is off");
+        assert!(
+            app.log
+                .iter()
+                .any(|notice| notice.text.starts_with("link closed: ble:NONSENSE")),
+            "the loss is still reported, in the ordinary words: {:?}",
+            app.log
+        );
+        assert!(
+            !app.log
+                .iter()
+                .any(|notice| notice.text.contains("reconnecting automatically")),
+            "and nothing promises a retry: {:?}",
+            app.log
+        );
+    }
+
+    /// A bridge that was asked to run is not a bridge to run again: a child
+    /// process that exited may have finished a job, and replaying its command
+    /// behind the user's back is not a reconnect.
+    #[test]
+    fn a_bridge_process_that_ended_is_not_restarted() {
+        let mut app = App {
+            lang: Lang::En,
+            ..App::default()
+        };
+        app.last_dial = Some(Dial::Stdio("-".into()));
+        let wire = crate::transport::testing::MemoryLink::new();
+        app.adopt(crate::transport::OpenedLink::open(wire.link()).expect("opens"));
+        assert!(pump_until(&mut app, |app| {
+            app.state == ConnectionState::Connected
+        }));
+        wire.close();
+        assert!(pump_until(&mut app, |app| !app.session.is_live()));
+        for _ in 0..3 {
+            app.pump();
+        }
+        assert!(app.reconnecting.is_none(), "a process is not a radio");
+    }
+
+    /// A dial that failed at startup is not retried behind the user's back:
+    /// the rule the app has always had, held here against the new state
+    /// machine so the two cannot drift apart.
+    #[test]
+    fn a_failed_startup_dial_is_not_redialled() {
+        let mut app = App {
+            lang: Lang::En,
+            ..App::default()
+        };
+        assert!(app.dial_async(
+            &Dial::Ble(
+                crate::transport::ble::Selection::Address("nonsense".into()),
+                None,
+            ),
+            true
+        ));
+        assert!(pump_until(&mut app, |app| app.dialing.is_none()));
+        for _ in 0..3 {
+            app.pump();
+        }
+        assert!(app.reconnecting.is_none(), "nothing was ever live");
+        assert!(
+            app.last_dial.is_none(),
+            "and the failed dial is not remembered"
+        );
+    }
+
+    /// The attempts walk the schedule and stop at six: the sixth failure is
+    /// the one that asks the user for the link, in the words the docs quote.
+    #[test]
+    fn the_redial_walks_the_backoff_and_gives_up_after_six() {
+        let mut app = armed_after_a_loss(Lang::En);
+        // A fake clock, far from the real one, so seedings that are measured
+        // from "now" do not matter to the assertions below.
+        let base = Instant::now() + Duration::from_secs(60);
+        for attempt in 0..AUTO_RECONNECT_DELAYS.len() {
+            let due = app.reconnecting.as_ref().expect("still trying").due();
+            app.drive_reconnect(due);
+            assert!(
+                app.dialing.is_some(),
+                "attempt {} is on the wire",
+                attempt + 1
+            );
+            let state = app.reconnecting.as_ref().expect("still trying");
+            assert_eq!(state.attempt(), attempt + 1, "the attempt is counted");
+            assert!(state.in_flight());
+            let text = app
+                .log
+                .last()
+                .expect("the attempt was announced")
+                .text
+                .clone();
+            assert_eq!(text, format!("auto-reconnect attempt {}/6", attempt + 1));
+            // The landing is a failure; collect it by hand so the next wait is
+            // measured on the fake clock rather than after a real sleep.
+            app.dialing = None;
+            app.note_reconnect_failure(base);
+            if attempt + 1 < AUTO_RECONNECT_DELAYS.len() {
+                let state = app.reconnecting.as_ref().expect("a next attempt");
+                assert_eq!(
+                    state.due(),
+                    base + AUTO_RECONNECT_DELAYS[attempt + 1],
+                    "the next wait doubles down the schedule"
+                );
+                assert!(!state.in_flight());
+            }
+        }
+        assert!(app.reconnecting.is_none(), "six attempts and no more");
+        let text = app
+            .log
+            .last()
+            .expect("the give-up was announced")
+            .text
+            .clone();
+        assert_eq!(
+            text,
+            "automatic reconnect failed after 6 attempts; press Reconnect to try again"
+        );
+    }
+
+    /// An attempt that lands brings the link back, says so once as a
+    /// restoration — not also as a fresh connection — and ends the redial.
+    #[test]
+    fn a_restored_link_is_announced_and_ends_the_redial() {
+        let mut app = armed_after_a_loss(Lang::En);
+        // The loopback is a dial a test can really complete, standing in for
+        // the board coming back; the state machine does not care which dial it
+        // repeats.
+        if let Some(state) = app.reconnecting.as_mut() {
+            state.dial = Dial::Stdio("-".into());
+        }
+        let due = app.reconnecting.as_ref().expect("armed").due();
+        let before = app.log.len();
+        app.drive_reconnect(due);
+        assert!(app.dialing.is_some(), "the attempt is on the wire");
+        assert!(pump_until(&mut app, |app| {
+            app.state == ConnectionState::Connected
+        }));
+        assert!(app.reconnecting.is_none(), "the wait is over");
+        let restored = app
+            .log
+            .iter()
+            .map(|notice| notice.text.as_str())
+            .find(|text| text.starts_with("link restored automatically: "))
+            .unwrap_or_else(|| panic!("the restoration was announced: {:?}", app.log));
+        assert_eq!(restored, "link restored automatically: stdio: loopback");
+        assert!(
+            !app.log[before..]
+                .iter()
+                .any(|notice| notice.text.starts_with("link open: ")),
+            "a restoration is not also a fresh connection: {:?}",
+            app.log
+        );
+    }
+
+    /// A manual Connect is another answer to the loss: the redial stops, and
+    /// the dial the press makes is the ordinary one.
+    #[test]
+    fn the_connect_key_calls_off_the_automatic_redial() {
+        let mut app = armed_after_a_loss(Lang::En);
+        assert!(app.reconnecting.is_some());
+        app.reconnect();
+        assert!(app.reconnecting.is_none(), "the press is the answer");
+        assert!(app.dialing.is_some(), "and the press dials");
+        assert!(pump_until(&mut app, |app| app.dialing.is_none()));
+        assert_eq!(
+            app.state,
+            ConnectionState::Failed,
+            "the dial really failed — the board is not there"
+        );
+    }
+
+    /// Quitting ends the redial too: nobody is left to read its notices.
+    #[test]
+    fn quitting_calls_off_the_automatic_redial() {
+        let mut app = armed_after_a_loss(Lang::En);
+        app.request_quit();
+        assert!(app.reconnecting.is_none());
+    }
+
+    #[test]
+    fn disconnect_during_auto_dial_releases_late_connection() {
+        let mut app = armed_after_a_loss(Lang::En);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.reconnecting.as_mut().unwrap().in_flight = true;
+        app.dialing = Some(DialJob {
+            dial: app.last_dial.clone().unwrap(),
+            quiet: true,
+            cancelled: false,
+            rx,
+        });
+        app.disconnect();
+        app.pump();
+        assert_eq!(app.state, ConnectionState::Disconnected);
+        assert!(app.reconnecting.is_none());
+        let wire = crate::transport::testing::MemoryLink::ble_addressed("NONSENSE");
+        assert!(tx.send(OpenedLink::open(wire.link())).is_ok());
+        app.poll_dial();
+        assert!(
+            !app.session.is_live(),
+            "late results must not restore the session"
+        );
+        assert!(wire.hung_up(), "the unwanted transport must be released");
+        assert!(app.dialing.is_none());
+        assert!(!app.transport_locked);
+    }
+
+    #[test]
+    fn cancelled_auto_dial_failure_stays_disconnected() {
+        let mut app = armed_after_a_loss(Lang::En);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.reconnecting.as_mut().unwrap().in_flight = true;
+        app.dialing = Some(DialJob {
+            dial: app.last_dial.clone().unwrap(),
+            quiet: true,
+            cancelled: false,
+            rx,
+        });
+        app.disconnect();
+        tx.send(Err(io::Error::other("late dial error"))).ok();
+        app.pump();
+        assert_eq!(app.state, ConnectionState::Disconnected);
+        assert!(app.reconnecting.is_none());
+        assert!(!app
+            .log
+            .iter()
+            .any(|item| item.text.contains("late dial error")));
+    }
+
+    #[test]
+    fn automatic_retry_pins_resolved_mac_or_uuid_and_preserves_timeout() {
+        use crate::transport::ble::Selection;
+        for selection in [Selection::Any, Selection::Name("Linkr".into())] {
+            for id in ["EE:C7:42:34:48:CF", "68998BA3-6A68-4B05-981E-3544CFD046CD"] {
+                let mut app = App {
+                    lang: Lang::En,
+                    ..App::default()
+                };
+                let timeout = Some(Duration::from_secs(8));
+                app.last_dial = Some(Dial::Ble(selection.clone(), timeout));
+                let wire = crate::transport::testing::MemoryLink::ble_addressed(id);
+                let mut opened = OpenedLink::open(wire.link()).unwrap();
+                opened.ble_device_id = Some(id.into());
+                app.adopt(opened);
+                assert!(pump_until(&mut app, |app| app.state == ConnectionState::Connected));
+                wire.close();
+                assert!(pump_until(&mut app, |app| app.reconnecting.is_some()));
+                assert_eq!(
+                    app.reconnecting.as_ref().unwrap().dial(),
+                    &Dial::Ble(Selection::Address(id.into()), timeout)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retry_never_reuses_an_unresolved_discovery_filter() {
+        use crate::transport::ble::Selection;
+        for selection in [Selection::Any, Selection::Name("Linkr".into())] {
+            let mut app = App {
+                last_dial: Some(Dial::Ble(selection, None)),
+                ..App::default()
+            };
+            assert!(!app.begin_auto_reconnect("unknown"));
+            assert!(app.reconnecting.is_none());
+        }
+    }
+
+    #[test]
+    fn exiting_releases_queued_and_pending_auto_dials() {
+        for queued in [true, false] {
+            let mut app = armed_after_a_loss(Lang::En);
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.reconnecting.as_mut().unwrap().in_flight = true;
+            app.dialing = Some(DialJob {
+                dial: app.last_dial.clone().unwrap(),
+                quiet: true,
+                cancelled: false,
+                rx,
+            });
+            let wire = crate::transport::testing::MemoryLink::ble_addressed("NONSENSE");
+            if queued {
+                assert!(tx.send(OpenedLink::open(wire.link())).is_ok());
+            }
+            app.request_quit();
+            drop(app);
+            if !queued {
+                assert!(tx.send(OpenedLink::open(wire.link())).is_ok());
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !wire.hung_up() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                wire.hung_up(),
+                "exiting must close even an uncollected dial"
+            );
+        }
+    }
+    #[test]
+    fn cli_bond_mutations_report_device_errors_and_success() {
+        for remove in [false, true] {
+            for reply in [
+                "ERR control=readonly",
+                "ERR bonds not found",
+                "ERR bonds unsupported",
+                "OK malformed",
+                if remove {
+                    "OK bonds queued"
+                } else {
+                    "OK bonds label=0/AA:BB:CC:DD:EE:01 hex=54657374"
+                },
+            ] {
+                let (mut app, wire) = connected_over_ble(Lang::En);
+                let peer = "0/AA:BB:CC:DD:EE:01".to_string();
+                let requests = if remove {
+                    crate::cli::Requests {
+                        bond_remove: Some(peer),
+                        ..Default::default()
+                    }
+                } else {
+                    crate::cli::Requests {
+                        bond_label: Some((peer, "Test".to_string())),
+                        ..Default::default()
+                    }
+                };
+                let responder = std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline {
+                        for frame in crate::transport::testing::asked_frames(&wire) {
+                            if frame[crate::protocol::MGMT_HEADER_SIZE..]
+                                .starts_with(b"@linkr bonds ")
+                            {
+                                let id =
+                                    u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+                                wire.feed_management(crate::transport::testing::answer(id, reply));
+                                return;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    panic!("bond command was not sent");
+                });
+                let failures = crate::cli::run_requests(
+                    &mut app,
+                    &requests,
+                    crate::cli::Format::Json,
+                    Duration::from_millis(100),
+                );
+                responder.join().unwrap();
+                let success = reply == "OK bonds queued" || reply.contains("hex=");
+                assert_eq!(
+                    failures,
+                    i32::from(!success),
+                    "remove={remove}, reply={reply}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unanswered_bond_mutations_have_no_success_result() {
+        let (mut app, _wire) = connected_over_ble(Lang::En);
+        app.remove_bond("0/AA:BB:CC:DD:EE:01").unwrap();
+        app.talk.abandon(Instant::now() + Duration::from_secs(30));
+        app.report_unanswered(Query::BondLabel, Instant::now());
+        assert!(app.take_bond_mutation_result().is_none());
+    }
+
+    // --- console ownership -------------------------------------------------
+
+    /// A board that advertises `MULTI_SESSION` is asked who owns the console
+    /// before anything else. A free console is claimed, the way the web client
+    /// takes it, and the top bar says so.
+    #[test]
+    fn a_free_console_is_claimed_on_connect() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=1 owner=0 mode=available epoch=1 peers=1\r\n",
+        ));
+        // The answer says "available", so the first session takes it.
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(
+            claim,
+            "OK control self=1 owner=1 mode=control epoch=2 peers=1\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        assert_eq!(
+            app.control_badge().map(|(text, _)| text),
+            Some("In control".to_string())
+        );
+    }
+
+    /// A read-only session holds the first keystroke, asks for an idle
+    /// hand-over, and sends the line once the bridge grants it.
+    #[test]
+    fn a_keystroke_takes_an_idle_console_and_then_goes_out() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Readonly)
+        }));
+        assert_eq!(
+            app.control_badge().map(|(text, _)| text),
+            Some("Read only".to_string())
+        );
+        settle_connect_reads(&mut app, &wire);
+
+        assert!(app.type_bytes(true, "ls"), "typing is accepted, then held");
+        assert_eq!(wire.sent_len(), 0, "nothing reached the line yet");
+
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(
+            claim,
+            "OK control self=2 owner=2 mode=control epoch=4 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"ls".to_vec(), "the held line went out");
+    }
+
+    /// The idle hand-over never interrupts an active typist: the refusal drops
+    /// the held line and says why, leaving the pane read-only.
+    #[test]
+    fn a_busy_console_refuses_the_idle_claim_and_the_line_is_dropped() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        settle_connect_reads(&mut app, &wire);
+
+        assert!(app.type_bytes(true, "rm -rf /"));
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(claim, "ERR control=busy\r\n"));
+        assert!(pump_until(&mut app, |app| {
+            !app.control_claim_in_flight && app.held_input.is_empty()
+        }));
+        for _ in 0..20 {
+            app.pump();
+        }
+        assert_eq!(wire.sent_len(), 0, "a refused line is not typed anyway");
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| { notice.text == app.strings().control_busy }),
+            "the refusal is spoken: {:?}",
+            app.notices
+        );
+    }
+
+    /// A script reads the refusal, not only the toast: `--control` and `send`
+    /// report what the bridge said.
+    #[test]
+    fn a_refused_ownership_command_is_readable_by_a_script() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        settle_connect_reads(&mut app, &wire);
+
+        let press = app.take_control_when_idle();
+        assert_eq!(press.level, crate::event::NoticeLevel::Info);
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(claim, "ERR control=busy\r\n"));
+        assert!(pump_until(&mut app, |app| app.control_refusal().is_some()));
+        assert_eq!(app.control_refusal(), Some("busy"));
+    }
+
+    /// The idle claim is available without a keystroke, for a script that is
+    /// about to send stdin.
+    #[test]
+    fn asking_for_the_console_when_idle_sends_the_idle_claim() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        settle_connect_reads(&mut app, &wire);
+
+        let notice = app.take_control_when_idle();
+        assert_eq!(notice.level, crate::event::NoticeLevel::Info);
+        next_control_frame(&mut app, &wire, b"@c claim idle");
+    }
+
+    /// Giving the console up is not another session seizing it, and saying so
+    /// would blame a peer for something the user asked for.
+    #[test]
+    fn releasing_the_console_is_not_reported_as_a_seizure() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=1 owner=0 mode=available epoch=1 peers=1\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(
+            claim,
+            "OK control self=1 owner=1 mode=control epoch=2 peers=1\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        settle_connect_reads(&mut app, &wire);
+        app.notices.clear();
+
+        let notice = app.release_control();
+        assert_eq!(notice.level, NoticeLevel::Info);
+        let release = next_control_frame(&mut app, &wire, b"@c release");
+        wire.feed_management(answer(
+            release,
+            "OK control self=1 owner=0 mode=available epoch=3 peers=1\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Available)
+        }));
+        assert!(
+            !app.notices
+                .iter()
+                .any(|notice| notice.text == app.strings().control_taken),
+            "a deliberate release is not a seizure: {:?}",
+            app.notices
+        );
+    }
+
+    /// The single answer slot is not stolen from a question already in flight:
+    /// the keystroke waits, and asks for the console as soon as the answer is
+    /// in.
+    #[test]
+    fn a_held_keystroke_waits_for_the_question_in_flight() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+
+        // A diagnostics read owns the one answer slot.
+        let (uart, _) = app.talk.ask(Query::Uart, Instant::now());
+        assert!(app.type_bytes(true, "ls"), "typing is accepted, then held");
+        assert!(!app.held_input.is_empty());
+        assert_eq!(app.talk.waiting(), Some(Query::Uart), "not displaced");
+        assert!(
+            !crate::transport::testing::asked_frames(&wire)
+                .iter()
+                .any(|frame| &frame[crate::protocol::MGMT_HEADER_SIZE..] == b"@c claim idle"),
+            "an idle claim must not take the answer slot from a read"
+        );
+
+        // The read answers, and the held line asks on the next pump.
+        wire.feed_management(answer(uart, "OK uart=115200,8,N,1,none\r\n"));
+        let claim = next_control_frame(&mut app, &wire, b"@c claim idle");
+        wire.feed_management(answer(
+            claim,
+            "OK control self=2 owner=2 mode=control epoch=4 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"ls".to_vec());
+    }
+
+    /// The LAN socket has no capability word: the bridge announces ownership
+    /// by sending its status unprompted, and only then does the TUI take a
+    /// free console — with the socket's own `@control` spelling.
+    #[test]
+    fn a_lan_session_claims_a_free_console_with_control_frames() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        assert!(!app.supports_control(), "no announcement has arrived yet");
+        wire.feed_control("OK control self=1 owner=0 mode=available epoch=1 peers=1\r\n");
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        assert!(app.supports_control());
+        assert!(pump_until(&mut app, |_| {
+            take_control_contains(&wire, "@control claim idle")
+        }));
+        wire.feed_control("OK control self=1 owner=1 mode=control epoch=2 peers=1\r\n");
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        assert_eq!(
+            app.control_badge().map(|(text, _)| text),
+            Some("In control".to_string())
+        );
+    }
+
+    #[test]
+    fn a_lan_write_refusal_immediately_blocks_input_until_status_is_refreshed() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        wire.feed_control("OK control self=1 owner=1 mode=control epoch=1 peers=2");
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        wire.feed_control("ERR control=readonly");
+        assert!(pump_until(&mut app, |app| app.control_refusal() == Some("readonly")));
+        assert!(app.control_readonly());
+        assert!(!app.send_bytes(b"stale"));
+        assert!(pump_until(&mut app, |_| take_control_contains(
+            &wire,
+            "@control ?"
+        )));
+        wire.feed_control("OK control self=1 owner=2 mode=readonly epoch=2 peers=2");
+        assert!(pump_until(&mut app, |app| app.control_mode()
+            == Some(crate::device::ControlMode::Readonly)));
+        assert_eq!(wire.sent_len(), 0);
+    }
+
+    /// A read-only LAN session holds the first keystroke, asks with the
+    /// socket's spelling, and types the line only after the grant.
+    #[test]
+    fn a_lan_readonly_keystroke_asks_for_an_idle_hand_over() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        wire.feed_control("OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n");
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+
+        assert!(app.type_bytes(true, "ls"), "typing is accepted, then held");
+        assert_eq!(wire.sent_len(), 0, "nothing reached the line yet");
+        assert!(pump_until(&mut app, |_| {
+            take_control_contains(&wire, "@control claim idle")
+        }));
+        wire.feed_control("OK control self=2 owner=2 mode=control epoch=4 peers=2\r\n");
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"ls".to_vec(), "the held line went out");
+    }
+
+    /// The LAN spelling of a refusal is read the same way: the held line is
+    /// dropped and the reason is spoken.
+    #[test]
+    fn a_lan_busy_refusal_drops_the_held_line() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        wire.feed_control("OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n");
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+
+        assert!(app.type_bytes(true, "rm -rf /"));
+        assert!(pump_until(&mut app, |_| {
+            take_control_contains(&wire, "@control claim idle")
+        }));
+        wire.feed_control("ERR control=busy\r\n");
+        assert!(pump_until(&mut app, |app| {
+            !app.control_claim_in_flight && app.held_input.is_empty()
+        }));
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert_eq!(wire.sent_len(), 0, "a refused line is not typed anyway");
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text == app.strings().control_busy),
+            "the refusal is spoken: {:?}",
+            app.notices
+        );
+    }
+
+    /// Releasing over LAN uses the socket's spelling and is still not reported
+    /// as somebody else seizing the console.
+    #[test]
+    fn a_lan_release_uses_the_control_frame_and_is_not_a_seizure() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        wire.feed_control("OK control self=1 owner=1 mode=control epoch=2 peers=1\r\n");
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Control)
+        }));
+        app.notices.clear();
+
+        let notice = app.release_control();
+        assert_eq!(notice.level, NoticeLevel::Info);
+        assert!(pump_until(&mut app, |_| {
+            take_control_contains(&wire, "@control release")
+        }));
+        wire.feed_control("OK control self=1 owner=0 mode=available epoch=3 peers=1\r\n");
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Available)
+        }));
+        assert!(
+            !app.notices
+                .iter()
+                .any(|notice| notice.text == app.strings().control_taken),
+            "a deliberate release is not a seizure: {:?}",
+            app.notices
+        );
+    }
+
+    /// A LAN bridge that never announces ownership is an old one: the TUI
+    /// keeps typing straight through instead of probing for a command the
+    /// bridge would reject.
+    #[test]
+    fn an_unannounced_lan_session_is_not_gated() {
+        let (mut app, wire) = connected_over_lan(Lang::En);
+        assert!(!app.supports_control());
+        assert!(app.type_bytes(true, "echo hi"));
+        assert!(pump_until(&mut app, |_| wire.sent_len() > 0));
+        assert_eq!(wire.take_sent(), b"echo hi".to_vec());
+        assert!(wire.take_control().is_empty(), "nothing was probed for");
+    }
+
+    /// Open a LAN memory link and wait until the session reports it.
+    fn connected_over_lan(lang: Lang) -> (App, crate::transport::testing::MemoryLink) {
+        let mut app = App {
+            lang,
+            ..App::default()
+        };
+        let wire = crate::transport::testing::MemoryLink::lan();
+        app.connect(wire.link()).expect("the memory link opens");
+        assert!(pump_until(&mut app, |app| app.connected()));
+        (app, wire)
+    }
+
+    /// Whether one of the ownership commands the host sent is `command`,
+    /// draining the queue as `take_control` does.
+    fn take_control_contains(wire: &crate::transport::testing::MemoryLink, command: &str) -> bool {
+        wire.take_control().iter().any(|sent| sent == command)
+    }
+
+    /// A session that joins while somebody else owns the console watches it,
+    /// it does not inherit an automatic claim: when the owner later releases,
+    /// taking the console is still the user's decision or the first keystroke's
+    /// idle request. The web client decides the same way.
+    #[test]
+    fn a_connect_into_a_busy_console_does_not_claim_it_later() {
+        let (mut app, wire, query) = connected_with_ownership(Lang::En);
+        wire.feed_management(answer(
+            query,
+            "OK control self=2 owner=1 mode=readonly epoch=3 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| app.control.is_some()));
+        settle_connect_reads(&mut app, &wire);
+
+        // The owner releases and the next poll says so.
+        app.control_poll_due = Some(Instant::now());
+        let poll = next_control_frame(&mut app, &wire, b"@c?");
+        wire.feed_management(answer(
+            poll,
+            "OK control self=2 owner=0 mode=available epoch=4 peers=2\r\n",
+        ));
+        assert!(pump_until(&mut app, |app| {
+            app.control
+                .is_some_and(|status| status.mode == crate::device::ControlMode::Available)
+        }));
+        for _ in 0..10 {
+            app.pump();
+        }
+        assert!(
+            !crate::transport::testing::asked_includes(&wire, b"@c claim idle"),
+            "the console became free; the user never asked for it"
+        );
+    }
+
+    /// Answer the two background reads a Bluetooth link asks after ownership,
+    /// so a test that types next is not waiting behind them.
+    fn settle_connect_reads(app: &mut App, wire: &crate::transport::testing::MemoryLink) {
+        for (query, reply) in [
+            (Query::BleName, "OK name=Bench Bee custom=yes"),
+            (Query::Lan, "OK ws=off token=none"),
+        ] {
+            if app.talk.waiting() != Some(query) {
+                continue;
+            }
+            let id = crate::transport::testing::asked_id(wire);
+            wire.feed_management(answer(id, reply));
+            assert!(
+                pump_until(app, |app| app.talk.waiting() != Some(query)),
+                "{query:?} was not answered"
+            );
+        }
+    }
+
+    /// Open a Bluetooth memory link that advertises console arbitration and
+    /// answer the on-connect ownership question out of band, handing the test
+    /// the request id it must answer.
+    fn connected_with_ownership(lang: Lang) -> (App, crate::transport::testing::MemoryLink, u32) {
+        let mut app = App {
+            lang,
+            ..App::default()
+        };
+        let wire = crate::transport::testing::MemoryLink::ble()
+            .with_capabilities(crate::protocol::MGMT_CAP_MULTI_SESSION);
+        app.connect(wire.link()).expect("the memory link opens");
+        assert!(pump_until(&mut app, |app| app.connected()));
+        assert!(
+            app.supports_control(),
+            "capabilities: {:?}",
+            app.session.capabilities()
+        );
+        assert!(
+            pump_until(&mut app, |app| app.talk.waiting() == Some(Query::Control)),
+            "ownership is asked before the name"
+        );
+        let frames = crate::transport::testing::asked_frames(&wire);
+        let query = frames
+            .iter()
+            .find(|frame| &frame[crate::protocol::MGMT_HEADER_SIZE..] == b"@c?")
+            .expect("@c? was not asked");
+        let id = u32::from_le_bytes([query[4], query[5], query[6], query[7]]);
+        (app, wire, id)
+    }
+
+    /// The id of the next control frame whose body is `command`.
+    fn next_control_frame(
+        app: &mut App,
+        wire: &crate::transport::testing::MemoryLink,
+        command: &[u8],
+    ) -> u32 {
+        assert!(
+            pump_until(app, |app| app.talk.waiting() == Some(Query::Control)),
+            "the control question never went out"
+        );
+        let frames = crate::transport::testing::asked_frames(wire);
+        let frame = frames
+            .iter()
+            .find(|frame| &frame[crate::protocol::MGMT_HEADER_SIZE..] == command)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} was not asked; got {:?}",
+                    String::from_utf8_lossy(command),
+                    frames
+                        .iter()
+                        .map(|frame| String::from_utf8_lossy(
+                            &frame[crate::protocol::MGMT_HEADER_SIZE..]
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
+        u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]])
     }
 }

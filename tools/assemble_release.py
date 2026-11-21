@@ -12,15 +12,15 @@ GitHub Actions downloaded; the script never reaches the network.
 
 Usage:
     tools/assemble_release.py \
-        --tag v0.1.2 --commit <sha> --run-id 123 \
+        --tag v1.1.5 --commit <sha> --run-id 123 \
         --desktop-dir artifacts/desktop \
         --firmware-dir artifacts/firmware \
         --apk-dir artifacts/apk \
         --web-dir artifacts/web \
         --out-dir release \
-        --notes-template docs/releases/v0.1.2.md \
+        --notes-template docs/releases/v1.1.5.md \
         --notes-out release-notes.md \
-        --web-version 0.1.2 --firmware-version 0.1.2 --apk-version 0.1.2
+        --web-version 1.1.5 --firmware-version 1.1.5 --apk-version 1.1.5
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ FIRMWARE_BOARDS = {
     "esp32c3-supermini": ("esp32c3_supermini", "esp32c3"),
     "esp32c3-devkitm": ("esp32c3_devkitm", "esp32c3"),
     "esp32c3-devkitc": ("esp32c3_devkitc", "esp32c3"),
+    "linkr-bee-x1-0": ("linkr_bee_x1_0", "esp32c3"),
     "esp32c5-devkitc": ("esp32c5_devkitc/esp32c5/hpcore", "esp32c5"),
     # Same SoC and devicetree as the devkit; the LCD build only adds the
     # Waveshare panel conf and overlay on top (boards/linkr_c5_touch_lcd.*).
@@ -55,6 +56,25 @@ DEB_ARCH = {
 
 DESKTOP_RE = re.compile(r"^(linkr-bee(?:-cli)?)-([0-9]+\.[0-9]+\.[0-9]+)-(.+)\.(?:tar\.gz|zip|dmg)$")
 DEB_RE = re.compile(r"^linkr-bee_([0-9]+\.[0-9]+\.[0-9]+)_([a-z0-9]+)\.deb$")
+# The desktop workflow also publishes the bare `bee-cli` binary per target, and
+# the `linkr-bee-cli` npm package downloads exactly that file (then verifies it
+# against SHA256SUMS and execs it). The name deliberately carries no version:
+# the release it is attached to is the version.
+RAW_CLI_RE = re.compile(r"^bee-cli-([a-z0-9_]+(?:-[a-z0-9_]+)*)(\.exe)?$")
+# The desktop workflow's matrix, spelled as `bee-cli-<target>[.exe]`. A target
+# added there must be added here, and the count check below says so.
+CLI_TARGETS = (
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "armv7-unknown-linux-gnueabihf",
+    "i686-unknown-linux-gnu",
+    "x86_64-pc-windows-gnu",
+    "i686-pc-windows-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+)
 FIRMWARE_RE = re.compile(r"^linkr-bee-(.+)-firmware-([a-z0-9-]+)\.zip$")
 WEB_RE = re.compile(r"^linkr-bee-(v[0-9]+\.[0-9]+\.[0-9]+)-web\.zip$")
 APK_RE = re.compile(r"^linkr-bee-(v[0-9]+\.[0-9]+\.[0-9]+)-android-debug\.apk$")
@@ -103,6 +123,17 @@ def collect_desktop(source: Path, out: Path) -> list[Path]:
         if path.name == "SHA256SUMS":
             continue
         if DESKTOP_RE.match(path.name) or DEB_RE.match(path.name):
+            destination = out / path.name
+            copy_file(path, destination)
+            files.append(destination)
+        elif (raw := RAW_CLI_RE.match(path.name)) is not None:
+            target = raw.group(1)
+            if target not in CLI_TARGETS:
+                raise SystemExit(
+                    f"unknown CLI target {target!r} in {path.name}; "
+                    "add it to CLI_TARGETS as well as the workflow matrix")
+            # The npm launcher downloads this file and execs it, so the
+            # executable bit is part of the artifact.
             destination = out / path.name
             copy_file(path, destination)
             files.append(destination)
@@ -222,6 +253,19 @@ def asset_entry(path: Path, tag: str, run_id: int, web_version: str,
             "component_version": match.group(2),
             "build_run": run_id,
         }
+    match = RAW_CLI_RE.match(name)
+    if match:
+        # No `component_version`: the asset's name deliberately carries none —
+        # the release it belongs to is the version. Desktop/DEB entries stay the
+        # only source the tag consistency check reads.
+        return {
+            "name": name,
+            "size": size,
+            "sha256": digest,
+            "kind": "cli",
+            "target": match.group(1),
+            "build_run": run_id,
+        }
     match = DEB_RE.match(name)
     if match:
         arch = DEB_ARCH.get(match.group(2))
@@ -320,11 +364,19 @@ def main() -> int:
     if web_staging.exists():
         shutil.rmtree(web_staging)
 
-    expected_counts = {"desktop": 28, "firmware": 5, "web": 1, "apk": 1}
+    expected_counts = {
+        "desktop": 28,
+        "cli": len(CLI_TARGETS),
+        "firmware": 6,
+        "web": 1,
+        "apk": 1,
+    }
     counts = {key: 0 for key in expected_counts}
     for path in assets:
         if DESKTOP_RE.match(path.name) or DEB_RE.match(path.name):
             counts["desktop"] += 1
+        elif RAW_CLI_RE.match(path.name):
+            counts["cli"] += 1
         elif FIRMWARE_RE.match(path.name):
             counts["firmware"] += 1
         elif WEB_RE.match(path.name):

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "bond_manager.h"
 #include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -34,6 +35,8 @@
 #endif
 #include <zephyr/version.h>
 
+#include "serial_session.h"
+#include "ble_peers.h"
 #include "target_binding.h"
 
 #if defined(CONFIG_LINKR_LCD)
@@ -41,12 +44,15 @@
 #endif
 #include "ble_mgmt.h"
 #include "ble_uart_reliable.h"
+#include "ext_ram.h"
 #include "linkr_bridge_stats.h"
 #include "wifi.h"
 #include "uart_autobaud.h"
 #include "uart_bulk_tx.h"
 #include "ws_bridge.h"
 #include "watchdog.h"
+#include "linkr_aux.h"
+#include "linkr_status_led.h"
 
 LOG_MODULE_REGISTER(linkr_ble_bridge, LOG_LEVEL_INF);
 
@@ -64,25 +70,10 @@ LOG_MODULE_REGISTER(linkr_ble_bridge, LOG_LEVEL_INF);
 #define UART_RX_CHUNK CONFIG_LINKR_BLE_BRIDGE_UART_RX_CHUNK
 #define UART_RX_BUFFER_SIZE CONFIG_LINKR_BLE_BRIDGE_UART_RX_BUFFER_SIZE
 
-/* Panel builds relocate the two biggest bridge buffers into PSRAM so the
- * freed internal SRAM can hold the LVGL rendering buffer, which must not live
- * in PSRAM (see boards/linkr_c5_touch_lcd.conf for the measurements behind
- * that). The section comes from boards/linkr_c5_lvgl_psram.ld and only
- * exists on panel builds, so other boards keep the buffers in .bss.
- */
-#if defined(CONFIG_LINKR_LCD)
-#define LINKR_PSRAM_ATTR __attribute__((section(".linkr_psram")))
-#else
-#define LINKR_PSRAM_ATTR
-#endif
-
 #define CONTROL_CMD_PREFIX "@linkr "
-#define CONTROL_CMD_MAX_LEN 416
+#define CONTROL_CMD_MAX_LEN (LINKR_MGMT_MAX_PAYLOAD + 1)
 #define FACTORY_RESET_CONFIRM_MS 2000
 #define FACTORY_RESET_SAMPLE_MS 100
-#if DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
-#define ACTIVITY_LED_NODE DT_ALIAS(led0)
-#endif
 
 #if DT_HAS_ALIAS(linkr_factory_reset)
 #define FACTORY_RESET_NODE DT_ALIAS(linkr_factory_reset)
@@ -98,6 +89,7 @@ BUILD_ASSERT(CONFIG_BT_ID_MAX >= 2,
 #endif
 
 struct bridge_packet {
+	uint32_t ticket;
 	uint16_t len;
 	uint8_t data[BLE_TO_UART_MAX_LEN];
 };
@@ -133,11 +125,6 @@ struct bridge_packet {
 #endif
 
 static const struct device *const bridge_uart = DEVICE_DT_GET(LINKR_UART_NODE);
-#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
-static const struct gpio_dt_spec activity_led =
-	GPIO_DT_SPEC_GET(ACTIVITY_LED_NODE, gpios);
-static struct k_work_delayable led_off_work;
-#endif
 #if defined(FACTORY_RESET_NODE)
 static const struct gpio_dt_spec factory_reset_gpio =
 	GPIO_DT_SPEC_GET(FACTORY_RESET_NODE, gpios);
@@ -148,12 +135,51 @@ static const struct gpio_dt_spec autobaud_button =
 static struct gpio_callback autobaud_button_cb;
 static uint32_t autobaud_button_last_ms;
 #endif
-static struct bt_conn *current_conn;
+static struct bt_conn *wifi_operation_conn;
+static struct bt_conn *wifi_scan_conn;
+#if LINKR_UART_AUTOBAUD
+static struct bt_conn *autobaud_conn;
+#endif
+/* Which connections are actually up, by identity.
+ *
+ * This used to be a counter incremented on connect and decremented only when
+ * the peer table still pointed at that same connection. A connection whose
+ * slot had already been reused by a new one matched nothing, so the counter
+ * drifted upward: the status LED stayed blue with nothing attached, and
+ * `advertise_start()` eventually believed the board was full. Remembering the
+ * connection pointers cannot drift that way. */
+static struct bt_conn *ble_links[CONFIG_BT_MAX_CONN];
+
+static void ble_link_hold(struct bt_conn *conn)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(ble_links); i++) {
+		if (ble_links[i] == NULL) {
+			ble_links[i] = conn;
+			return;
+		}
+	}
+}
+
+static void ble_link_drop(struct bt_conn *conn)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(ble_links); i++) {
+		if (ble_links[i] == conn) ble_links[i] = NULL;
+	}
+}
+
+static int ble_link_count(void)
+{
+	int count = 0;
+
+	for (size_t i = 0; i < ARRAY_SIZE(ble_links); i++) {
+		if (ble_links[i] != NULL) count++;
+	}
+	return count;
+}
 static struct k_mutex conn_lock;
 static struct k_mutex uart_config_lock;
 static struct k_work_delayable advertise_work;
 static atomic_t advertise_refresh_req;
-static atomic_t nus_notify_enabled;
 static uint8_t linkr_identity = BT_ID_DEFAULT;
 static atomic_t wifi_scan_request_id;
 #if LINKR_UART_AUTOBAUD
@@ -164,10 +190,12 @@ static atomic_t autobaud_request_id;
 /* NUS receive callbacks run serially on the Bluetooth workqueue.  Keep the
  * command scratch buffer out of that workqueue's small thread stack: placing
  * it in handle_control_command_complete() consumed more than half of the
- * stack on every terminal keystroke. */
-static char control_command_data[CONTROL_CMD_MAX_LEN];
+ * stack on every terminal keystroke. Only thread context touches it, so it can
+ * live in PSRAM. */
+static char control_command_data[CONTROL_CMD_MAX_LEN] LINKR_EXT_RAM_BSS;
 static struct {
 	bool active;
+	uint32_t epoch;
 	bool overflow;
 	struct bt_conn *conn;
 	uint32_t request_id;
@@ -178,7 +206,7 @@ static struct {
 	 * Management event follows on the same request ID. */
 	bool async_response;
 	char data[LINKR_MGMT_MAX_PAYLOAD];
-} mgmt_capture;
+} mgmt_capture LINKR_EXT_RAM_BSS;
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
 static atomic_t uart_rx_dropped;
 static atomic_t uart_reliable_drop_no_conn;
@@ -213,10 +241,16 @@ static struct uart_config active_uart_config = {
  * same board). This is an exact expansion of K_MSGQ_DEFINE (same
  * STRUCT_SECTION_ITERABLE entry, same static initializer, same alignment)
  * with only the buffer's placement changed: contents never need to survive
- * reset. */
-static uint8_t __aligned(4) LINKR_PSRAM_ATTR
+ * reset.
+ *
+ * On the PSRAM build the store moves out of DRAM entirely: both the producers
+ * (GATT/WebSocket receive callbacks) and the single consumer (the UART worker
+ * thread) run in thread context, and the kernel copies queue elements under
+ * its own spinlock, so the slower memory costs nothing but bytes. */
+static uint8_t __aligned(4)
 	ble_to_uart_storage[sizeof(struct bridge_packet) *
-			    CONFIG_LINKR_BLE_BRIDGE_BLE_TO_UART_QUEUE_DEPTH];
+			    CONFIG_LINKR_BLE_BRIDGE_BLE_TO_UART_QUEUE_DEPTH]
+		LINKR_EXT_RAM_BSS;
 STRUCT_SECTION_ITERABLE(k_msgq, ble_to_uart_queue) =
 	Z_MSGQ_INITIALIZER(ble_to_uart_queue, ble_to_uart_storage,
 			   sizeof(struct bridge_packet),
@@ -225,10 +259,12 @@ K_MUTEX_DEFINE(ble_to_uart_queue_lock);
 K_SEM_DEFINE(bridge_start_sem, 0, 5);
 /* Same relocation as ble_to_uart_storage above: RING_BUF_DECLARE declares the
  * byte array as __noinit (dram1), this keeps every field of the initializer
- * but places the array in .bss (dram0). */
-/* Kept in internal SRAM: this ring is filled from the UART ISR, and PSRAM
- * writes there were slow enough to overflow the buffer ("Dropped N UART RX
- * bytes" at boot). Only the BLE-to-UART queue below may live in PSRAM.
+ * but places the array in .bss (dram0).
+ *
+ * This one stays in DRAM even on the PSRAM build: it is written from the UART
+ * interrupt handler, where a QSPI round trip per byte is unacceptable. The
+ * panel branch measured the failure mode: moving it to PSRAM drops UART RX
+ * bytes from boot onwards.
  */
 static uint8_t uart_rx_storage[UART_RX_BUFFER_SIZE];
 struct ring_buf uart_rx_ring =
@@ -798,28 +834,16 @@ static int linkr_ble_name_init(void)
 }
 #endif
 
-#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
-static void led_off(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	gpio_pin_set_dt(&activity_led, 0);
-}
-
+/*
+ * The status LED moved into linkr_status_led.c so that boards with an
+ * addressable RGB LED (Linkr Bee X1.0) and boards with a plain GPIO LED share
+ * one call site. Activity stays a short flash; the RGB backend decides what
+ * colour the flash uses.
+ */
 static void signal_uart_activity(void)
 {
-	if (!device_is_ready(activity_led.port)) {
-		return;
-	}
-
-	gpio_pin_set_dt(&activity_led, 1);
-	k_work_reschedule(&led_off_work, K_MSEC(40));
+	linkr_status_led_activity();
 }
-#else
-static void signal_uart_activity(void)
-{
-}
-#endif
 
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
 static void uart_rx_irq_callback(const struct device *dev, void *user_data)
@@ -828,7 +852,11 @@ static void uart_rx_irq_callback(const struct device *dev, void *user_data)
 
 	ARG_UNUSED(user_data);
 
-	while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
+	while (true) {
+		uart_irq_update(dev);
+		if (!uart_irq_rx_ready(dev)) {
+			break;
+		}
 		int rx_len = uart_fifo_read(dev, buf, sizeof(buf));
 
 		if (rx_len <= 0) {
@@ -872,23 +900,6 @@ static void uart_rx_irq_enable(void)
 #endif
 }
 
-#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay) && \
-	IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
-static void blink_activity_led(int count, int delay_ms)
-{
-	if (!device_is_ready(activity_led.port)) {
-		return;
-	}
-
-	for (int i = 0; i < count; i++) {
-		gpio_pin_set_dt(&activity_led, 1);
-		k_sleep(K_MSEC(delay_ms));
-		gpio_pin_set_dt(&activity_led, 0);
-		k_sleep(K_MSEC(delay_ms));
-	}
-}
-#endif
-
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
 static void indicate_loopback_result(bool ok)
 {
@@ -897,9 +908,7 @@ static void indicate_loopback_result(bool ok)
 		return;
 	}
 
-#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
-	blink_activity_led(3, 80);
-#endif
+	linkr_status_led_blink(3, 80);
 }
 #endif
 
@@ -908,6 +917,7 @@ static int advertise_start(void)
 	struct bt_le_adv_param params = *BT_LE_ADV_CONN_FAST_1;
 	int err;
 
+	if (ble_link_count() >= CONFIG_BT_MAX_CONN) return 0;
 	params.id = linkr_identity;
 	params.options |= BT_LE_ADV_OPT_USE_IDENTITY;
 	err = bt_le_adv_start(&params, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
@@ -981,12 +991,15 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
-	k_mutex_lock(&conn_lock, K_FOREVER);
-	if (current_conn) {
-		bt_conn_unref(current_conn);
+	linkr_uart_reliable_connected(conn);
+	if (linkr_ble_peer_connected(conn)) {
+		(void)bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
+		return;
 	}
-	current_conn = bt_conn_ref(conn);
-	k_mutex_unlock(&conn_lock);
+	ble_link_hold(conn);
+	linkr_status_led_ble(true);
+	linkr_mgmt_connected(conn);
+	advertise_schedule(K_MSEC(100));
 
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_DIAG_MARKER)
 	ble_diag.connected_count++;
@@ -998,30 +1011,32 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	ble_link_drop(conn);
+	linkr_status_led_ble(ble_link_count() > 0);
 	k_mutex_lock(&conn_lock, K_FOREVER);
-	if (current_conn) {
-		bt_conn_unref(current_conn);
-		current_conn = NULL;
+	if (wifi_operation_conn == conn) {
+		bt_conn_unref(wifi_operation_conn);
+		wifi_operation_conn = NULL;
 	}
-	k_mutex_unlock(&conn_lock);
-
-	atomic_clear(&nus_notify_enabled);
+	if (wifi_scan_conn == conn) {
+		bt_conn_unref(wifi_scan_conn);
+		wifi_scan_conn = NULL;
+		atomic_clear(&wifi_scan_request_id);
+		linkr_wifi_scan_abort();
+	}
 #if LINKR_UART_AUTOBAUD
-	/* A pass belongs to the client that requested it. Drop the pending
-	 * request ID so a later connection cannot receive this pass's FINAL
-	 * event under an ID it never issued. The pass itself still runs and
-	 * logs its result. */
-	atomic_set(&autobaud_request_id, 0);
+	if (autobaud_conn == conn) {
+		bt_conn_unref(autobaud_conn);
+		autobaud_conn = NULL;
+		atomic_clear(&autobaud_request_id);
+	}
 #endif
+	k_mutex_unlock(&conn_lock);
 	linkr_mgmt_disconnected(conn);
 	linkr_uart_reliable_disconnected(conn);
-	/* A scan owned by this connection must not survive it: otherwise it keeps
-	 * its reference, streams results to the dead peer and answers -EBUSY to
-	 * the next @w scan until the 15 s watchdog fires. */
-	linkr_wifi_scan_abort();
+
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_DIAG_MARKER)
 	ble_diag.disconnected_count++;
-	ble_diag.notify_enabled = 0;
 	schedule_ble_diag_marker_write();
 #endif
 	LOG_INF("BLE disconnected: 0x%02x", reason);
@@ -1057,10 +1072,6 @@ static void nus_notif_enabled(bool enabled, void *ctx)
 {
 	ARG_UNUSED(ctx);
 
-	atomic_set(&nus_notify_enabled, enabled);
-	if (enabled) {
-		linkr_uart_reliable_nus_selected();
-	}
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_DIAG_MARKER)
 	ble_diag.notify_enabled = enabled ? 1 : 0;
 	ble_diag.notify_events++;
@@ -1213,8 +1224,11 @@ static void wifi_state_event(uint32_t operation_id,
 	int err;
 	int len;
 
+	/* Autoconnect has no requesting BLE peer, but still drives status. */
+	linkr_status_led_wifi(linkr_wifi_is_connected());
+
 	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	conn = wifi_operation_conn ? bt_conn_ref(wifi_operation_conn) : NULL;
 	k_mutex_unlock(&conn_lock);
 	if (!conn) {
 		return;
@@ -1292,7 +1306,7 @@ static void autobaud_result_event(enum linkr_uart_autobaud_result result,
 	atomic_set(&autobaud_request_id, 0);
 
 	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+	conn = autobaud_conn ? bt_conn_ref(autobaud_conn) : NULL;
 	k_mutex_unlock(&conn_lock);
 	if (!conn) {
 		return;
@@ -1721,8 +1735,8 @@ static void diagnostics_response(struct bt_conn *conn)
 				    CONFIG_LINKR_BLE_BRIDGE_FIRMWARE_VERSION,
 				    KERNEL_VERSION_STRING);
 	(void)send_control_response(conn,
-				    "@info sys uptime_ms=%lld owner=%u security=%u\r\n",
-				    (long long)k_uptime_get(), 0U,
+				    "@info sys uptime_ms=%lld owner=%u links=%d security=%u\r\n",
+				    (long long)k_uptime_get(), 0U, ble_link_count(),
 				    (unsigned int)security);
 	(void)send_control_response(conn,
 				    "@info uart dropped=%u dropped_no_conn=%u buffer=%u/%u\r\n",
@@ -1739,6 +1753,11 @@ static void diagnostics_response(struct bt_conn *conn)
 	 * and the web parser, both key on the group name). */
 	(void)send_control_response(conn, "@info queue dropped=%u\r\n",
 				    (unsigned int)atomic_get(&uart_queue_dropped));
+	/* Fourth drop point: UART -> BLE output queues. Counted instead of
+	 * closing the peer, so a host slower than the SBC loses bytes and keeps
+	 * its terminal. */
+	(void)send_control_response(conn, "@info peer dropped=%u\r\n",
+				    linkr_ble_peer_dropped());
 	{
 		/* Whether the 40-92 ms handoff stalls come from the -EBUSY/-ENOMEM
 		 * retry backoff (slept_ms) or from waiting on the peer (wait_max_ms).
@@ -1786,9 +1805,11 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		if (len == 2 && data[0] == '@' && data[1] == 'h') {
 			short_ch = 'h';
 		} else if (len >= 2 && data[0] == '@' &&
-			   (data[1] == 'i' || data[1] == 'u' || data[1] == 'w' ||
+			   (data[1] == 'c' || data[1] == 'i' || data[1] == 'u' || data[1] == 'w' ||
 			    data[1] == 'd' || data[1] == 's' ||
-			    data[1] == 'a' || data[1] == 'n') &&
+			    data[1] == 'a' || data[1] == 'n' ||
+			    data[1] == 'l' || data[1] == 'o' || data[1] == 'r' ||
+			    data[1] == 'p' || data[1] == 'y') &&
 			   (len == 2 || data[2] == '?' ||
 			    data[2] == '=' || data[2] == ' ')) {
 			short_ch = data[1];
@@ -1810,6 +1831,54 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	}
 
 	LOG_INF("Control command received");
+	char session_response[192];
+	if (linkr_session_control(conn, body, session_response, sizeof(session_response))) {
+		(void)send_control_response(conn, "%s", session_response);
+		return true;
+	}
+
+	bool readonly = !strcmp(body, "h") || !strcmp(body, "help") ||
+		!strcmp(body, "aux") ||
+		!strcmp(body, "i?") || !strcmp(body, "info?") ||
+		!strcmp(body, "u?") || !strcmp(body, "uart?") ||
+		!strcmp(body, "n?") || !strcmp(body, "name?") ||
+		!strcmp(body, "a?") || !strcmp(body, "autobaud?") ||
+		!strcmp(body, "w?") || !strcmp(body, "wifi?") ||
+		!strcmp(body, "d?") || !strcmp(body, "webdav?") ||
+		!strcmp(body, "s?") || !strcmp(body, "socket?") ||
+		!strcmp(body, "bonds?") || !strcmp(body, "bonds names?") ||
+		linkr_bond_is_readonly(body) ||
+		!strcmp(body, "target?") || linkr_aux_is_readonly(body);
+	/* `bonds name` only writes the caller's own bond; it needs no console
+	 * ownership. `bonds label <self>` is the same idea in the management
+	 * form; arbitrary addresses still go through the control gate. */
+	bool own_bond = !strcmp(body, "bonds name") ||
+			!strncmp(body, "bonds name ", 11);
+	if (!readonly && !own_bond) {
+		if (!linkr_session_command_begin(conn, mgmt_capture.epoch)) {
+			(void)send_control_response(conn, "ERR control=readonly\r\n");
+			return true;
+		}
+		/* Accepted operations may finish after a handover. Never hold the
+		 * ownership mutex while a device/network operation can block. */
+		linkr_session_end();
+	}
+	/* ---- Auxiliary board I/O (@l / @o / @r) ---- */
+	{
+		char aux_response[192];
+
+		if (linkr_aux_command(body, aux_response, sizeof(aux_response))) {
+			(void)send_control_response(conn, "%s", aux_response);
+			return true;
+		}
+	}
+
+	char bond_response[512];
+	if (linkr_bond_command(conn, body, bond_response, sizeof(bond_response))) {
+		(void)send_control_response(conn, "%s", bond_response);
+		return true;
+	}
+
 	char target_response[80];
 	if (linkr_target_command(body, target_response, sizeof(target_response))) {
 		(void)send_control_response(conn, "%s", target_response);
@@ -1817,8 +1886,12 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	}
 
 	if (!strcmp(body, "help") || !strcmp(body, "h")) {
+		// The core list and the board-I/O list are two commands: together
+		// they exceed the 512-byte management payload and the reply would be
+		// replaced by "response too large". `@linkr aux` carries the board
+		// half, so both fit.
 		(void)send_control_response(conn,
-					    "OK cmds: @i? @u?|@u=baud,data,par,stop,flow "
+					     "OK cmds: @linkr bonds?|@linkr bonds name <label>|@linkr bonds names?|@linkr bonds label <type>/<address> [<hex>|clear]|@linkr bonds remove <type>/<address> @c?|@c claim|@c release|@c yield <peer> @i? @u?|@u=baud,data,par,stop,flow "
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_BLE_NAME_FROM_MAC)
 					    "@n?|@n=<name>|@n default "
 #endif
@@ -1833,9 +1906,16 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 #endif
 #if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE)
 					    "@s?|@s on|@s off|"
-					    "@s token[=<32 hex>]|@s token off"
+					    "@s token[=<32 hex>]|@s token off "
 #endif
-					    "\r\n");
+					    "(board I/O: @linkr aux)\r\n");
+		return true;
+	}
+	if (!strcmp(body, "aux")) {
+		char aux_help_text[LINKR_AUX_HELP_MAX];
+
+		linkr_aux_help(aux_help_text, sizeof(aux_help_text));
+		(void)send_control_response(conn, "OK aux: %s\r\n", aux_help_text);
 		return true;
 	}
 
@@ -1938,6 +2018,10 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 						    "ERR autobaud busy\r\n");
 			return true;
 		}
+		k_mutex_lock(&conn_lock, K_FOREVER);
+		if (autobaud_conn) bt_conn_unref(autobaud_conn);
+		autobaud_conn = linkr_session_epoch(conn) ? bt_conn_ref(conn) : NULL;
+		k_mutex_unlock(&conn_lock);
 		mgmt_capture.async_response = true;
 		(void)send_control_response(
 			conn,
@@ -2192,7 +2276,7 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 
 static void mgmt_request_received(struct bt_conn *conn, uint32_t request_id,
 				  const uint8_t *payload,
-				  uint16_t payload_len)
+				  uint16_t payload_len, uint32_t epoch)
 {
 	bool handled;
 	int err;
@@ -2202,6 +2286,7 @@ static void mgmt_request_received(struct bt_conn *conn, uint32_t request_id,
 	mgmt_capture.active = true;
 	mgmt_capture.conn = conn;
 	mgmt_capture.request_id = request_id;
+	mgmt_capture.epoch = epoch;
 
 	handled = handle_control_command_complete(conn, payload, payload_len);
 	if (!handled) {
@@ -2233,9 +2318,18 @@ static void mgmt_request_received(struct bt_conn *conn, uint32_t request_id,
 		LOG_WRN("Management response queue failed: %d", err);
 	}
 	if (mgmt_capture.release_wifi_operation) {
+		k_mutex_lock(&conn_lock, K_FOREVER);
+		if (wifi_operation_conn) bt_conn_unref(wifi_operation_conn);
+		wifi_operation_conn = linkr_session_epoch(conn) ? bt_conn_ref(conn) : NULL;
+		k_mutex_unlock(&conn_lock);
 		linkr_wifi_release_operation(request_id);
 	}
 	if (mgmt_capture.start_wifi_scan) {
+		k_mutex_lock(&conn_lock, K_FOREVER);
+		if (wifi_scan_conn) bt_conn_unref(wifi_scan_conn);
+		wifi_scan_conn = linkr_session_epoch(conn) ? bt_conn_ref(conn) : NULL;
+		if (!wifi_scan_conn) linkr_wifi_scan_abort();
+		k_mutex_unlock(&conn_lock);
 		linkr_wifi_release_scan();
 	}
 	memset(&mgmt_capture, 0, sizeof(mgmt_capture));
@@ -2251,7 +2345,7 @@ static void nus_received(struct bt_conn *conn, const void *data, uint16_t len,
 	LOG_DBG("BLE RX write: %u bytes", len);
 
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_BLE_ECHO)
-	if (linkr_uart_write(bytes, len) != 0) {
+	if (linkr_uart_write_peer(conn, bytes, len) != 0) {
 		LOG_WRN("Dropping BLE->UART write; queue full");
 	}
 	return;
@@ -2322,7 +2416,7 @@ static void write_loopback_marker(bool ok, unsigned int pass_count,
 }
 #endif
 
-int linkr_uart_write(const uint8_t *data, size_t len)
+int linkr_uart_write_peer(const void *peer, const uint8_t *data, size_t len)
 {
 	struct bridge_packet packet;
 	size_t packets_needed;
@@ -2335,6 +2429,8 @@ int linkr_uart_write(const uint8_t *data, size_t len)
 		return 0;
 	}
 
+	packet.ticket = linkr_session_ticket(peer, true);
+	if (!linkr_session_begin(packet.ticket)) return -EACCES;
 	packets_needed = DIV_ROUND_UP(len, sizeof(packet.data));
 	k_mutex_lock(&ble_to_uart_queue_lock, K_FOREVER);
 	if (k_msgq_num_free_get(&ble_to_uart_queue) < packets_needed) {
@@ -2362,7 +2458,13 @@ int linkr_uart_write(const uint8_t *data, size_t len)
 
 out:
 	k_mutex_unlock(&ble_to_uart_queue_lock);
+	linkr_session_end();
 	return err;
+}
+
+static int reliable_uart_write(struct bt_conn *conn, const uint8_t *data, size_t len)
+{
+	return linkr_uart_write_peer(conn, data, len);
 }
 
 static void ble_to_uart_thread(void)
@@ -2377,6 +2479,11 @@ static void ble_to_uart_thread(void)
 			continue;
 		}
 
+		if (!linkr_session_begin(packet.ticket)) continue;
+		/* Commit this packet to the single UART worker. Already in-flight
+		 * bytes cannot be recalled, but queued old-generation packets can.
+		 * CTS backpressure must not block Bluetooth/session callbacks. */
+		linkr_session_end();
 #if LINKR_UART_BULK_TX
 		/*
 		 * Same bytes, same order, same completion guarantee as the
@@ -2408,121 +2515,16 @@ static void ble_to_uart_thread(void)
 	}
 }
 
-static int nus_send_conn(struct bt_conn *conn, const uint8_t *data, uint16_t len)
-{
-	uint16_t mtu = bt_gatt_get_mtu(conn);
-	/* An unexchanged MTU reads back as 0, and `0 - 3` in uint16_t wraps to
-	 * 65533; clamp before subtracting so the chunk size is never taken from
-	 * the wrapped value. */
-	uint16_t mtu_payload = mtu > 3 ? mtu - 3 : 1;
-	uint16_t acl_payload = CONFIG_BT_BUF_ACL_TX_SIZE > 7 ?
-			       CONFIG_BT_BUF_ACL_TX_SIZE - 7 : 1;
-
-	mtu_payload = MIN(MAX(mtu_payload, 1), acl_payload);
-
-	while (len > 0) {
-		uint16_t chunk_len = MIN(len, mtu_payload);
-		int err = linkr_nus_send(conn, data, chunk_len);
-
-		if (err == -ENOMEM || err == -EAGAIN) {
-			k_sleep(K_MSEC(10));
-			err = linkr_nus_send(conn, data, chunk_len);
-		}
-
-		if (err) {
-			return err;
-		}
-
-		data += chunk_len;
-		len -= chunk_len;
-	}
-
-	return 0;
-}
-
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
-static int nus_send_chunk(const uint8_t *data, uint16_t len)
+static int uart_forward_chunk(const uint8_t *data, uint16_t len, bool *accounted)
 {
-	struct bt_conn *conn;
-	int err;
-
-	if (!atomic_get(&nus_notify_enabled)) {
-		return -ENOTCONN;
-	}
-
-	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
-	k_mutex_unlock(&conn_lock);
-
-	if (!conn) {
-		return -ENOTCONN;
-	}
-
-	err = nus_send_conn(conn, data, len);
-	bt_conn_unref(conn);
-	return err;
-}
-
-static int reliable_send_chunk(const uint8_t *data, uint16_t len)
-{
-	struct bt_conn *conn;
-	int err;
-
-	k_mutex_lock(&conn_lock, K_FOREVER);
-	conn = current_conn ? bt_conn_ref(current_conn) : NULL;
-	k_mutex_unlock(&conn_lock);
-	if (!conn) {
-		return -ENOTCONN;
-	}
-	err = linkr_uart_reliable_send(conn, data, len);
-	bt_conn_unref(conn);
-	return err;
-}
-
-static int uart_forward_chunk(const uint8_t *data, uint16_t len,
-			      bool *accounted)
-{
-	int err;
-
 	if (!*accounted) {
 		linkr_log_feed(data, len);
 		linkr_ws_feed(data, len);
+		linkr_ble_feed(data, len);
 		*accounted = true;
 	}
-	if (!linkr_uart_reliable_mode()) {
-		/* NUS is the compatibility, best-effort path. Preserve its previous
-		 * behavior: UART capture must not stall when no NUS central exists. */
-		(void)nus_send_chunk(data, len);
-		return 0;
-	}
-
-	err = reliable_send_chunk(data, len);
-	if (err == -ENOTCONN) {
-		if (IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_UART_RX_DROP_NO_CONN)) {
-			atomic_inc(&uart_reliable_drop_no_conn);
-			/* LAN-only operation: with no BLE central the reliable
-			 * path can never deliver, and retrying forever stalls
-			 * this thread, which then stops feeding the WebSocket
-			 * bridge and the log ring. The chunk was already staged
-			 * above; drop it from the BLE path and keep draining.
-			 */
-			return 0;
-		}
-	} else if (err == -EINVAL) {
-		/* The reliable path rejects a payload larger than its limit with
-		 * -EINVAL, and this thread retries a failed chunk in place: that
-		 * would wedge the thread for good and stop it feeding the log ring
-		 * and the LAN bridge. The chunk is already staged above, so drop
-		 * only the BLE copy and keep draining. Reachable only if
-		 * LINKR_BLE_BRIDGE_UART_RX_CHUNK is raised past 232.
-		 */
-		LOG_WRN("Dropping %u UART bytes the reliable path cannot carry",
-			len);
-		return 0;
-	} else if (err) {
-		LOG_WRN("Reliable UART delivery retry: %d", err);
-	}
-	return err;
+	return 0;
 }
 #endif
 
@@ -2621,26 +2623,11 @@ static void ble_diag_active_notify_thread(void)
 	k_sem_take(&bridge_start_sem, K_FOREVER);
 
 	for (;;) {
-		struct bt_conn *conn;
 		int err;
 		int len;
-
 		k_sleep(K_SECONDS(2));
-
-		if (!atomic_get(&nus_notify_enabled)) {
-			continue;
-		}
-
-		k_mutex_lock(&conn_lock, K_FOREVER);
-		conn = current_conn ? bt_conn_ref(current_conn) : NULL;
-		k_mutex_unlock(&conn_lock);
-		if (!conn) {
-			continue;
-		}
-
 		len = snprintk(msg, sizeof(msg), "diag-ping:%u\n", seq++);
-		err = linkr_nus_send(conn, msg, len);
-		bt_conn_unref(conn);
+		err = linkr_ble_feed((const uint8_t *)msg, len);
 
 		ble_diag.last_active_notify_err = err;
 		if (err) {
@@ -2748,6 +2735,7 @@ int main(void)
 	}
 
 	k_mutex_init(&uart_config_lock);
+	linkr_ble_peers_init();
 #if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_TEST_UART_LOOPBACK_VERIFY)
 	uart_irq_callback_user_data_set(bridge_uart, uart_rx_irq_callback, NULL);
 #endif
@@ -2799,15 +2787,15 @@ int main(void)
 	}
 #endif
 
-#if DT_NODE_HAS_STATUS(ACTIVITY_LED_NODE, okay)
-	if (!device_is_ready(activity_led.port)) {
-		LOG_ERR("Activity LED device is not ready");
-		return -ENODEV;
+	/*
+	 * Status LED, optocoupler contact and IR transceiver. Each is optional
+	 * per board; the helper initializes whatever the devicetree describes
+	 * and reports the first failure without blocking the others.
+	 */
+	err = linkr_aux_init();
+	if (err) {
+		LOG_WRN("Auxiliary board I/O incomplete: %d", err);
 	}
-
-	gpio_pin_configure_dt(&activity_led, GPIO_OUTPUT_INACTIVE);
-	k_work_init_delayable(&led_off_work, led_off);
-#endif
 
 #if defined(FACTORY_RESET_NODE)
 	if (factory_reset_requested()) {
@@ -2876,10 +2864,23 @@ int main(void)
 		LOG_ERR("Management Service init failed: %d", err);
 		return err;
 	}
-	err = linkr_uart_reliable_init(linkr_uart_write);
+	err = linkr_uart_reliable_init(reliable_uart_write);
 	if (err) {
 		LOG_ERR("Reliable UART init failed: %d", err);
 		return err;
+	}
+
+	/*
+	 * Verify that the PSRAM shared heap really starts past .ext_ram.bss.
+	 * Link-time checks cannot see this -- the pool is registered at the
+	 * mapped region start, which only clears the section when the
+	 * SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY option is enabled. Report and keep
+	 * going: a firmware that logs it is more useful than one that refuses to
+	 * boot, and the buffers are still intact until something allocates.
+	 */
+	if (linkr_ext_ram_verify_heap() != 0) {
+		LOG_ERR("PSRAM heap placement is wrong; migrated buffers may be "
+			"corrupted at boot");
 	}
 
 	/* Install sinks before init: saved credentials may complete quickly enough

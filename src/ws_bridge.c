@@ -5,13 +5,15 @@
  * while WiFi has an IP address. UART RX bytes are fanned out to every
  * connected client from the uart_to_ble thread via per-client ring
  * buffers; bytes received from clients are queued into the shared
- * BLE-to-UART path in main.c via linkr_uart_write().
+ * BLE-to-UART path in main.c via linkr_uart_write_peer().
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "ws_bridge.h"
 #include "wifi.h"
+#include "serial_session.h"
+#include "ext_ram.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(linkr_ws, LOG_LEVEL_INF);
@@ -54,6 +56,19 @@ BUILD_ASSERT(sizeof(CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_AUTH_TOKEN) <=
 		     WS_RX_BUF_SIZE,
 	     "WebSocket auth token must fit in one receive buffer");
 
+/* Match Zephyr's HTTP_SERVER_SOCK_COUNT. poll() prepares an event for the
+ * wakeup fd, each listener and every client that has not upgraded yet. Its
+ * event array is independent of the HTTP server's own fd table. */
+#define WS_HTTP_SOCKETS_PER_SERVICE \
+	(1 + (IS_ENABLED(CONFIG_HTTP_SERVER_VERSION_3) && \
+	      (IS_ENABLED(CONFIG_HTTP_SERVER_VERSION_1) || \
+	       IS_ENABLED(CONFIG_HTTP_SERVER_VERSION_2))))
+#define WS_HTTP_POLL_REQUIRED \
+	(1 + WS_HTTP_SOCKETS_PER_SERVICE * CONFIG_HTTP_SERVER_NUM_SERVICES + \
+	 CONFIG_HTTP_SERVER_MAX_CLIENTS + HTTP3_SERVER_MAX_STREAMS)
+BUILD_ASSERT(CONFIG_ZVFS_POLL_MAX >= WS_HTTP_POLL_REQUIRED,
+	     "Increase CONFIG_ZVFS_POLL_MAX for HTTP listeners, clients and streams");
+
 /* CLAIMED means the socket is registered but not yet authenticated: UART
  * fan-out only targets ACTIVE clients, and the handshake frame is written
  * before a client is promoted from CLAIMED to ACTIVE. */
@@ -70,23 +85,31 @@ struct ws_client {
 	struct k_sem start_sem;
 	struct k_sem tx_sem;
 	struct k_mutex tx_lock;
+	/* Backed by ws_tx_bufs[] (PSRAM on the C5 build). */
 	struct ring_buf tx_ring;
-	uint8_t tx_buf[WS_TX_BUF_SIZE];
 	atomic_t tx_bytes;
 	atomic_t rx_bytes;
 	atomic_t tx_dropped;
 	bool rx_fragmented;
+	bool rx_control;
 };
 
 static struct ws_client clients[WS_MAX_CLIENTS];
+/* Per-client TX payload. Kept out of struct ws_client because GCC refuses a
+ * section attribute on a struct member, and because the ring_buf/k_sem/k_thread
+ * objects next to it are kernel objects that must stay in DRAM. Only pure data
+ * lives here: producers run on the uart_to_ble thread, the consumer on each
+ * client's thread, and both hold that client's tx_lock. */
+static uint8_t
+	ws_tx_bufs[WS_MAX_CLIENTS][WS_TX_BUF_SIZE] __aligned(4) LINKR_EXT_RAM_BSS;
 static struct k_thread ws_handler_threads[WS_MAX_CLIENTS];
 K_THREAD_STACK_ARRAY_DEFINE(ws_client_stacks, WS_MAX_CLIENTS,
 			    CONFIG_LINKR_BLE_BRIDGE_WS_BRIDGE_STACK);
 
 /* All upgraded-socket receive calls are serialized by ws_rx_lock, so one
  * scratch buffer is sufficient regardless of the configured client count. */
-static uint8_t ws_rx_buf[WS_RX_BUF_SIZE];
-static uint8_t ws_handshake_buf[1024];
+static uint8_t ws_rx_buf[WS_RX_BUF_SIZE] __aligned(4) LINKR_EXT_RAM_BSS;
+static uint8_t ws_handshake_buf[1024] __aligned(4) LINKR_EXT_RAM_BSS;
 /* Zephyr's HTTP resource API supplies one receive scratch buffer per resource,
  * not per upgraded socket. Drain it to EAGAIN under this lock so two client
  * parsers never retain or overwrite each other's buffered bytes. */
@@ -318,6 +341,7 @@ static int ws_token_resolve(void)
 static void ws_client_cleanup(struct ws_client *client)
 {
 	int sock;
+	linkr_session_close(client);
 
 	atomic_set(&client->state, WS_CLIENT_CLOSING);
 
@@ -475,10 +499,26 @@ static int ws_client_rx_drain_locked(struct ws_client *client, int slot)
 			(void)websocket_send_msg(client->sock, ws_rx_buf,
 					 received, WEBSOCKET_OPCODE_PONG, false,
 					 true, 100);
+		} else if ((message_type & WEBSOCKET_FLAG_TEXT) || client->rx_control) {
+			char response[192];
+			client->rx_control = remaining != 0 || !(message_type & WEBSOCKET_FLAG_FINAL);
+			if (!client->rx_control && received > 0 && received < sizeof(ws_rx_buf) &&
+			    (message_type & WEBSOCKET_FLAG_TEXT) &&
+			    received >= 9 && received < 180 && !memcmp(ws_rx_buf, "@control ", 9)) {
+				ws_rx_buf[received] = '\0';
+				char command[192];
+				snprintk(command, sizeof(command), "control %.*s", received - 9, (char *)ws_rx_buf + 9);
+				if (!linkr_session_control(client, command, response, sizeof(response)))
+					snprintk(response, sizeof(response), "ERR control=bad_action\r\n");
+			} else snprintk(response, sizeof(response), "ERR control=bad_frame\r\n");
+			if (ws_send_text(client, response) < 0) return -ENOTCONN;
 		} else if (ws_client_is_data_fragment(client, message_type,
 						   remaining) &&
 			   received > 0) {
-			if (linkr_uart_write(ws_rx_buf, received) != 0) {
+			int result = linkr_uart_write_peer(client, ws_rx_buf, received);
+			if (result == -EACCES) {
+				if (ws_send_text(client, "ERR control=readonly\r\n") < 0) return -ENOTCONN;
+			} else if (result != 0) {
 				LOG_WRN("[%d] UART queue full; dropping %d WS RX bytes",
 					slot, received);
 			} else {
@@ -538,6 +578,11 @@ static void ws_client_thread(void *p1, void *p2, void *p3)
 			goto out;
 		}
 		LOG_INF("[%d] WS client connected", slot);
+		if (linkr_session_open(client, LINKR_SESSION_LAN)) goto out;
+		client->rx_control = false;
+		char control_status[192];
+		linkr_session_status(client, control_status, sizeof(control_status));
+		if (ws_send_text(client, control_status) < 0) goto out;
 
 		fds[0].fd = client->sock;
 		fds[0].events = ZSOCK_POLLIN;
@@ -725,8 +770,8 @@ int linkr_ws_init(void)
 		k_sem_init(&client->start_sem, 0, 1);
 		k_sem_init(&client->tx_sem, 0, 1);
 		k_mutex_init(&client->tx_lock);
-		ring_buf_init(&client->tx_ring, sizeof(client->tx_buf),
-			      client->tx_buf);
+		ring_buf_init(&client->tx_ring, sizeof(ws_tx_bufs[i]),
+			      ws_tx_bufs[i]);
 		k_thread_create(&ws_handler_threads[i], ws_client_stacks[i],
 				K_THREAD_STACK_SIZEOF(ws_client_stacks[i]),
 				ws_client_thread, INT_TO_POINTER(i), NULL, NULL,
@@ -891,7 +936,8 @@ void linkr_ws_feed(const uint8_t *data, size_t len)
 		if (ring_buf_space_get(&client->tx_ring) < keep) {
 			uint32_t oldest = keep - ring_buf_space_get(&client->tx_ring);
 
-			discarded += ring_buf_get(&client->tx_ring, NULL, oldest);
+			ring_buf_consume(&client->tx_ring, oldest);
+			discarded += oldest;
 		}
 		written = ring_buf_put(&client->tx_ring, src, keep);
 		atomic_add(&client->tx_dropped, discarded + keep - written);

@@ -1,5 +1,25 @@
+/* BabelStone-derived fallback for the Unicode legacy-computing blocks used by
+ * ANSI art in serial logs. System monospace fonts treat these as .notdef. */
+@font-face {
+  font-family: "Linkr Legacy Computing";
+  src: url("./fonts/linkr-legacy-computing.woff2?v=20261030") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+1CC00-1CEBF, U+1FB00-1FBFF;
+}
+
 :root {
   color-scheme: dark;
+  /* Edge-to-edge safe areas. Android 15+ forbids fitting the window above the
+   * system bars, and the WebView does not report env(safe-area-inset-*) for the
+   * status and navigation bars (measured 0 on Chromium 141). Capacitor's
+   * SystemBars plugin injects the real WindowInsets as --safe-area-inset-*,
+   * so prefer that and keep env() for iOS and plain browsers. */
+  --safe-top: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
+  --safe-right: var(--safe-area-inset-right, env(safe-area-inset-right, 0px));
+  --safe-bottom: var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
+  --safe-left: var(--safe-area-inset-left, env(safe-area-inset-left, 0px));
   --bg: #090d14;
   --bg-glow-1: rgba(63, 200, 138, 0.09);
   --bg-glow-2: rgba(80, 130, 240, 0.07);
@@ -27,9 +47,15 @@
   --terminal: #05080d;
   --input-bg: #0e131c;
   --btn-hover: #232c3d;
+  /* The floating selection Copy pill sits over live terminal text, so it needs
+   * its own opaque surface: skin-v2 makes --panel-3 translucent glass. */
+  --selection-copy-bg: #1f2735;
+  --selection-copy-border: rgba(255, 255, 255, 0.22);
+  --selection-copy-text: #eef4fc;
+  --selection-copy-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
   --font-mono:
     ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
-    "Liberation Mono", monospace;
+    "Liberation Mono", "Linkr Legacy Computing", monospace;
   --layout-gap: clamp(12px, 1vw, 20px);
   --layout-gutter: clamp(10px, 1.25vw, 24px);
   --sidebar-width: clamp(300px, 22vw, 420px);
@@ -62,6 +88,10 @@
   --terminal: #f8fafc;
   --input-bg: #ffffff;
   --btn-hover: #e4ebf4;
+  --selection-copy-bg: #ffffff;
+  --selection-copy-border: rgba(15, 32, 56, 0.22);
+  --selection-copy-text: #0f1c2e;
+  --selection-copy-shadow: 0 6px 20px rgba(15, 35, 70, 0.24);
 }
 
 /* ---------- Header right cluster ---------- */
@@ -226,7 +256,11 @@ button {
 }
 
 /* ---------- Scrollbars ---------- */
-.controls,
+/* Chromium drops every ::-webkit-scrollbar rule below as soon as the element
+ * sets `scrollbar-width` or `scrollbar-color`, so the drawer must not set them:
+ * doing that silently replaced the inset thumb with the native bar, whose square
+ * corners crossed the drawer's 18px radius. The terminal viewport keeps the pair
+ * for Firefox and its bar lives inside a square surface anyway. */
 .xterm-viewport {
   scrollbar-color: var(--panel-3) transparent;
   scrollbar-width: thin;
@@ -243,9 +277,11 @@ button {
   background: transparent;
 }
 
+/* --panel-3 is lighter than the panel in the light theme: the thumb was there
+ * but invisible on the one surface that actually renders it. */
 .controls::-webkit-scrollbar-thumb,
 .xterm-viewport::-webkit-scrollbar-thumb {
-  background: var(--panel-3);
+  background: var(--line);
   background-clip: padding-box;
   border: 3px solid transparent;
   border-radius: 999px;
@@ -253,9 +289,19 @@ button {
 
 .controls::-webkit-scrollbar-thumb:hover,
 .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: var(--line);
+  background: var(--line-strong);
   background-clip: padding-box;
   border: 3px solid transparent;
+}
+
+/* Up to the drawer's touch layout the bar overlays instead of reserving a lane:
+ * ten pixels there pushed the six settings tabs under their 44px touch floor at
+ * 320px wide. Fingers scroll the drawer anyway. */
+@media (max-width: 900px) {
+  .controls::-webkit-scrollbar {
+    height: 0;
+    width: 0;
+  }
 }
 
 /* ---------- Layout ---------- */
@@ -271,10 +317,10 @@ button {
   height: 100dvh;
   margin: 0 auto;
   padding:
-    max(var(--layout-gutter), env(safe-area-inset-top, 0px))
-    max(var(--layout-gutter), env(safe-area-inset-right, 0px))
-    max(var(--layout-gutter), env(safe-area-inset-bottom, 0px))
-    max(var(--layout-gutter), env(safe-area-inset-left, 0px));
+    max(var(--layout-gutter), var(--safe-top))
+    max(var(--layout-gutter), var(--safe-right))
+    max(var(--layout-gutter), var(--safe-bottom))
+    max(var(--layout-gutter), var(--safe-left));
 }
 
 .topbar {
@@ -396,6 +442,7 @@ h1 {
 }
 
 .card {
+  --card-pad: 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: linear-gradient(180deg, var(--panel-2), var(--panel));
@@ -673,6 +720,18 @@ input[aria-invalid="true"] {
   margin-bottom: 12px;
 }
 
+/* Explicit field layout must not override capability/transport visibility. */
+#uartModeField[hidden],
+#uartTransportStatus[hidden] {
+  display: none;
+}
+
+/* An author display setting beats the user agent's rule for [hidden]; the
+ * custom baud field is the first .field that toggles visibility. */
+.field[hidden] {
+  display: none;
+}
+
 .field:last-child {
   margin-bottom: 0;
 }
@@ -862,7 +921,8 @@ input[aria-invalid="true"] {
 }
 
 input,
-select {
+select,
+textarea {
   height: 36px;
   width: 100%;
   border: 1px solid var(--line);
@@ -870,11 +930,21 @@ select {
   background: var(--input-bg);
   color: var(--text);
   padding: 0 12px;
+  font: inherit;
   transition: border-color 0.15s ease, box-shadow 0.15s ease,
     background-color 0.25s ease;
 }
 
-input::placeholder {
+textarea {
+  height: auto;
+  min-height: 84px;
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+input::placeholder,
+textarea::placeholder {
   color: var(--placeholder);
 }
 
@@ -885,12 +955,14 @@ input::placeholder {
 }
 
 input:hover,
-select:hover {
+select:hover,
+textarea:hover {
   border-color: var(--line-strong);
 }
 
 input:focus,
 select:focus,
+textarea:focus,
 button:focus-visible {
   outline: none;
   border-color: var(--focus);
@@ -944,11 +1016,53 @@ button:focus-visible {
   cursor: pointer;
 }
 
+/* A checked box reads as a mark, not a filled chip. The native control paints
+ * the accent colour across the whole square (solid in Chromium, a pale tint with
+ * a coloured tick in WebKit), which sat on the panel like a stray highlight next
+ * to the label. Nothing here is accent-filled: the box stays transparent, the
+ * border is a hairline and only the tick carries the colour.
+ *
+ * The 4px radius is deliberate: a 16px control cannot take the 10px control
+ * radius without turning into a lozenge. */
 .check input {
+  appearance: none;
   width: 16px;
   height: 16px;
-  accent-color: var(--accent);
+  margin: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: transparent;
+  display: grid;
+  place-content: center;
   cursor: pointer;
+}
+
+.check input::after {
+  content: "";
+  width: 8px;
+  height: 4px;
+  border-left: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+  transform: rotate(-45deg) translate(1px, -1px);
+  opacity: 0;
+}
+
+.check input:checked::after {
+  opacity: 1;
+}
+
+.check input:hover {
+  border-color: var(--muted);
+}
+
+.check input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.check input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 /* ---------- Work panel ---------- */
@@ -962,6 +1076,7 @@ button:focus-visible {
 }
 
 .terminal-card {
+  position: relative;
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -1038,9 +1153,7 @@ body.terminal-fullscreen-fallback {
 }
 
 .term-hint {
-  font-size: 11.5px;
-  color: var(--placeholder);
-  letter-spacing: 0.03em;
+  display: none;
 }
 
 .terminal-output {
@@ -1078,12 +1191,41 @@ body.terminal-fullscreen-fallback {
   -webkit-touch-callout: none;
 }
 
+/* The page in a browser keeps the platform's own text selection and copy
+ * menu; only the native shells draw the custom draggable dots. */
+.browser-terminal-selection .terminal-output,
+.browser-terminal-selection .terminal-output .xterm,
+.browser-terminal-selection .terminal-output .xterm-rows,
+.browser-terminal-selection .terminal-output .xterm-screen {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+}
+
 .terminal-output .xterm-viewport {
   background: var(--terminal) !important;
 }
 
 .terminal-output .xterm-scrollable-element {
   background: var(--terminal) !important;
+}
+
+/* xterm sets the scrollbar's inline width from overviewRuler.width (see
+ * initTerminal), so this only insets the painted thumb: the transparent border
+ * keeps the full track tappable while the visible slider stays a thin pill. */
+.terminal-output .xterm-scrollable-element > .scrollbar > .slider {
+  box-sizing: border-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  /* xterm's injected `background:` shorthand resets the clip, and it is added
+   * after this stylesheet, so this one property has to win explicitly. */
+  background-clip: padding-box !important;
+}
+
+/* The overview ruler borrows the same width option, but this terminal has no
+ * decorations, so its canvas would only paint a hairline over the slider. */
+.terminal-output .xterm-decoration-overview-ruler {
+  display: none;
 }
 
 /* ---------- Integrated terminal input ---------- */
@@ -1185,10 +1327,10 @@ body.terminal-fullscreen-fallback {
 @media (max-width: 520px) {
   .app-shell {
     padding:
-      max(10px, env(safe-area-inset-top, 0px))
-      max(10px, env(safe-area-inset-right, 0px))
-      max(10px, env(safe-area-inset-bottom, 0px))
-      max(10px, env(safe-area-inset-left, 0px));
+      max(10px, var(--safe-top))
+      max(10px, var(--safe-right))
+      max(10px, var(--safe-bottom))
+      max(10px, var(--safe-left));
   }
 
   .topbar {
@@ -1904,6 +2046,152 @@ body,
   }
 }
 
+/* ---------- Event log (plugin/UI messages, out of the serial stream) ---------- */
+.event-log {
+  --event-log-height: auto;
+  --event-log-max-height: 100%;
+  position: absolute;
+  inset: auto 0 0 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  max-height: min(58%, 420px, var(--event-log-max-height));
+  border-top: 1px solid var(--line);
+  /* Opaque on purpose: this pane covers the terminal and the key bar, and the
+   * translucent glass surfaces would let both show through the log text. */
+  background: var(--sticky-surface);
+  box-shadow: 0 -12px 28px rgba(2, 6, 16, 0.38);
+}
+
+.event-log[hidden] {
+  display: none;
+}
+
+.event-log-resize {
+  flex: 0 0 10px;
+  position: relative;
+  margin-top: -5px;
+  cursor: ns-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.event-log-resize::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 4px;
+  width: 44px;
+  height: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: var(--line-strong);
+  opacity: 0.75;
+}
+
+.event-log-resize:hover::after,
+.event-log-resize:focus-visible::after {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.event-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.event-log-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.event-log-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.event-log-clear {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.event-log-toggle {
+  white-space: nowrap;
+}
+
+.event-log-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 12px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  overscroll-behavior: contain;
+}
+
+.event-log-line {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 1px 0;
+  word-break: break-word;
+}
+
+.event-log-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.event-log-message {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.event-log-line[data-level="error"] .event-log-message {
+  color: var(--danger);
+}
+
+.event-log-line[data-level="warn"] .event-log-message {
+  color: #e6b45c;
+}
+
+[data-theme="light"] .event-log-line[data-level="warn"] .event-log-message {
+  color: #8a5a00;
+}
+
+.event-log-empty {
+  margin: 4px 0;
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* Unread is a quiet dot, not a numeric counter. */
+.event-log-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  vertical-align: middle;
+}
+
 /* ---------- Mobile drawer header visible ---------- */
 @media (max-width: 900px) {
   .drawer-head {
@@ -1920,10 +2208,10 @@ body,
   .app-shell {
     gap: 6px;
     padding:
-      max(6px, env(safe-area-inset-top, 0px))
-      max(6px, env(safe-area-inset-right, 0px))
-      max(6px, env(safe-area-inset-bottom, 0px))
-      max(6px, env(safe-area-inset-left, 0px));
+      max(6px, var(--safe-top))
+      max(6px, var(--safe-right))
+      max(6px, var(--safe-bottom))
+      max(6px, var(--safe-left));
   }
 
   .topbar {
@@ -2022,6 +2310,17 @@ body,
     height: 34px;
     padding: 0 5px;
     font-size: 11px;
+  }
+
+  /* The two-character label and its badge need their intrinsic width. */
+  .event-log-toggle {
+    width: auto;
+    min-width: 42px;
+    padding: 0 7px;
+  }
+
+  .event-log {
+    max-height: min(64%, var(--event-log-max-height));
   }
 
   .term-hint {
@@ -2180,10 +2479,10 @@ body,
     left: auto;
     width: min(440px, 68vw);
     padding:
-      max(14px, env(safe-area-inset-top, 0px))
-      max(14px, env(safe-area-inset-right, 0px))
-      max(14px, env(safe-area-inset-bottom, 0px))
-      max(14px, env(safe-area-inset-left, 0px));
+      max(14px, var(--safe-top))
+      max(14px, var(--safe-right))
+      max(14px, var(--safe-bottom))
+      max(14px, var(--safe-left));
     border-right: 0;
     border-left: 1px solid var(--line);
     transform: translateX(100%);
@@ -2216,10 +2515,10 @@ body,
   .controls {
     width: 100vw;
     padding:
-      max(8px, env(safe-area-inset-top, 0px))
-      max(8px, env(safe-area-inset-right, 0px))
-      max(10px, env(safe-area-inset-bottom, 0px))
-      max(8px, env(safe-area-inset-left, 0px));
+      max(8px, var(--safe-top))
+      max(8px, var(--safe-right))
+      max(10px, var(--safe-bottom))
+      max(8px, var(--safe-left));
     border-left: 0;
   }
 
@@ -2235,7 +2534,8 @@ body,
   }
 
   .controls .card {
-    padding: 13px;
+    --card-pad: 13px;
+    padding: var(--card-pad);
     border-radius: 8px;
     box-shadow: none;
   }
@@ -2284,9 +2584,9 @@ html.settings-drawer-layout .mobile-connect {
 
 html.settings-drawer-layout .controls {
   position: fixed;
-  top: max(12px, env(safe-area-inset-top, 0px));
-  right: max(12px, env(safe-area-inset-right, 0px));
-  bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  top: max(12px, var(--safe-top));
+  right: max(12px, var(--safe-right));
+  bottom: max(12px, var(--safe-bottom));
   left: auto;
   z-index: 60;
   width: min(420px, calc(100vw - 32px));
@@ -2359,10 +2659,10 @@ html.settings-drawer-layout .controls[data-settings-active="network"] [data-sett
     bottom: 0;
     width: 100vw;
     padding:
-      max(8px, env(safe-area-inset-top, 0px))
-      max(8px, env(safe-area-inset-right, 0px))
-      max(10px, env(safe-area-inset-bottom, 0px))
-      max(8px, env(safe-area-inset-left, 0px));
+      max(8px, var(--safe-top))
+      max(8px, var(--safe-right))
+      max(10px, var(--safe-bottom))
+      max(8px, var(--safe-left));
     border: 0;
     border-radius: 0;
   }
@@ -2381,10 +2681,10 @@ html.soft-keyboard-open .app-shell {
   height: var(--terminal-viewport-height, 100vh);
   min-height: 0;
   padding:
-    max(4px, env(safe-area-inset-top, 0px))
-    max(6px, env(safe-area-inset-right, 0px))
+    max(4px, var(--safe-top))
+    max(6px, var(--safe-right))
     2px
-    max(6px, env(safe-area-inset-left, 0px));
+    max(6px, var(--safe-left));
   overflow: hidden;
 }
 
@@ -2579,6 +2879,38 @@ html.soft-keyboard-open .terminal-card .terminal-keyboard {
 
 /* Agent workspace shares the existing terminal; no second xterm or modal. */
 #agentButton[hidden] { display: none; }
+#agentButton {
+  --agent-button-from: rgba(104, 142, 228, 0.1);
+  --agent-button-to: rgba(157, 127, 214, 0.14);
+  --agent-button-ink: #d9d4f4;
+  --agent-button-film: rgba(255, 255, 255, 0.04);
+  --agent-button-edge: rgba(184, 172, 227, 0.3);
+  --agent-button-sheen: rgba(255, 255, 255, 0.16);
+  color: var(--agent-button-ink);
+  background: linear-gradient(135deg, var(--agent-button-from), var(--agent-button-to)) var(--agent-button-film);
+  border-color: var(--agent-button-edge);
+  box-shadow: inset 0 1px 0 var(--agent-button-sheen);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  backdrop-filter: blur(10px) saturate(120%);
+  font-weight: 600;
+  letter-spacing: 0;
+}
+[data-theme="light"] #agentButton {
+  --agent-button-ink: #504571;
+  --agent-button-film: rgba(255, 255, 255, 0.36);
+  --agent-button-edge: rgba(121, 108, 171, 0.24);
+  --agent-button-sheen: rgba(255, 255, 255, 0.92);
+}
+#agentButton:hover {
+  --agent-button-from: rgba(104, 142, 228, 0.16);
+  --agent-button-to: rgba(157, 127, 214, 0.2);
+  border-color: rgba(143, 126, 201, 0.4);
+}
+#agentButton[aria-pressed="true"] {
+  --agent-button-from: rgba(104, 142, 228, 0.22);
+  --agent-button-to: rgba(157, 127, 214, 0.26);
+  border-color: rgba(143, 126, 201, 0.5);
+}
 .terminal-workspace { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .agent-panel[hidden], .agent-terminal-peek[hidden] { display: none; }
 .agent-panel { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; color: var(--text); background: var(--terminal); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
@@ -2592,7 +2924,7 @@ html.agent-mode.settings-drawer-layout .app-shell {
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   gap: 0;
-  padding: max(6px, env(safe-area-inset-top, 0px)) max(6px, env(safe-area-inset-right, 0px)) max(6px, env(safe-area-inset-bottom, 0px)) max(6px, env(safe-area-inset-left, 0px));
+  padding: max(6px, var(--safe-top)) max(6px, var(--safe-right)) max(6px, var(--safe-bottom)) max(6px, var(--safe-left));
 }
 @supports (height: 100dvh) {
   html.agent-mode.settings-drawer-layout .app-shell {
@@ -2610,7 +2942,6 @@ html.agent-mode .terminal-workspace[data-agent-layout="columns"] { grid-template
 html.agent-mode .terminal-card { height: 100%; min-width: 0; min-height: 0; }
 html.agent-mode .terminal-head { min-height: 44px; padding: 2px 6px; flex: 0 0 auto; }
 html.agent-mode .term-tool { min-width: 44px; min-height: 44px; height: 44px; }
-html.agent-mode #agentButton { color: var(--accent); border-color: var(--accent); background: var(--panel-3); }
 html.agent-mode #fullscreenBtn, html.agent-mode #zoomOutBtn, html.agent-mode #zoomInBtn,
 html.agent-mode .term-hint, html.agent-mode .terminal-input-hint { display: none; }
 html.agent-mode .terminal-card .terminal-input-bar { padding: 4px; }
@@ -2643,9 +2974,9 @@ html.agent-keyboard-terminal .agent-console { display: none; }
 /* Keep the shared drawer usable above the soft keyboard, including Agent mode. */
 html.settings-drawer-layout .app-shell.sidebar-open .controls {
   display: flex;
-  top: calc(var(--settings-viewport-top, 0px) + max(12px, env(safe-area-inset-top, 0px)));
+  top: calc(var(--settings-viewport-top, 0px) + max(12px, var(--safe-top)));
   bottom: auto;
-  height: calc(var(--terminal-viewport-height, 100vh) - max(12px, env(safe-area-inset-top, 0px)) - max(12px, env(safe-area-inset-bottom, 0px)));
+  height: calc(var(--terminal-viewport-height, 100vh) - max(12px, var(--safe-top)) - max(12px, var(--safe-bottom)));
 }
 @media (max-width: 600px) {
   html.settings-drawer-layout .app-shell.sidebar-open .controls {
@@ -2655,7 +2986,7 @@ html.settings-drawer-layout .app-shell.sidebar-open .controls {
 }
 @supports (height: 100dvh) {
   html.settings-drawer-layout .app-shell.sidebar-open .controls {
-    height: calc(var(--terminal-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top, 0px)) - max(12px, env(safe-area-inset-bottom, 0px)));
+    height: calc(var(--terminal-viewport-height, 100dvh) - max(12px, var(--safe-top)) - max(12px, var(--safe-bottom)));
   }
   @media (max-width: 600px) {
     html.settings-drawer-layout .app-shell.sidebar-open .controls {
@@ -2784,7 +3115,7 @@ html:not(.settings-drawer-layout) :is(#drawerThemeButton, #drawerLangButton) { d
 #targetBindingIdentity { overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .target-binding .check { min-height: 44px; padding-block: 8px; }
-.target-binding .check input[type="checkbox"] { box-sizing: border-box; width: 18px; min-width: 18px; max-width: 18px; height: 18px; min-height: 18px; flex: 0 0 18px; margin: 0; padding: 0; appearance: auto; accent-color: var(--accent-strong); }
+.target-binding .check input[type="checkbox"] { box-sizing: border-box; width: 18px; min-width: 18px; max-width: 18px; height: 18px; min-height: 18px; flex: 0 0 18px; margin: 0; padding: 0; }
 
 /* ---------- Terminal selection handles ---------- */
 .terminal-selection-ui {
@@ -2833,14 +3164,14 @@ html:not(.settings-drawer-layout) :is(#drawerThemeButton, #drawerLangButton) { d
   transform: translate(-50%, -100%);
   padding: 8px 18px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--panel-3);
-  color: var(--text);
+  border: 1px solid var(--selection-copy-border);
+  background: var(--selection-copy-bg);
+  color: var(--selection-copy-text);
   font: inherit;
   font-size: 13px;
   font-weight: 600;
   white-space: nowrap;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--selection-copy-shadow);
   pointer-events: auto;
   touch-action: manipulation;
   z-index: 71;

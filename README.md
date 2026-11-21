@@ -34,17 +34,50 @@ target's own UART bytes and does not replace the target shell.
 
 - Terminal in the browser, in the phone apps, or on the command line, with ANSI and
   256-color output.
+- Board panel on the Linkr Bee X1.0: RGB status LED, isolated optocoupler
+  contact, NEC remote send/receive, IR learning with slots and names stored
+  on the board, a board-stored AI prompt, and an optional board-stored AI
+  configuration (endpoint, model, limits; the key stays on the host unless
+  explicitly saved).
 - Change baud rate, data bits, parity, stop bits, and flow control while connected.
   Default is `115200,8,n,1,n`.
 - Send Enter as raw, CR, LF, or CRLF for bootloaders and different shells.
 - Save logs, upload them to WebDAV, and check firmware, UART buffer, WiFi, and
   transfer counters from the diagnostics panel.
+- Give each paired host a display label (for example "Alice's phone"), stored on
+  the board by identity address. The web and phone editors report the browser's
+  OS once when the board stores none, the TUI reports the local user name once
+  for this host, and the owner can always edit or clear it.
 - Join a 2.4 GHz network and keep using the console over LAN, without Bluetooth.
 - Assistant in the browser and the phone apps: searches the serial log, runs
   target commands under a selectable approval policy, and asks before changing
   the bridge's UART, WiFi or log-upload settings. It remembers facts
   about each target between sessions, counts the tokens it used, and can export
   the whole diagnosis as a Markdown report.
+- Android app as an MCP server and A2A agent on the local network, so Claude
+  Desktop, Cursor, and other AI clients can read the console and — under a
+  selectable access mode (read-only, every command needs approval, only
+  high-risk commands need approval, or fully authorized) — send input and
+  change settings, or delegate a task to the app's resident assistant. See the
+  [MCP server guide](docs/MCP.md) and the [A2A guide](docs/A2A.md).
+
+### Pairing labels from the command line
+
+The board's own I/O help is `@linkr aux`; the core list is `@h` / `@linkr
+help`. A pairing label travels hex-encoded UTF-8:
+
+```sh
+bee-cli --query-bonds
+bee-cli --rename-bond 0/AA:BB:CC:DD:EE:01="Alice's phone"
+bee-cli --remove-bond 0/AA:BB:CC:DD:EE:01
+bee-cli query bonds
+bee-cli bond 0/AA:BB:CC:DD:EE:01 "Alice's phone"
+bee-cli unbond 0/AA:BB:CC:DD:EE:01
+```
+
+`@linkr bonds label <type>/<address>` reads one label back; adding `<hex>` or
+`clear` writes or clears it under the control-owner gate. Labels are display
+only, are at most 48 UTF-8 bytes, and are deleted with the pairing.
 
 ## Choose a client
 
@@ -61,6 +94,30 @@ All clients reach the same accessory; choose the workflow that suits your host.
 RISC-V 64-bit and LoongArch64 Linux are prospective CLI/TUI ports, not published
 v0.1 targets. See the [architecture assessment](docs/CLI_ARCHITECTURES.zh-CN.md)
 (Chinese) for dependencies and remaining build/runtime validation.
+
+### Agent plugins
+
+[opencode-linkr-bee](linkr-bee-opencode/README.md) gives the
+[OpenCode](https://opencode.ai) 2.x agent five board tools over one shared live
+serial console: `linkr_bee_exec` and `linkr_bee_send` drive the target console,
+`linkr_bee_query` and `linkr_bee_set` read and change the bridge, and
+`linkr_bee_console` drives the console panel. The console appears in the TUI
+(**Linkr Bee: open console**, Ctrl+Shift+L, or `/linkr-bee`), in OpenCode
+desktop app windows (**Linkr Bee: toggle console**, Ctrl+\`), and as a
+standalone local browser page at the token-gated loopback URL the plugin reports
+(`webUrl`). The desktop panel does not load in a browser tab at the
+`opencode serve` URL; the browser page covers that case. Pairing and settings
+live in the **Linkr Bee** page of the desktop app's Settings (scan, one-click
+connect, transport fields, bridge UART, browser page) and in the TUI dialog
+commands **Linkr Bee: board / pair…** / **Linkr Bee: settings…** (or
+`/linkr-bee scan|settings|status`). Every console status bar shows the bridge
+UART baud rate the board reports.
+
+It needs OpenCode 2.x (verified with 2.2.7), Node.js 22 or newer, and `bee-cli`
+1.2.0 or newer; install it with `opencode plugin add opencode-linkr-bee`, which
+adds it to the global configuration. Projects can also list it under `"plugins"`
+in `opencode.json`. The DeepSeek Harness counterpart is
+[dsh-linkr-bee](linkr-bee-dsh/README.md).
 
 The mobile screenshots below show the shared responsive web UI, not proof of a
 physical-device test. See each platform guide for its validation status.
@@ -79,8 +136,8 @@ Browser / desktop / mobile / Linkr
         SBC or embedded target
 ```
 
-- A Linkr Bee accessory: ESP32-C3 Super Mini, ESP32-C3 DevKitM, ESP32-C3 DevKitC,
-  or ESP32-C5 DevKitC.
+- A Linkr Bee accessory: Linkr Bee X1.0 (MV013), ESP32-C3 Super Mini,
+  ESP32-C3 DevKitM, ESP32-C3 DevKitC, or ESP32-C5 DevKitC.
 - A target with a UART console, and three wires: target TX to accessory RX, target RX
   to accessory TX, and a shared ground.
 - A host running a compatible browser, a desktop terminal client, or a phone app
@@ -101,21 +158,30 @@ The UART side is 3.3 V logic, not RS-232. See the
    ```
 
    The script finds the image and the serial port, verifies `SHA256SUMS` when it is
-   present, and keeps the saved settings. Building from source is covered in the
+   present, and keeps the saved settings. If you would rather not install anything,
+   the [flashing page](https://radxa.github.io/linkr-bee/flash.html) writes the same
+   images from Chrome or Edge over USB. Building from source is covered in the
    [development guide](docs/DEVELOPMENT.md#build).
 
 2. Wire it to the target, crossing TX and RX and connecting ground. On an ESP32-C3
    Super Mini the bridge uses GPIO20 (RX) and GPIO21 (TX); other boards are in the
-   [hardware requirements](docs/HARDWARE.md#3-引脚分配).
+   [hardware requirements](docs/HARDWARE.md#3-引脚分配). On the Linkr Bee X1.0 the
+   target plugs into J7: pin 1 RX, pin 2 TX, pin 3 GND, pin 4 optional 5 V in.
 
-3. Power both sides. The blue activity LED flashes while bytes cross the bridge
-   on every board (WROOM: GPIO2). On WROOM the optional autobaud key is GPIO13;
+3. Power both sides. The activity LED flashes while bytes cross the bridge on
+   every board (WROOM: GPIO2; Linkr Bee X1.0: the single-wire RGB LED on GPIO8).
+   On the X1.0, `@l`, `@o` and `@r` also expose that LED, an isolated dry
+   contact, and an NEC IR remote; see the
+   [X1.0 hardware notes](docs/BEE_X1.0_HARDWARE.md#5-板载外设与固件命令). On WROOM the optional autobaud key is GPIO13;
    it is used only when `CONFIG_LINKR_BLE_BRIDGE_UART_AUTOBAUD=y` (off in the
    default build).
 
-4. Authorize this host if the board requires it: hold the pairing GPIO to GND
-   (**GPIO1** on C3/C5), connect, and accept the pairing prompt. WROOM ships
-   with pairing authorization disabled, so no GPIO4 press is needed; enable
+4. Authorize this host if the board requires it: press the pairing key once
+   (**GPIO1** on C3/C5, **USER_KEY/GPIO3** on the Linkr Bee X1.0) and connect
+   within 30 seconds, then accept the pairing prompt. The window is
+   `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GRACE_MS` (30 s by default), so the key does
+   not have to be held for the whole exchange. WROOM ships with pairing
+   authorization disabled, so no GPIO4 press is needed; enable
    `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y` to require it. On the Waveshare
    panel build GPIO1 carries the touch I2C clock, so tap **PAIR** on the screen
    instead — it opens a 60 s, single-use pairing window.
@@ -136,7 +202,12 @@ The UART side is 3.3 V logic, not RS-232. See the
 
 - Top bar: connection state, connect/disconnect, panel toggle, theme, language.
 - Terminal: click and type; its toolbar opens the assistant and provides font
-  size, fullscreen, scroll-to-bottom, and copy. Clear and log export are in settings.
+  size, fullscreen, **Log**, scroll-to-bottom, and copy. The serial terminal only
+  shows UART bytes: app messages (connection state, reconnect attempts, GATT and
+  management errors, debug traces) go to the Log drawer, which opens from that
+  button and never writes into the terminal. Drag its top grabber (or focus it
+  and use the arrow keys, Home/End; double-click resets) to size it; the height
+  is remembered. Clear and log export are in settings.
 - Settings: the left rail opens connection, serial, network, assistant, and About
   sections. Close the panel to give the terminal more space.
 
@@ -193,11 +264,19 @@ while Bluetooth is connected; the Python and C terminals print it. The token gat
 access but does not encrypt anything, so `ws://` traffic is visible on the same
 network. Use LAN mode on a network you trust.
 
+**Without a token the bridge is open to the whole network.** The WebSocket listens
+on every interface and the firmware checks no `Origin` or `Host` header, so
+`@s token off` (or an empty build-time token) lets any page or script that can
+reach the accessory read **and write** the target's UART. Keep the token on
+outside a trusted lab network; see [LAN warning](docs/DEVELOPMENT.md#uart-over-websocket-lan-bridge).
+
 ## Pairing and security
 
 - The Bluetooth LE link is encrypted and bonded. On C3/C5 each new host is
-  authorized once by holding **GPIO1** to GND during pairing. WROOM disables the
-  physical pairing check by default; GPIO4 is optional when
+  authorized once by pressing **GPIO1** to GND and connecting within 30 seconds
+  (**GPIO3/USER_KEY** on the Linkr Bee X1.0); the press opens the window, the
+  key does not have to stay held. WROOM disables the physical pairing check by
+  default; GPIO4 is optional when
   `CONFIG_LINKR_BLE_BRIDGE_PAIRING_GPIO_AUTH=y` is enabled.
 - Eight hosts are remembered across reboots and are not evicted automatically, so
   remove an unused host or factory-reset before adding a ninth.
@@ -212,12 +291,12 @@ network. Use LAN mode on a network you trust.
 
 | Symptom | Check |
 | --- | --- |
-| No device in the client | Accessory powered and in range, and not already connected to another host; only one Bluetooth LE connection is served at a time |
+| No device in the client | Accessory powered and in range. The default firmware accepts two BLE connections, but only one session may type or change settings — see [Multi-client serial sessions](docs/MULTI_CLIENT.md) |
 | Browser cannot connect | Chrome or Chromium, served over HTTPS or `localhost`. `tools/serve_web.sh` uses `localhost` |
 | No output | Target TX to accessory RX, target is printing, baud rate matches |
 | Output but no input | Target RX to accessory TX; hardware flow control off unless CTS and RTS are both wired |
 | Garbled output | UART format matches the target: baud rate, data bits, parity, stop bits |
-| No pairing prompt | On C3/C5, ground GPIO1 before connecting; WROOM needs no GPIO press unless its optional pairing check is enabled |
+| No pairing prompt | On C3/C5, press GPIO1 then connect within 30 s (Linkr Bee X1.0: GPIO3/USER_KEY); press again if the window expired. WROOM needs no GPIO press unless its optional pairing check is enabled |
 | LAN mode fails | Accessory on 2.4 GHz, host on the same network, token matches the one reported over Bluetooth LE |
 
 ## Limits

@@ -1,10 +1,22 @@
-//! Bluetooth Low Energy, speaking the Nordic UART Service.
+//! Bluetooth Low Energy, speaking either the Nordic UART Service or the
+//! bridge's Reliable UART service.
 //!
 //! This is the link the product actually ships on: the Linkr Bee is an ESP32
-//! that advertises one GATT profile and nothing else, and the bytes a user
-//! types go down a single characteristic while the target's reply comes back
-//! up another. There is no framing and no handshake on top — the radio is a
-//! cable with a discoverable name, which is the entire point of the device.
+//! that advertises a Management service and two ways to carry a terminal.
+//!
+//! **NUS** is the oldest and the only one most firmware has: bytes go down one
+//! characteristic and come back up another, with no framing and no handshake —
+//! the radio is a cable with a discoverable name, which is the entire point of
+//! the device.
+//!
+//! **Reliable UART** is the same console with a sequence number. Each write is
+//! a 12-byte frame header (`"LR"`, version, sequence, length) followed by up to
+//! 232 payload bytes, cut into ATT-sized writes and confirmed by the peer; the
+//! receive side is a confirmed indication stream that is reassembled and
+//! checked against the sequence it expects. The channel is chosen once per link
+//! from what the board advertises (capability bit 5) and falls back to NUS when
+//! it does not, so old firmware still works. The web client makes the same
+//! choice; see `protocol` for the framing itself.
 //!
 //! Two things about BLE shape this file more than the protocol does.
 //!
@@ -31,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Manager, Peripheral};
@@ -52,6 +64,27 @@ pub const NUS_RX: Uuid = Uuid::from_u128(0x6e400002_b5a3_f393_e0a9_e50e24dcca9e)
 /// What this host subscribes to: bytes coming in from the target.
 pub const NUS_TX: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
 
+/// The Reliable UART service: sequence-numbered, confirmed frames instead of
+/// the unframed NUS stream.
+///
+/// The service, its receive, transmit and state characteristics. RX is what
+/// this host writes, TX is the indication stream it subscribes to, and STATE is
+/// a 16-byte read that says where each direction starts: the sequence the
+/// bridge expects next, the one it will send next, and the largest payload a
+/// frame may carry.
+pub const RELIABLE_SERVICE: Uuid = Uuid::from_u128(0x4c4b0010_9a7e_4f4e_8b8a_3d6f12a0c001);
+pub const RELIABLE_RX: Uuid = Uuid::from_u128(0x4c4b0011_9a7e_4f4e_8b8a_3d6f12a0c001);
+pub const RELIABLE_TX: Uuid = Uuid::from_u128(0x4c4b0012_9a7e_4f4e_8b8a_3d6f12a0c001);
+pub const RELIABLE_STATE: Uuid = Uuid::from_u128(0x4c4b0013_9a7e_4f4e_8b8a_3d6f12a0c001);
+
+/// The ATT payload every Reliable UART write starts at.
+///
+/// Twenty bytes is the value that fits the default 23-byte ATT MTU, so it is
+/// valid on a link whose MTU exchange is still in flight. The framing carries
+/// the rest: one logical frame is cut into as many writes as it needs, and a
+/// link that later agrees on a larger MTU simply sends fewer of them.
+pub const RELIABLE_WRITE_SIZE: usize = 20;
+
 /// These five belong to the bridge's **management** service, and each is its
 /// own characteristic rather than another byte inside Nordic UART.
 ///
@@ -64,12 +97,20 @@ pub const NUS_TX: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e)
 /// (`tools/linkr_ble_terminal.py`) speaks to these same five.
 pub const MGMT_SERVICE: Uuid = Uuid::from_u128(0x4c4b0001_9a7e_4f4e_8b8a_3d6f12a0c001);
 /// Read: the negotiated protocol version, size limits and capability bits.
+///
+/// The primary client reads it before wiring a link: the capability word says
+/// whether the board carries the Reliable UART service and whether it
+/// arbitrates console ownership, and the transport decision is made from that
+/// rather than assumed. A board without the characteristic keeps the historical
+/// NUS assumptions.
 pub const MGMT_PROTOCOL: Uuid = Uuid::from_u128(0x4c4b0002_9a7e_4f4e_8b8a_3d6f12a0c001);
 /// Read: this board's stable identifier.
 pub const MGMT_DEVICE_ID: Uuid = Uuid::from_u128(0x4c4b0003_9a7e_4f4e_8b8a_3d6f12a0c001);
 /// Write: one management request, framed as `protocol` encodes it.
 pub const MGMT_COMMAND: Uuid = Uuid::from_u128(0x4c4b0004_9a7e_4f4e_8b8a_3d6f12a0c001);
-/// Notify: the responses, as one `protocol::ManagementReassembler` stream.
+/// Notify: the responses, a fragment stream whose header arrives in the first
+/// fragment only. [`ManagementMessages`] assembles each message and absorbs a
+/// re-delivered copy before the application sees it.
 pub const MGMT_RESPONSE: Uuid = Uuid::from_u128(0x4c4b0005_9a7e_4f4e_8b8a_3d6f12a0c001);
 
 /// The advertised-name prefix used by firmware that predates per-device names.
@@ -293,8 +334,8 @@ impl Selection {
                 let digits = normalise_address(address);
                 if digits.len() < ADDRESS_DIGITS {
                     return Err(format!(
-                        "“{address}” is not a Bluetooth address; those are twelve \
-                         hexadecimal digits, as in EE:C7:42:34:48:CF"
+                        "“{address}” is not a Bluetooth address or a usable macOS UUID; \
+                         scan and select the Bee again"
                     ));
                 }
                 Ok(())
@@ -334,8 +375,8 @@ impl Selection {
     }
 }
 
-/// An address reduced to what identifies it: the last twelve hexadecimal
-/// digits, one case.
+/// Preserve full CoreBluetooth UUIDs; normalize MACs and BlueZ paths to their
+/// twelve hexadecimal digits. An all-zero placeholder is never an identity.
 ///
 /// Kept as a function rather than done inline because it has to behave the
 /// same on both sides of the comparison, and "the same" is easy to get wrong
@@ -347,13 +388,25 @@ impl Selection {
 /// `de` in `dev_`). Reading from the end is what makes a path, a MAC, and a
 /// shelf entry remembered from an older version all name the same board.
 fn normalise_address(address: &str) -> String {
+    if let Ok(id) = Uuid::parse_str(address.trim()) {
+        return if id.is_nil() {
+            String::new()
+        } else {
+            id.simple().to_string().to_ascii_uppercase()
+        };
+    }
     let digits: String = address
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .map(|c| c.to_ascii_uppercase())
         .collect();
     let start = digits.len().saturating_sub(ADDRESS_DIGITS);
-    digits[start..].to_string()
+    let digits = &digits[start..];
+    if digits.chars().all(|c| c == '0') {
+        String::new()
+    } else {
+        digits.to_string()
+    }
 }
 
 /// Whether two ways of writing a device's address name the same device.
@@ -376,6 +429,17 @@ pub fn same_device(left: &str, right: &str) -> bool {
 /// read out in the Device row names a device nobody can match against
 /// anything. Anything that is not such a path — a MAC already, a UUID, a name
 /// — keeps its own spelling, upper-cased like the rows are.
+/// A scan must retain a dialable identity. CoreBluetooth has no peer MAC and
+/// fills its address property with zeroes, while its peripheral ID is a UUID.
+pub fn connection_identifier(id: &str, address: &str) -> String {
+    let mac = normalise_address(address);
+    if mac.len() == ADDRESS_DIGITS {
+        written_address(address)
+    } else {
+        written_address(id)
+    }
+}
+
 pub fn written_address(address: &str) -> String {
     match bluez_path_address(address) {
         Some(mac) => mac,
@@ -436,6 +500,19 @@ enum Frame {
     /// left connected to a client that is gone is a board the next client
     /// cannot find.
     Hangup,
+}
+
+/// The channels a reactor reports through.
+///
+/// Opened together, handed over together: a signature with one parameter per
+/// kind of event would describe the plumbing instead of the link. `outbound` is
+/// the one that carries commands in; the rest carry bytes and words out.
+struct Outbox {
+    ready: Sender<io::Result<(String, Option<u32>)>>,
+    inbound: Sender<Option<Vec<u8>>>,
+    outbound: tokio::sync::mpsc::Receiver<Frame>,
+    management: Sender<Vec<u8>>,
+    notices: Sender<String>,
 }
 
 /// A BLE connection that has not been opened yet.
@@ -508,7 +585,11 @@ impl Link for BleLink {
         // interface can hand them to the pump as management and not as target
         // output. Their own channel, like their own characteristic.
         let (management_tx, management_rx) = mpsc::channel::<Vec<u8>>();
-        let (ready_tx, ready_rx) = mpsc::channel::<io::Result<()>>();
+        // Words about the link itself — which UART channel it settled on, and a
+        // stream that had to stop — ride beside the bytes rather than through
+        // them, for the same reason management answers do.
+        let (notice_tx, notice_rx) = mpsc::channel::<String>();
+        let (ready_tx, ready_rx) = mpsc::channel::<io::Result<(String, Option<u32>)>>();
         let (to_radio_tx, to_radio_rx) = tokio::sync::mpsc::channel::<Frame>(WRITE_BACKLOG);
         // What the board carries, shared between the reactor that finds out
         // and the writer that has to answer for it. See [`BleWriter`].
@@ -525,10 +606,13 @@ impl Link for BleLink {
             radio(
                 &selection,
                 window,
-                ready_tx,
-                inbound_tx,
-                to_radio_rx,
-                management_tx,
+                Outbox {
+                    ready: ready_tx,
+                    inbound: inbound_tx,
+                    outbound: to_radio_rx,
+                    management: management_tx,
+                    notices: notice_tx,
+                },
                 found_by_the_reactor,
             );
         });
@@ -557,10 +641,13 @@ impl Link for BleLink {
                 ),
             )),
             Ok(Err(why)) => Err(why),
-            Ok(Ok(())) => Ok((
+            Ok(Ok((device_id, capabilities))) => Ok((
                 Box::new(BleReader {
+                    device_id,
+                    capabilities,
                     inbound: inbound_rx,
                     management: Some(management_rx),
+                    notices: Some(notice_rx),
                     leftover: VecDeque::new(),
                     done: false,
                 }),
@@ -595,12 +682,16 @@ impl Link for BleLink {
 fn radio(
     selection: &Selection,
     window: Duration,
-    ready: Sender<io::Result<()>>,
-    inbound: Sender<Option<Vec<u8>>>,
-    outbound: tokio::sync::mpsc::Receiver<Frame>,
-    management: Sender<Vec<u8>>,
+    outbox: Outbox,
     carries_management: Arc<AtomicBool>,
 ) {
+    let Outbox {
+        ready,
+        inbound,
+        outbound,
+        management,
+        notices,
+    } = outbox;
     // No attempt is worked out here: the window is the caller's, the clock on
     // it starts with the work below, and each dial asks for what is left of it
     // when it is about to run. See [`dial_attempt`].
@@ -638,19 +729,25 @@ fn radio(
                 return;
             }
         };
-        let target = match peripheral
+        let properties = match peripheral
             .properties()
             .await
             .map_err(|why| format!("the device would not say what it is: {why}"))
         {
-            Ok(properties) => properties
-                .and_then(|p| p.local_name)
-                .unwrap_or_else(|| "the device".to_string()),
+            Ok(properties) => properties,
             Err(why) => {
                 refuse(why);
                 return;
             }
         };
+
+        let address = properties
+            .as_ref()
+            .map(|p| p.address.to_string())
+            .unwrap_or_default();
+        let target = properties
+            .and_then(|p| p.local_name)
+            .unwrap_or_else(|| "the device".to_string());
 
         // Joining a link that is already up is an optimization, and it has one
         // failure shape: BlueZ reports a device as connected for a second or
@@ -676,19 +773,22 @@ fn radio(
                 }
             }
         }
-        if let Err(why) = wired {
-            // A refused link is still an up link as far as BlueZ is concerned,
-            // and hanging it up is only ours to do when the dial was: a link
-            // another client brought up has that client's session running
-            // over it.
-            if dialled_here {
-                let _ = peripheral.disconnect().await;
+        let wiring = match wired {
+            Ok(wiring) => wiring,
+            Err(why) => {
+                // A refused link is still an up link as far as BlueZ is
+                // concerned, and hanging it up is only ours to do when the dial
+                // was: a link another client brought up has that client's
+                // session running over it.
+                if dialled_here {
+                    let _ = peripheral.disconnect().await;
+                }
+                refuse(format!(
+                    "connected to {target} but the link was refused: {why}"
+                ));
+                return;
             }
-            refuse(format!(
-                "connected to {target} but the link was refused: {why}"
-            ));
-            return;
-        }
+        };
         // What the board carries, told to the writer before the caller can use
         // the link: a management frame queued for a board with no management
         // characteristic is a request nothing will ever answer, and the caller
@@ -705,7 +805,8 @@ fn radio(
         // Reported only once the subscription is live. A read that succeeds
         // and a notify that never arrives looks exactly like a dead target,
         // so "connected" means bytes can already flow both ways.
-        if ready.send(Ok(())).is_err() {
+        let device_id = connection_identifier(&peripheral.id().to_string(), &address);
+        if ready.send(Ok((device_id, wiring.capabilities))).is_err() {
             // The caller gave up (or went away) while this dial was still
             // working, so there is no reader for the bytes below and a link
             // left open is a radio the next dial has to fight for. Hanging it
@@ -715,7 +816,22 @@ fn radio(
             }
             return;
         }
-        carry(&peripheral, &inbound, outbound, &management).await;
+        let _ = notices.send(match wiring.uart {
+            Uart::Reliable(state) => format!(
+                "link: Reliable UART (frames up to {} bytes)",
+                state.max_payload
+            ),
+            Uart::Nus => "link: Nordic UART Service".to_string(),
+        });
+        carry(
+            &peripheral,
+            &inbound,
+            outbound,
+            &management,
+            &notices,
+            wiring,
+        )
+        .await;
         // The one signal that means "stop reading" to whoever is waiting on
         // us, sent once the loop above has decided the device went away.
         let _ = inbound.send(None);
@@ -1147,7 +1263,13 @@ async fn heard_boards(adapter: &btleplug::platform::Adapter) -> Vec<String> {
         }
         let name = display_name(properties.local_name.as_deref())
             .unwrap_or_else(|| "Linkr Bee".to_string());
-        heard.push(format!("{name} ({})", peripheral.address()));
+        heard.push(format!(
+            "{name} ({})",
+            connection_identifier(
+                &peripheral.id().to_string(),
+                &properties.address.to_string()
+            )
+        ));
     }
     heard.sort();
     heard.truncate(6);
@@ -1232,9 +1354,42 @@ fn check_identity(
     Ok(())
 }
 
+/// Which characteristic carries the target's bytes, once the wiring is up.
+///
+/// The board offers both; the choice is made once, per link, from what the
+/// board's Management service advertises. It is never re-made mid-session: a
+/// channel change would leave a half-written frame on one characteristic and
+/// its continuation on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uart {
+    /// The unframed Nordic UART stream, and the only channel old firmware has.
+    Nus,
+    /// Confirmed, sequence-numbered frames.
+    Reliable(ReliableState),
+}
+
+/// What a Reliable UART state read says, from this host's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReliableState {
+    /// The largest payload one frame may carry, capped at the protocol's 232.
+    max_payload: usize,
+    /// The sequence this host writes next.
+    tx_sequence: u32,
+    /// The sequence this host expects from the board next.
+    rx_sequence: u32,
+}
+
+/// What [`wire`] had to say about the link beyond "it is up".
+struct Wiring {
+    notifications: futures::stream::BoxStream<'static, btleplug::api::ValueNotification>,
+    uart: Uart,
+    /// The Management capability word, when the board advertised one.
+    capabilities: Option<u32>,
+}
+
 /// Discover the service and subscribe to the characteristic that carries the
 /// target's output.
-async fn wire(peripheral: &Peripheral) -> Result<(), String> {
+async fn wire(peripheral: &Peripheral) -> Result<Wiring, String> {
     retry_busy(|| async { peripheral.discover_services().await })
         .await
         .map_err(|why| format!("the services could not be enumerated: {why}"))?;
@@ -1279,24 +1434,11 @@ async fn wire(peripheral: &Peripheral) -> Result<(), String> {
         check_identity(false, &characteristic_uuids, None, name)?;
     }
 
-    for wanted in [NUS_TX, NUS_RX] {
-        // Checked for both, because a firmware that advertises NUS but does
-        // not lay out the standard characteristics is a real thing, and it is
-        // better to say which end is missing than to fail on the first write.
-        if !characteristics.iter().any(|c| c.uuid == wanted) {
-            return Err(format!(
-                "the device does not offer the Nordic UART characteristic {wanted}"
-            ));
-        }
-    }
-    let out = characteristics
-        .iter()
-        .find(|c| c.uuid == NUS_TX)
-        .ok_or_else(|| "the notify characteristic vanished".to_string())?;
-    retry_busy(|| async { peripheral.subscribe(out).await })
+    // btleplug does not replay indications received before the host stream exists.
+    let notifications = peripheral
+        .notifications()
         .await
-        .map_err(|why| format!("notify could not be subscribed to: {why}"))?;
-
+        .map_err(|why| format!("the notification stream could not be opened: {why}"))?;
     // The management service is optional and *must stay* optional: a bridge
     // without it is a bridge that can still carry a terminal, and refusing to
     // connect to one because it cannot answer `@i?` would turn a firmware
@@ -1310,11 +1452,124 @@ async fn wire(peripheral: &Peripheral) -> Result<(), String> {
             .await
             .map_err(|why| format!("the management channel could not be subscribed to: {why}"))?;
     }
-    Ok(())
+
+    let mut uart = Uart::Nus;
+    // The capability word, read once: the transport and the session features
+    // both come from it, and a second read could disagree with the first.
+    let protocol = protocol_info_of(peripheral, has_management, &characteristics).await;
+    if let Some(info) = protocol {
+        if let Some(state) = reliable_state_of(peripheral, info, &characteristics).await {
+            if let Some(out) = characteristics.iter().find(|c| c.uuid == RELIABLE_TX) {
+                if retry_busy(|| async { peripheral.subscribe(out).await })
+                    .await
+                    .is_ok()
+                {
+                    uart = Uart::Reliable(state);
+                }
+            }
+        }
+    }
+    if uart == Uart::Nus {
+        for wanted in [NUS_TX, NUS_RX] {
+            // Checked for both, because a firmware that advertises NUS but does
+            // not lay out the standard characteristics is a real thing, and it is
+            // better to say which end is missing than to fail on the first write.
+            if !characteristics.iter().any(|c| c.uuid == wanted) {
+                return Err(format!(
+                    "the device does not offer the Nordic UART characteristic {wanted}"
+                ));
+            }
+        }
+        let out = characteristics
+            .iter()
+            .find(|c| c.uuid == NUS_TX)
+            .ok_or_else(|| "the notify characteristic vanished".to_string())?;
+        retry_busy(|| async { peripheral.subscribe(out).await })
+            .await
+            .map_err(|why| format!("notify could not be subscribed to: {why}"))?;
+    }
+
+    Ok(Wiring {
+        notifications,
+        uart,
+        capabilities: protocol.map(|info| info.capabilities),
+    })
 }
 
-/// The first of a run of identical management notifications, and nothing of
-/// the rest.
+/// Read the Management protocol word, when the board has one.
+///
+/// This is what says which features the bridge offers — the Reliable UART
+/// service and console ownership arbitration — so it is read before either is
+/// used rather than assumed. A board without the characteristic, or with a word
+/// this client cannot parse, keeps the historical NUS-only behaviour.
+async fn protocol_info_of(
+    peripheral: &Peripheral,
+    has_management: bool,
+    characteristics: &std::collections::BTreeSet<btleplug::api::Characteristic>,
+) -> Option<crate::protocol::ProtocolInfo> {
+    if !has_management {
+        return None;
+    }
+    let protocol = characteristics.iter().find(|c| c.uuid == MGMT_PROTOCOL)?;
+    let value = retry_busy(|| async { peripheral.read(protocol).await })
+        .await
+        .ok()?;
+    crate::protocol::parse_protocol_info(&value)
+}
+
+/// Whether the board offers the Reliable UART channel, and where its two
+/// sequence counters start.
+///
+/// Three things have to agree before this host stops speaking plain NUS: the
+/// protocol word has to set `MGMT_CAP_RELIABLE_UART`, all three service
+/// characteristics have to be on the device, and the state read has to describe
+/// a usable frame size and a live sequence. Anything less is not a board that
+/// can carry the channel — it is a board this client should keep talking to the
+/// old way rather than a link to refuse.
+async fn reliable_state_of(
+    peripheral: &Peripheral,
+    info: crate::protocol::ProtocolInfo,
+    characteristics: &std::collections::BTreeSet<btleplug::api::Characteristic>,
+) -> Option<ReliableState> {
+    if info.capabilities & crate::protocol::MGMT_CAP_RELIABLE_UART == 0 {
+        return None;
+    }
+    for wanted in [RELIABLE_RX, RELIABLE_TX, RELIABLE_STATE] {
+        if !characteristics.iter().any(|c| c.uuid == wanted) {
+            return None;
+        }
+    }
+    let state = characteristics.iter().find(|c| c.uuid == RELIABLE_STATE)?;
+    let value = retry_busy(|| async { peripheral.read(state).await })
+        .await
+        .ok()?;
+    reliable_state(&value)
+}
+
+/// Read the firmware's Reliable UART state value.
+///
+/// The 16 bytes are `version`, `flags`, `max_payload_le`, then the sequence the
+/// bridge expects next, the one it will send next, and the last it was told
+/// about. A zero sequence is never valid and so is a zero frame size: a state
+/// that says either is a service this host cannot start a stream on.
+fn reliable_state(value: &[u8]) -> Option<ReliableState> {
+    if value.len() != 16 || value[0] != crate::protocol::RELIABLE_UART_API_MAJOR {
+        return None;
+    }
+    let max_payload = u16::from_le_bytes([value[2], value[3]]) as usize;
+    let rx_next = u32::from_le_bytes([value[4], value[5], value[6], value[7]]);
+    let tx_next = u32::from_le_bytes([value[8], value[9], value[10], value[11]]);
+    if max_payload == 0 || rx_next == 0 || tx_next == 0 {
+        return None;
+    }
+    Some(ReliableState {
+        max_payload: max_payload.min(crate::protocol::RELIABLE_UART_MAX_PAYLOAD),
+        tx_sequence: rx_next,
+        rx_sequence: tx_next,
+    })
+}
+
+/// How long a re-delivered management message may follow the original.
 ///
 /// BlueZ re-broadcasts one GATT notification once per outstanding notify
 /// session on the characteristic, so a client sees the same value several
@@ -1325,17 +1580,140 @@ async fn wire(peripheral: &Peripheral) -> Result<(), String> {
 /// are the daemon's alone; passing them on turns one scan result into four
 /// rows and one ending into several orphans.
 ///
-/// The comparison is against the *immediately* previous notification rather
-/// than a set of seen ones: what arrives is runs of repeats, and a value that
-/// legitimately comes back later — a state that is published twice — is not
-/// this function's to swallow. Terminal bytes never come through here, so
-/// nothing a user types is ever suppressed.
-fn keep_once(last: &mut Option<Vec<u8>>, value: Vec<u8>) -> Option<Vec<u8>> {
-    if last.as_deref() == Some(value.as_slice()) {
-        return None;
+/// A copy is on the socket by the time the original has been read, so this
+/// window is generous for the daemon and short enough that a bridge which
+/// genuinely publishes the same state twice, a second apart, is not silenced.
+const MANAGEMENT_REPEAT_WINDOW: Duration = Duration::from_millis(1000);
+
+/// The message being assembled from management fragments.
+struct Incoming {
+    /// Every byte received for this message so far, header included.
+    bytes: Vec<u8>,
+    /// The message's declared length, header included.
+    total: usize,
+}
+
+/// A message already handed to the application, kept as the anchor for repeat
+/// detection.
+struct Delivered {
+    bytes: Vec<u8>,
+    at: Instant,
+}
+
+/// The management notification stream, cut into whole messages.
+///
+/// A management response is a *fragment* stream: only the first fragment of a
+/// message carries the header, and every fragment after it is bare payload
+/// bytes. Two fragments in a row can legitimately be byte-identical — uniform
+/// padding, a repeated status string — and a continuation fragment has no
+/// sequence number, so that pair is indistinguishable from one notification
+/// the daemon delivered twice. Duplicate detection therefore must not look at
+/// fragments at all: it looks at *messages*. A message, header and all, that
+/// arrives again inside [`MANAGEMENT_REPEAT_WINDOW`] of the first copy is the
+/// re-broadcast this type exists to absorb; every other fragment is payload
+/// and is kept. Dropping a repeat after the whole message has been assembled
+/// is also what keeps a run of copies (three, four, as sessions pile up) from
+/// looking like a new message each time.
+///
+/// Terminal bytes never come through here. `NUS_TX` has no framing at all, so
+/// nothing a target prints — and nothing a user types — can be suppressed.
+struct ManagementMessages {
+    /// The message being assembled, from its header to its last declared byte.
+    pending: Option<Incoming>,
+    /// The last message handed over, the anchor a copy is compared against.
+    delivered: Option<Delivered>,
+}
+
+impl ManagementMessages {
+    fn new() -> ManagementMessages {
+        ManagementMessages {
+            pending: None,
+            delivered: None,
+        }
     }
-    *last = Some(value.clone());
-    Some(value)
+
+    /// Feed one notification value; hand back at most one whole message.
+    ///
+    /// `None` covers both "still arriving" and "a re-delivery": a caller that
+    /// only ever sees complete messages never has to decide anything about a
+    /// fragment, which is exactly the property the old byte-level filter
+    /// lacked.
+    fn push(&mut self, value: Vec<u8>, now: Instant) -> Option<Vec<u8>> {
+        if self.pending.is_none() {
+            // A message starts with a header. A value that does not parse as
+            // one is passed through untouched: the application's reassembler
+            // has words for that break, and guessing here would replace them
+            // with silence.
+            let Ok(header) = crate::protocol::parse_management_header(&value) else {
+                return Some(value);
+            };
+            let total = crate::protocol::MGMT_HEADER_SIZE + header.expected as usize;
+            if value.len() >= total {
+                // The common case: the whole answer fitted in one indication.
+                return self.whole(value, now);
+            }
+            self.pending = Some(Incoming {
+                bytes: value,
+                total,
+            });
+            return None;
+        }
+        let mut pending = self.pending.take().expect("checked above");
+        pending.bytes.extend_from_slice(&value);
+        if pending.bytes.len() < pending.total {
+            self.pending = Some(pending);
+            return None;
+        }
+        if pending.bytes.len() > pending.total {
+            // More bytes than the header declared: this cannot be the message
+            // that header started. The partial copy goes, and the fragment
+            // that broke it is offered as it came so the application reports
+            // the break and the next header starts from a clean slate.
+            // Swallowing it would leave the caller waiting on a message that
+            // is never coming.
+            return Some(value);
+        }
+        self.whole(pending.bytes, now)
+    }
+
+    /// Hand a complete message over, unless it is the previous one arriving
+    /// again inside the window.
+    fn whole(&mut self, message: Vec<u8>, now: Instant) -> Option<Vec<u8>> {
+        if let Some(last) = &self.delivered {
+            let repeated = last.bytes == message
+                && now.saturating_duration_since(last.at) <= MANAGEMENT_REPEAT_WINDOW;
+            if repeated {
+                // Keep the original as the anchor: a run of four copies is one
+                // message, and comparing the fifth with the first is what
+                // keeps it that way.
+                return None;
+            }
+        }
+        self.delivered = Some(Delivered {
+            bytes: message.clone(),
+            at: now,
+        });
+        Some(message)
+    }
+}
+
+// CoreBluetooth can keep the notification stream open after a physical link
+// loss. Check OS connection state independently of serial traffic, without
+// blocking the data loop or sending probe bytes to the target.
+async fn wait_for_disconnect<F, Fut>(mut connected: F, interval: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        tokio::time::sleep(interval).await;
+        if !tokio::time::timeout(Duration::from_secs(2), connected())
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
 }
 
 /// Move bytes in both directions until one of them stops.
@@ -1344,38 +1722,116 @@ async fn carry(
     inbound: &Sender<Option<Vec<u8>>>,
     mut outbound: tokio::sync::mpsc::Receiver<Frame>,
     management: &Sender<Vec<u8>>,
+    notices: &Sender<String>,
+    wiring: Wiring,
 ) {
+    let Wiring {
+        uart,
+        mut notifications,
+        ..
+    } = wiring;
     let characteristics = peripheral.characteristics();
-    let sink = characteristics.iter().find(|c| c.uuid == NUS_RX).cloned();
+    let nus_sink = characteristics.iter().find(|c| c.uuid == NUS_RX).cloned();
+    let reliable_sink = characteristics
+        .iter()
+        .find(|c| c.uuid == RELIABLE_RX)
+        .cloned();
     let command = characteristics
         .iter()
         .find(|c| c.uuid == MGMT_COMMAND)
         .cloned();
-    let Ok(mut notifications) = peripheral.notifications().await else {
-        return;
+    // The management channel, cut into whole messages so a re-delivered one
+    // can be told apart from a fragment that merely matches its neighbour.
+    // See `ManagementMessages`.
+    let mut messages = ManagementMessages::new();
+    // The Reliable UART receive side: fragments in, whole frames out, and the
+    // sequence number that says whether a frame is the next one. A frame is
+    // delivered once; a re-indication of the one just delivered is dropped, and
+    // a gap stops delivery rather than typing the rest of the target's output
+    // out of order.
+    let mut frames = crate::protocol::ReliableReassembler::default();
+    // A broken stream is said once. Every later frame fails the same check, and
+    // one notice per frame would bury the target's last useful output.
+    let mut desynced = false;
+    let (mut tx_sequence, mut rx_sequence, max_payload) = match uart {
+        Uart::Reliable(state) => (
+            Some(state.tx_sequence),
+            Some(state.rx_sequence),
+            state.max_payload,
+        ),
+        Uart::Nus => (None, None, 0),
     };
-    // The last management notification, so its repeats can be told apart.
-    // See `keep_once`.
-    let mut last_response: Option<Vec<u8>> = None;
+    let disconnected = wait_for_disconnect(|| is_up(peripheral), Duration::from_millis(500));
+    tokio::pin!(disconnected);
 
     loop {
         tokio::select! {
+            _ = &mut disconnected => return,
             notification = notifications.next() => {
                 match notification {
                     Some(notification) => {
                         if notification.value.is_empty() {
                             continue;
                         }
-                        // Two notify characteristics now feed this loop, and
+                        // Three notify characteristics now feed this loop, and
                         // which one a packet came in on is the only reliable
-                        // way to know what it is: both carry plain bytes and
-                        // neither carries a hint. Sending a management
-                        // response down the target's stream would type the
-                        // bridge's answer into somebody's shell prompt.
+                        // way to know what it is: NUS carries plain bytes, the
+                        // Reliable stream carries frames, and neither carries a
+                        // hint. Sending a management response down the target's
+                        // stream would type the bridge's answer into somebody's
+                        // shell prompt.
                         if notification.uuid == MGMT_RESPONSE {
-                            if let Some(bytes) = keep_once(&mut last_response, notification.value) {
+                            if let Some(bytes) = messages.push(notification.value, Instant::now()) {
                                 if management.send(bytes).is_err() {
                                     return;
+                                }
+                            }
+                        } else if notification.uuid == RELIABLE_TX {
+                            let Some(expected) = rx_sequence.as_mut() else { continue };
+                            match frames.push(&notification.value) {
+                                crate::protocol::Reassembly::Incomplete => {}
+                                // A frame this host cannot parse is a stream it
+                                // can no longer trust: drop the partial copy
+                                // and let the next header start clean.
+                                crate::protocol::Reassembly::Error(why) => {
+                                    frames.reset();
+                                    if !desynced {
+                                        desynced = true;
+                                        let _ = notices.send(format!(
+                                            "Reliable UART: {}",
+                                            why.message(true)
+                                        ));
+                                    }
+                                }
+                                crate::protocol::Reassembly::Complete { payload, meta } => {
+                                    let previous = if *expected == 1 {
+                                        u32::MAX
+                                    } else {
+                                        *expected - 1
+                                    };
+                                    // A duplicated indication of the frame just
+                                    // delivered is not new output.
+                                    if meta.sequence == previous {
+                                        continue;
+                                    }
+                                    // A gap cannot be waited out: every later
+                                    // frame would fail the same check.
+                                    if meta.sequence != *expected {
+                                        if !desynced {
+                                            desynced = true;
+                                            let _ = notices.send(format!(
+                                                "Reliable UART sequence gap: expected {}, got {}. \
+                                                 Output has stopped; disconnect and reconnect \
+                                                 the board.",
+                                                expected, meta.sequence
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    *expected = crate::protocol::next_reliable_sequence(*expected);
+                                    if inbound.send(Some(payload)).is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         } else if notification.uuid == NUS_TX
@@ -1391,7 +1847,48 @@ async fn carry(
             frame = outbound.recv() => {
                 match frame {
                     Some(Frame::Stream(bytes)) => {
-                        let Some(sink) = sink.as_ref() else { continue };
+                        if let Some(sequence) = tx_sequence.as_mut() {
+                            // The sink was found at wiring time and the
+                            // characteristic set cannot change under a live
+                            // link. If it did, writing through NUS is not a
+                            // fallback: that characteristic was never
+                            // subscribed in this mode, so the bytes would go
+                            // nowhere. Say so and stop instead of losing the
+                            // target's input one keystroke at a time.
+                            let Some(sink) = reliable_sink.as_ref() else {
+                                let _ = notices.send(
+                                    "Reliable UART: the transmit characteristic is gone; \
+                                     disconnect and reconnect the board."
+                                        .to_string(),
+                                );
+                                return;
+                            };
+                            // A write is cut into frames of the board's own
+                            // payload limit, each confirmable on its own. With
+                            // Response is not the throughput choice it is on
+                            // NUS: the bridge advances its expected sequence
+                            // only after a frame's last fragment lands, so the
+                            // writes have to be ordered and complete.
+                            for chunk in bytes.chunks(max_payload.max(1)) {
+                                let frame =
+                                    crate::protocol::encode_reliable_frame(*sequence, chunk);
+                                for piece in segment(&frame, RELIABLE_WRITE_SIZE) {
+                                    if retry_busy(|| async {
+                                        peripheral
+                                            .write(sink, &piece, WriteType::WithResponse)
+                                            .await
+                                    })
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                *sequence = crate::protocol::next_reliable_sequence(*sequence);
+                            }
+                            continue;
+                        }
+                        let Some(sink) = nus_sink.as_ref() else { continue };
                         for piece in segment(&bytes, MTU_WRITE_LIMIT) {
                             // Without response is the throughput choice: NUS is
                             // handed to the Link Layer with whatever credit it
@@ -1448,17 +1945,32 @@ async fn carry(
 
 /// Bytes from the device, in order.
 struct BleReader {
+    device_id: String,
+    /// The Management capability word the link read at wiring time, if any.
+    capabilities: Option<u32>,
     inbound: Receiver<Option<Vec<u8>>>,
     /// Responses from the bridge's management channel, until [`Self::
     /// side_channel`] takes them over. `Option` because that happens exactly
     /// once and must not be able to happen twice.
     management: Option<Receiver<Vec<u8>>>,
+    /// Words about the link itself — the transport it settled on, a stream that
+    /// had to stop — until [`Self::side_channel`] takes them over. `Option` for
+    /// the same reason `management` is.
+    notices: Option<Receiver<String>>,
     /// What a notification that did not fit in the caller's buffer left over.
     leftover: VecDeque<u8>,
     done: bool,
 }
 
 impl LinkReader for BleReader {
+    fn ble_device_id(&self) -> Option<String> {
+        Some(self.device_id.clone())
+    }
+
+    fn board_capabilities(&self) -> Option<u32> {
+        self.capabilities
+    }
+
     /// Management responses are not target output, so they leave by the side
     /// channel rather than by [`Self::read`].
     ///
@@ -1468,6 +1980,16 @@ impl LinkReader for BleReader {
     /// `read` that returns early looking for them would look exactly like a
     /// link that hung up.
     fn side_channel(&mut self, events: Sender<super::LinkEvent>) {
+        if let Some(notices) = self.notices.take() {
+            let events = events.clone();
+            thread::spawn(move || {
+                while let Ok(text) = notices.recv() {
+                    if events.send(super::LinkEvent::Notice(text)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         let Some(management) = self.management.take() else {
             return;
         };
@@ -1576,6 +2098,65 @@ mod tests {
         );
         assert_eq!(NUS_RX.to_string(), "6e400002-b5a3-f393-e0a9-e50e24dcca9e");
         assert_eq!(NUS_TX.to_string(), "6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+        assert_eq!(
+            RELIABLE_RX.to_string(),
+            "4c4b0011-9a7e-4f4e-8b8a-3d6f12a0c001"
+        );
+        assert_eq!(
+            RELIABLE_TX.to_string(),
+            "4c4b0012-9a7e-4f4e-8b8a-3d6f12a0c001"
+        );
+    }
+
+    /// The state value is the one `struct reliable_state_value` writes: version,
+    /// flags, the frame limit, then the sequence the bridge expects next (this
+    /// host's transmit counter) and the one it will send next (this host's
+    /// receive counter).
+    #[test]
+    fn a_reliable_state_read_says_where_each_stream_starts() {
+        let mut value = vec![crate::protocol::RELIABLE_UART_API_MAJOR, 1];
+        value.extend_from_slice(&232u16.to_le_bytes());
+        value.extend_from_slice(&7u32.to_le_bytes());
+        value.extend_from_slice(&9u32.to_le_bytes());
+        value.extend_from_slice(&8u32.to_le_bytes());
+        let state = reliable_state(&value).expect("a usable state");
+        assert_eq!(
+            state,
+            ReliableState {
+                max_payload: 232,
+                tx_sequence: 7,
+                rx_sequence: 9,
+            }
+        );
+
+        // A board that advertises more than the protocol's ceiling is taken at
+        // the ceiling, not at its word.
+        let mut greedy = value.clone();
+        greedy[2..4].copy_from_slice(&4096u16.to_le_bytes());
+        assert_eq!(reliable_state(&greedy).unwrap().max_payload, 232);
+    }
+
+    #[test]
+    fn a_reliable_state_with_no_stream_to_start_is_refused() {
+        let mut value = vec![crate::protocol::RELIABLE_UART_API_MAJOR, 0];
+        value.extend_from_slice(&232u16.to_le_bytes());
+        value.extend_from_slice(&1u32.to_le_bytes());
+        value.extend_from_slice(&1u32.to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes());
+        assert!(reliable_state(&value).is_some());
+
+        for (offset, what) in [(0usize, "version"), (2usize, "frame size")] {
+            let mut broken = value.clone();
+            broken[offset] = 0;
+            assert!(reliable_state(&broken).is_none(), "{what}");
+        }
+        let mut zero_tx = value.clone();
+        zero_tx[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(reliable_state(&zero_tx).is_none(), "transmit sequence");
+        let mut zero_rx = value;
+        zero_rx[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(reliable_state(&zero_rx).is_none(), "receive sequence");
+        assert!(reliable_state(&[1, 0, 0]).is_none(), "a short state");
     }
 
     /// "Any" is how a single board on a bench is dialled, and it has to accept
@@ -1585,6 +2166,45 @@ mod tests {
         let any = Selection::any();
         assert!(any.accepts(Some("Linkr BLE UART-3"), "EE:C7:42:34:48:CF", None));
         assert!(any.accepts(None, "some-platform-uuid", None));
+    }
+
+    #[test]
+    fn macos_uses_the_native_uuid_and_zeroes_never_select_a_device() {
+        let id = "11111111-1111-4111-8111-aabbccddeeff";
+        let other = "22222222-2222-4222-8222-aabbccddeeff";
+        assert_eq!(
+            connection_identifier(id, "00:00:00:00:00:00"),
+            id.to_ascii_uppercase()
+        );
+        let selected = Selection::Address(id.into());
+        assert!(selected.reachable().is_ok());
+        assert!(selected.accepts(Some("Linkr Bee"), id, Some("00:00:00:00:00:00")));
+        assert!(!selected.accepts(Some("Linkr Bee"), other, Some("00:00:00:00:00:00")));
+        assert!(
+            !same_device(id, other),
+            "UUIDs with a shared suffix are distinct devices"
+        );
+        assert!(!same_device(id, "AA:BB:CC:DD:EE:FF"));
+        assert!(same_device(id, &id.to_ascii_uppercase()));
+        let zero = Selection::Address("00:00:00:00:00:00".into());
+        assert!(zero.reachable().is_err());
+        assert!(!zero.accepts(Some("Any device"), id, Some("00:00:00:00:00:00")));
+        assert!(!same_device("00:00:00:00:00:00", "00:00:00:00:00:00"));
+        assert!(Selection::Address(Uuid::nil().to_string())
+            .reachable()
+            .is_err());
+    }
+
+    #[test]
+    fn platforms_with_real_mac_addresses_keep_them_as_scan_identifiers() {
+        assert_eq!(
+            connection_identifier("some-platform-id", "FB:F6:91:14:33:3A"),
+            "FB:F6:91:14:33:3A"
+        );
+        assert_eq!(
+            connection_identifier("hci0/dev_FB_F6_91_14_33_3A", "00:00:00:00:00:00"),
+            "FB:F6:91:14:33:3A"
+        );
     }
 
     /// Names are matched on a substring ignoring case, because the same board
@@ -1857,11 +2477,15 @@ mod tests {
     fn a_reader_with_no_radio_behind_it_reads_end_of_stream() {
         let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
         let mut reader = BleReader {
+            device_id: "EE:C7:42:34:48:CF".into(),
+            capabilities: None,
             inbound: rx,
             management: None,
+            notices: None,
             leftover: VecDeque::new(),
             done: false,
         };
+        assert_eq!(reader.ble_device_id().as_deref(), Some("EE:C7:42:34:48:CF"));
         let _ = tx.send(Some(vec![1, 2, 3]));
         let mut buf = [0u8; 8];
         assert_eq!(reader.read(&mut buf).unwrap(), 3);
@@ -1880,8 +2504,11 @@ mod tests {
     fn bytes_that_do_not_fit_wait_for_the_next_read() {
         let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
         let mut reader = BleReader {
+            device_id: "EE:C7:42:34:48:CF".into(),
+            capabilities: None,
             inbound: rx,
             management: None,
+            notices: None,
             leftover: VecDeque::new(),
             done: false,
         };
@@ -1898,30 +2525,138 @@ mod tests {
         assert_eq!(got, sent, "ten bytes through a four-byte buffer, whole");
     }
 
-    /// A notification the daemon repeated is passed on once, and its repeats
-    /// are dropped — but only while they are *repeats*: the same value coming
-    /// back after a different one is a new event and is not this link's to
-    /// swallow.
-    #[test]
-    fn a_repeated_notification_is_passed_on_once() {
-        let mut last = None;
-        let line = b"@scan result BenchNet wpa2 ch=6 -54dBm".to_vec();
+    /// A management response header, the way the bridge frames one: `LK`,
+    /// version 1, response type 2, the request it answers, its payload length
+    /// and the flags word. Written by hand because `protocol` only encodes
+    /// requests — a host never sends a response.
+    fn response_header(request_id: u32, expected: u16, finished: bool) -> Vec<u8> {
+        let mut frame = vec![0x4c, 0x4b, 1, 2];
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&expected.to_le_bytes());
+        frame.extend_from_slice(&(if finished { 1u16 } else { 0 }).to_le_bytes());
+        frame
+    }
 
-        for copy in 0..4 {
-            let kept = keep_once(&mut last, line.clone());
-            if copy == 0 {
-                assert_eq!(kept.as_ref(), Some(&line), "the first copy is the event");
-            } else {
-                assert!(kept.is_none(), "copy {copy} is the daemon talking twice");
-            }
+    /// One whole management response in a single notification.
+    fn response_frame(request_id: u32, payload: &[u8], finished: bool) -> Vec<u8> {
+        let mut frame = response_header(request_id, payload.len() as u16, finished);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// A fragment stream can carry two identical fragments in a row — uniform
+    /// padding, a repeated status string, any payload that happens to repeat.
+    /// Both are payload, and a message split across them only reassembles if
+    /// both are kept.
+    ///
+    /// This is the H4 regression: the old byte-level filter compared each
+    /// notification with the one before it and dropped this third fragment,
+    /// leaving the message one fragment short for good.
+    #[test]
+    fn two_identical_fragments_are_both_delivered() {
+        let mut messages = ManagementMessages::new();
+        let now = Instant::now();
+        let head = response_header(7, 8, true);
+        let padding = [0u8; 4].to_vec();
+
+        assert_eq!(
+            messages.push(head, now),
+            None,
+            "a header alone is no message"
+        );
+        assert_eq!(
+            messages.push(padding.clone(), now),
+            None,
+            "half the payload is no message either"
+        );
+        let whole = messages
+            .push(padding.clone(), now)
+            .expect("the message reassembles");
+        assert_eq!(&whole[..12], response_header(7, 8, true).as_slice());
+        assert_eq!(
+            &whole[12..],
+            [padding.clone(), padding].concat().as_slice(),
+            "both identical fragments are in the message"
+        );
+    }
+
+    /// The daemon's re-broadcast: one whole management response is handed over
+    /// once, however many times the stack delivers it inside the window.
+    #[test]
+    fn a_repeated_management_message_is_delivered_once() {
+        let mut messages = ManagementMessages::new();
+        let started = Instant::now();
+        let reply = response_frame(9, b"OK", true);
+
+        assert_eq!(messages.push(reply.clone(), started), Some(reply.clone()));
+        for copy in 1..4 {
+            assert_eq!(
+                messages.push(reply.clone(), started + Duration::from_millis(50 * copy)),
+                None,
+                "copy {copy} is the daemon talking twice"
+            );
         }
 
-        // A different notification in between makes the same value new again.
-        assert!(keep_once(&mut last, b"@scan done".to_vec()).is_some());
-        assert!(
-            keep_once(&mut last, line.clone()).is_some(),
-            "after a different notification the same value is a new one"
+        // After the window the same answer is a new one: a bridge that
+        // publishes the same state twice is heard twice, not silenced for
+        // having repeated itself.
+        assert_eq!(
+            messages.push(
+                reply.clone(),
+                started + MANAGEMENT_REPEAT_WINDOW + Duration::from_millis(1)
+            ),
+            Some(reply),
+            "the same message after the window is a new one"
         );
+    }
+
+    /// A repeat is only a repeat next to its original: another message in
+    /// between makes the same bytes new again.
+    #[test]
+    fn a_message_in_between_makes_the_same_answer_new() {
+        let mut messages = ManagementMessages::new();
+        let started = Instant::now();
+        let reply = response_frame(9, b"OK", true);
+        let other = response_frame(9, b"OK\n", true);
+
+        assert_eq!(messages.push(reply.clone(), started), Some(reply.clone()));
+        assert_eq!(messages.push(other.clone(), started), Some(other));
+        assert_eq!(
+            messages.push(reply.clone(), started),
+            Some(reply),
+            "after a different message the same bytes are a new answer"
+        );
+    }
+
+    /// A value that does not parse as a header is passed on untouched: the
+    /// application's reassembler has words for an orphaned fragment, and
+    /// replacing them with silence would hide the break.
+    #[test]
+    fn a_fragment_that_is_not_a_header_is_passed_through() {
+        let mut messages = ManagementMessages::new();
+        let orphan = b"\x00\x01orphan".to_vec();
+        assert_eq!(messages.push(orphan.clone(), Instant::now()), Some(orphan));
+    }
+
+    /// A fragment stream that runs past the length its header declared cannot
+    /// be that message. The half-assembled copy goes and the fragment that
+    /// broke it is reported, so the caller sees a break in the stream instead
+    /// of waiting forever for a message that will never arrive.
+    #[test]
+    fn a_message_that_overruns_its_header_is_dropped_and_the_fragment_reported() {
+        let mut messages = ManagementMessages::new();
+        let now = Instant::now();
+        assert_eq!(messages.push(response_header(3, 4, true), now), None);
+        let extra = [0u8; 6].to_vec();
+        assert_eq!(
+            messages.push(extra.clone(), now),
+            Some(extra),
+            "the fragment is reported, not swallowed"
+        );
+
+        // The next header starts from a clean slate.
+        let reply = response_frame(4, b"OK", true);
+        assert_eq!(messages.push(reply.clone(), now), Some(reply));
     }
 
     /// A second client holding the adapter is an answer BlueZ gives in more
@@ -2093,5 +2828,34 @@ mod tests {
         let expired = dial_error("br-connection-timeout");
         assert!(expired.contains("dropped mid-dial"), "{expired}");
         assert!(!expired.contains("did not answer in time"), "{expired}");
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_is_detected_without_notification_or_write() {
+        let connected = Arc::new(AtomicBool::new(true));
+        let state = Arc::clone(&connected);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            state.store(false, Ordering::Release);
+        });
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_disconnect(
+                || async { connected.load(Ordering::Acquire) },
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("idle link loss must end the reader");
+    }
+
+    #[tokio::test]
+    async fn an_idle_connected_peer_is_not_disconnected() {
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            wait_for_disconnect(|| async { true }, Duration::from_millis(5))
+        )
+        .await
+        .is_err());
     }
 }

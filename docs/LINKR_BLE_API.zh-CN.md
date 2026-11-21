@@ -73,6 +73,7 @@ capability bits：
 
 - bit 0：WiFi；bit 1：WebDAV；bit 2：WebSocket；
 - bit 3：Device ID；bit 4：异步事件；bit 5：Reliable UART。
+- bit 7：多客户端单控制权。指令、状态及交接边界见[多客户端协议](MULTI_CLIENT.zh-CN.md#协议)。
 
 连接后应先读取 Protocol Info 并检查 major，再读取 Device ID，最后订阅
 Response / Event indication。不要在订阅完成前发送命令。
@@ -214,6 +215,44 @@ UART 自动波特率也是异步操作，但默认只在用户要求时运行：
 | `@linkr target?` | 查询 Bee 保存的目标机 UUID，无关联时返回 `OK target=none` |
 | `@linkr target=<UUID>` | 保存小写、带连字符的 36 字符 UUID；相同值不重复写入 |
 | `@linkr target clear` | 清除 Bee 中的目标机关联，不删除目标机 ID 文件或浏览器档案 |
+| `@linkr bonds?` | 列出已保存的配对，每条一行 `BOND <type>/<addr> self=0/1` |
+| `@linkr bonds name <label>` | 为当前连接自己的配对命名（无需控制权；空值清除） |
+| `@linkr bonds names?` | 列出所有名称 `NAME <type>/<addr> "<label>"`（兼容旧客户端，最多 32 字节） |
+| `@linkr bonds label <type>/<addr>` | 查询任意配对的标签（只读）：`OK bonds label=<addr> hex=<hex>`，无标签时 `none` |
+| `@linkr bonds label <type>/<addr> <hex>` | 设置任意配对的标签（需控制权；UTF-8 十六进制，最多 48 字节） |
+| `@linkr bonds label <type>/<addr> clear` | 清除任意配对的标签（需控制权） |
+| `@l?` | 查询 RGB 状态灯颜色（仅 Linkr Bee X1.0，其他板返回 `ERR led unsupported`） |
+| `@l=<r>,<g>,<b>` | 预览颜色 5 秒后恢复自动状态；通道 0–255 或 `0x00`–`0xff`，AI 状态优先 |
+| `@l off` | 预览熄灭 5 秒后恢复自动状态，AI 状态优先 |
+| `@o?` | 查询光耦干接点状态（仅 Linkr Bee X1.0） |
+| `@o on` / `@o off` | 闭合 / 断开 J5 干接点 |
+| `@o pulse <ms>` | 闭合 1–60000 ms 后自动断开 |
+| `@r?` | 查询红外接收计数与最近一帧 NEC（仅 Linkr Bee X1.0） |
+| `@r tx <addr>,<cmd>[,<repeats>]` | 发送 NEC 帧（addr 0–0xffff 支持扩展地址，repeats 0–16） |
+| `@r rx on\|off` | 使能 / 关闭 NEC 解码 |
+| `@r clear` | 清空最近一帧与计数 |
+| `@r learn [<slot>]` | 开始捕获原始红外帧（仅 Linkr Bee X1.0，槽位 0–7，静默 60 ms 自动结束） |
+| `@r learn stop` | 提前结束学习并保存；`ERR ir learn=no-frame` 表示没抓到完整帧 |
+| `@r play [<slot>]` | 回放学习到的帧 |
+| `@r slots` | 列出每个槽位的边沿数，例如 `0:67,1:0,...` |
+| `@r delete <slot>` | 删除槽位（连同名字）并清除 NVS 中的副本 |
+| `@r name <slot>` | 读取槽位名字：`OK ir name=0 none` / `OK ir name=0 hex=e5aea2e58e85` |
+| `@r name <slot> <hex>` | 以 UTF-8 十六进制写名字（≤32 字节）；`ERR ir name=too-long` / `ERR ir name=hex` |
+| `@r name <slot> clear` | 清除名字 |
+| `@p?` | 读取提示词长度：`OK prompt=140` / `OK prompt=0` |
+| `@p get [<offset>]` | 分片读取提示词（每片 48 字节，UTF-8 转十六进制）：`OK p off=0 hex=... total=140 done=no` |
+| `@p set <hex>` | 写入唯一的一条提示词（UTF-8 十六进制，≤240 字节） |
+| `@p clear` | 删除提示词 |
+| `@y?` | 读取板载 AI 配置长度：`OK aiconf bytes=186 max=960` |
+| `@y begin` / `@y put <hex>` / `@y end` | 分块上传一段 JSON 配置（`put` 每块 ≤200 字节；`end` 落盘） |
+| `@y get [<offset>]` | 分块读回配置（每片 48 字节，UTF-8 转十六进制） |
+| `@y clear` | 删除板载 AI 配置 |
+
+> `@l`/`@o`/`@r` 只存在于带对应硬件的板型（当前为 Linkr Bee X1.0）。
+> `@h` 返回的命令列表会按板型裁剪；固件仍接受这些命令并回
+> `ERR ... unsupported`，便于客户端区分“板子没有”与“写错了”。详细硬件说明见
+> [Linkr Bee X1.0 硬件说明](BEE_X1.0_HARDWARE.md)。
+
 
 名称规则：固件只裁剪首尾的空格、Tab、CR、LF，拒绝 C0、DEL、C1 与
 U+2028/U+2029，长度按 UTF-8 字节计（1–29）。只有 `@n` 后恰好一个空格时的
@@ -231,6 +270,18 @@ Management payload，不再受旧 NUS 128 字节响应缓冲区截断。
 绑定密钥相互独立。写入成功返回 `OK target=<UUID>`，失败返回 `ERR target storage <code>`。
 它仅用于关联档案；客户端仍须从当前 UART 目标机读取 ID 并比对，不能将缓存 UUID
 作为目标机身份认证或本次连接已核实的证据。
+
+红外学习（`@r learn` / `@r play` / `@r slots` / `@r delete` / `@r name`）只存在于带红外
+硬件的板型。
+板载 AI 提示词（`@p`）只有一条，存在 NVS 里，助手在对话开始时读取；文本通过
+管理通道以十六进制分片传输，避免换行/中文需要转义。
+
+板载 AI 配置（`@y`）由应用序列化为 JSON 后整体上传，固件只存字节、不解析；应用
+负责版本与字段校验。API Key 与附加请求头默认**不**写入，只有用户显式勾选时才随
+配置保存，读取时任何已配对主机都能通过管理通道取回，UI 中已注明该风险。槽位名字与波形一起存在板子的 NVS 里，因此换手机/清浏览器缓存都不丢；
+名字通过十六进制传输，空格与中文不需要转义。学习是异步的：`@r learn` 立即返回，之后用 `@r?` 轮询
+`learn=active,...` / `learn=idle,slots=..`，或直接读 `@r slots` 判断是否已写入；
+一帧在遥控器停止发射后约 60 ms 内收尾。
 
 ## 7. Reliable UART 帧和恢复
 
@@ -296,6 +347,12 @@ bridge -> client  "@ws auth=ok\r\n"         通过，随即开始转发串口
   `@s token=<值>` 指定，`@s token off` 关闭鉴权。
 - `@i?` 诊断输出 **不含** 令牌。令牌只经加密的 BLE 管理通道下发。
 - 令牌是局域网访问控制，不是传输加密：`ws://` 为明文，同网段仍可嗅探串口内容。
+
+> **安全警告：`@s token off` 会把目标板串口交给整个网段。** 桥接器监听 `0.0.0.0`，
+> 固件不校验 `Origin`/`Host`；关闭鉴权后，任何能访问 `ws://<设备 IP>/ws` 的网页或
+> 脚本都可以**读写目标机串口**（浏览器不阻止跨站 `ws://`）。产品上应默认保留令牌，
+> 仅在隔离的实验网络中临时关闭；关闭后请用 `@s token` 重新生成并重新下发。
+> 详细部署建议见[开发指南](DEVELOPMENT.zh-CN.md#uart-over-websocket局域网桥)。
 
 ## 9. 推荐接入顺序
 

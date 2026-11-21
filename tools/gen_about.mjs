@@ -38,15 +38,15 @@ const VENDORED_WEB = [
  * Versions other than Zephyr's own are the ones that manifest pins, and the
  * allowlist says so. */
 const FIRMWARE = [
-  { name: "Zephyr RTOS", version: "4.4.1", license: "Apache-2.0",
+  { name: "Zephyr RTOS", version: "4.5.0", license: "Apache-2.0",
     url: "https://github.com/zephyrproject-rtos/zephyr" },
-  { name: "HAL for Espressif SoCs", version: "pinned by Zephyr 4.4.1", license: "Apache-2.0",
+  { name: "HAL for Espressif SoCs", version: "pinned by Zephyr 4.5.0", license: "Apache-2.0",
     url: "https://github.com/zephyrproject-rtos/hal_espressif" },
-  { name: "Mbed TLS", version: "pinned by Zephyr 4.4.1", license: "Apache-2.0",
+  { name: "Mbed TLS", version: "pinned by Zephyr 4.5.0", license: "Apache-2.0",
     url: "https://github.com/zephyrproject-rtos/mbedtls" },
-  { name: "TF-PSA-Crypto", version: "pinned by Zephyr 4.4.1", license: "Apache-2.0",
+  { name: "TF-PSA-Crypto", version: "pinned by Zephyr 4.5.0", license: "Apache-2.0",
     url: "https://github.com/zephyrproject-rtos/tf-psa-crypto" },
-  { name: "hostap", version: "pinned by Zephyr 4.4.1", license: "BSD-3-Clause",
+  { name: "hostap", version: "pinned by Zephyr 4.5.0", license: "BSD-3-Clause",
     url: "https://github.com/zephyrproject-rtos/hostap" },
 ];
 
@@ -59,6 +59,11 @@ const ASSETS = [
     url: "https://github.com/linuxdeepin/deepin-desktop-theme",
     changes: "Three cursor shapes extracted from the XCursor bundles and converted to PNG.",
     licenseFile: "vendor/macaron-cursors/LICENSE-CC-BY-4.0.txt" },
+  { name: "BabelStone Pseudographica (subset)", version: "16.0.0", license: "OFL-1.1",
+    author: "Andrew West",
+    url: "https://www.babelstone.co.uk/Fonts/Pseudographica.html",
+    changes: "Subset to U+1CC00–U+1CEBF and U+1FB00–U+1FBFF, scaled horizontally to half-width for terminal cells, and renamed Linkr Legacy Computing.",
+    licenseFile: "fonts/OFL.txt" },
 ];
 
 const CONTRIBUTORS = [
