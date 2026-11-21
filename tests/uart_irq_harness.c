@@ -7,7 +7,10 @@
 #define ARG_UNUSED(x) (void)(x)
 #define IS_ENABLED(x) 0
 struct device { int unused; };
+typedef int atomic_val_t;
 static int uart_rx_ring, uart_rx_dropped, uart_rx_sem;
+/* Panel throughput counter touched by the production ISR. */
+static int bridge_rx_delta;
 static uint8_t incoming[100], queued[80];
 static size_t read_bytes, queued_bytes;
 static unsigned int updates;
@@ -61,6 +64,8 @@ int main(void)
 	assert(read_bytes == 100 && queued_bytes == 80);
 	assert(memcmp(queued, incoming, sizeof(queued)) == 0);
 	assert(uart_rx_dropped == 20 && uart_rx_sem == 2 && updates == 3);
+	/* Only bytes that reached the ring count toward the panel rate. */
+	assert(bridge_rx_delta == 80);
 	/* An interrupt with no RX bytes does not fabricate data or a wakeup. */
 	uart_rx_irq_callback(&dev, NULL);
 	assert(updates == 4 && uart_rx_dropped == 20 && uart_rx_sem == 2);
