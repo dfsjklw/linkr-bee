@@ -969,7 +969,7 @@ class TerminalGeometryTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(terminal.looks_like_shell_prompt(text))
 
-        web = (ROOT / "web/terminal_geometry.js").read_text()
+        web = (ROOT / "web/terminal_geometry.js").read_text(encoding="utf-8")
         self.assertIn('new Set(["$", "#", "%", ">", "→", "❯", "›"])', web)
         self.assertIn('line[line.length - 2]', web)
 
