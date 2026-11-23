@@ -15,9 +15,10 @@
  * @brief Queue raw UART bytes for display on the panel.
  *
  * Safe to call from the UART interrupt handler: the bytes are copied into a
- * small lock-protected ring and rendered by a delayed work item, so a full
- * ring drops the newest bytes instead of blocking the ISR. Non-printable and
- * non-ASCII bytes are rendered as '.'.
+ * lock-protected ring and rendered by a delayed work item, so the ISR never
+ * blocks. When the ring is full the oldest bytes are discarded, keeping the
+ * newest output on screen. Non-printable and non-ASCII bytes are rendered as
+ * '.'.
  */
 void linkr_terminal_feed(const uint8_t *data, size_t len);
 

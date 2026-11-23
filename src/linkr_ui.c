@@ -22,11 +22,13 @@
  *   y=196  feedback line
  *   y=248  PAIR / BAUD / TERM buttons (72x52)
  *
- * Page 1 (LINKR_UI_PAGE_TERMINAL) is the serial terminal only, 22 rows of
- * 10 px text plus a bar and three view-only buttons (CLR / FOL / STAT).
+ * Page 1 (LINKR_UI_PAGE_TERMINAL) is the serial terminal only: a status bar and
+ * a rounded card holding a fixed 24 x 38 grid of 10 px text. linkr_terminal.c
+ * scrolls its own text buffer, so the labels never scroll and the page needs
+ * no touch handling.
  *
- * Both pages are tiles of one lv_tileview, so a horizontal drag switches
- * pages while a vertical drag inside the terminal still scrolls history.
+ * Both pages are full-screen containers toggled with LV_OBJ_FLAG_HIDDEN, not
+ * tiles of an lv_tileview: see ui_build() for why.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -739,23 +741,29 @@ void linkr_ui_terminal_unread(bool unread)
 #endif
 }
 
-void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
+void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
+				 uint8_t count)
 {
-	lv_obj_t *line;
-
-	if (row >= LINKR_TERM_HISTORY || text == NULL) {
+	if (texts == NULL || colors == NULL) {
 		return;
 	}
-	line = term_lines[row];
-	if (line == NULL) {
-		return;
+	if (count > LINKR_TERM_HISTORY) {
+		count = LINKR_TERM_HISTORY;
 	}
 
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_lock();
 #endif
-	lv_obj_set_style_text_color(line, lv_color_hex(term_palette[color & 0x0FU]), 0);
-	lv_label_set_text(line, text);
+	for (uint8_t row = 0U; row < count; row++) {
+		lv_obj_t *line = term_lines[row];
+
+		if (line == NULL || texts[row] == NULL) {
+			continue;
+		}
+		lv_obj_set_style_text_color(line,
+					    lv_color_hex(term_palette[colors[row] & 0x0FU]), 0);
+		lv_label_set_text(line, texts[row]);
+	}
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
@@ -824,11 +832,12 @@ void linkr_ui_terminal_unread(bool unread)
 	ARG_UNUSED(unread);
 }
 
-void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color)
+void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
+				 uint8_t count)
 {
-	ARG_UNUSED(row);
-	ARG_UNUSED(text);
-	ARG_UNUSED(color);
+	ARG_UNUSED(texts);
+	ARG_UNUSED(colors);
+	ARG_UNUSED(count);
 }
 
 #endif /* CONFIG_LINKR_LCD && CONFIG_LVGL */

@@ -100,12 +100,17 @@ void linkr_ui_set_terminal_bar(const char *text);
 void linkr_ui_terminal_unread(bool unread);
 
 /**
- * @brief Replace one terminal line.
+ * @brief Replace several terminal lines in one LVGL transaction.
  *
- * @param row   Line index, 0 .. LINKR_TERM_ROWS-1.
- * @param text  NUL-terminated text, at most LINKR_TERM_COLS characters.
- * @param color ANSI palette index (0-15); the palette lives in linkr_ui.c.
+ * The terminal pushes a whole scroll as one batch: taking the LVGL lock per
+ * line let the renderer insert a full-page frame between two rows, so the
+ * view fell behind the target instead of tracking it.
+ *
+ * @param texts  Per-row strings; a NULL entry leaves that row unchanged.
+ * @param colors ANSI palette index per row (0-15), read where texts[row] != NULL.
+ * @param count  Number of entries, at most LINKR_TERM_ROWS.
  */
-void linkr_ui_terminal_set_line(uint8_t row, const char *text, uint8_t color);
+void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
+				 uint8_t count);
 
 #endif /* LINKR_UI_H_ */
