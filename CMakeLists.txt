@@ -65,6 +65,7 @@ target_sources_ifdef(CONFIG_LINKR_BLE_BRIDGE_WATCHDOG app PRIVATE src/watchdog.c
 if(CONFIG_LINKR_LCD)
   target_sources(app PRIVATE
     src/board_io.c
+    src/fonts/lv_font_consola_7.c
     src/fonts/lv_font_consola_10.c
     src/fonts/lv_font_consola_14.c
     src/linkr_display.c

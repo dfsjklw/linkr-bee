@@ -25,9 +25,23 @@
  * rounded card frame as the status page, and 25 rows would push the card past
  * the bottom edge.
  */
-#define LINKR_TERM_ROWS    24
-#define LINKR_TERM_HISTORY LINKR_TERM_ROWS
-#define LINKR_TERM_COLS    38
+/* Two grids share the page: the normal 38x24 log view (Consolas 10) and a
+ * 60x33 view (Consolas 7) for full-screen TUIs such as htop. The mode is
+ * RAM-only and toggled by the @u? management query; see
+ * linkr_terminal_set_wide().
+ */
+#define LINKR_TERM_COLS_NARROW 38
+#define LINKR_TERM_COLS_WIDE   60
+#define LINKR_TERM_COLS_MAX    LINKR_TERM_COLS_WIDE
+#define LINKR_TERM_COLS        LINKR_TERM_COLS_NARROW
+
+#define LINKR_TERM_ROWS_NARROW 24
+#define LINKR_TERM_ROWS_WIDE   33
+#define LINKR_TERM_ROWS_MAX    LINKR_TERM_ROWS_WIDE
+/* The UI builds one label per possible row; the mode decides how many are
+ * visible. */
+#define LINKR_TERM_HISTORY     LINKR_TERM_ROWS_MAX
+#define LINKR_TERM_ROWS        LINKR_TERM_ROWS_NARROW
 
 /** @brief Tile indices of the two-page view. */
 #define LINKR_UI_PAGE_STATUS   0U
@@ -100,17 +114,28 @@ void linkr_ui_set_terminal_bar(const char *text);
 void linkr_ui_terminal_unread(bool unread);
 
 /**
- * @brief Replace several terminal lines in one LVGL transaction.
+ * @brief Redraw the terminal grid from the per-cell buffer.
  *
- * The terminal pushes a whole scroll as one batch: taking the LVGL lock per
- * line let the renderer insert a full-page frame between two rows, so the
- * view fell behind the target instead of tracking it.
+ * The panel renders the grid into an RGB565 canvas: one rectangle per run of
+ * equal background colour and one text run per foreground colour. Full
+ * programs such as htop therefore keep their per-cell colours.
  *
- * @param texts  Per-row strings; a NULL entry leaves that row unchanged.
- * @param colors ANSI palette index per row (0-15), read where texts[row] != NULL.
- * @param count  Number of entries, at most LINKR_TERM_ROWS.
+ * @param rows   Grid rows to draw, at most the active row count.
+ * @param cols   Grid columns to draw, at most the active column count.
+ * @param cells  Row-major characters with @p stride bytes per row.
+ * @param stride Bytes per row in @p cells (a NUL-terminated line buffer).
+ * @param fg     Row-major palette index per cell, row * LINKR_TERM_COLS_MAX + col.
+ * @param bg     Row-major background index per cell, 0xFF for none.
  */
-void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
-				 uint8_t count);
+void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
+			      size_t stride, const uint8_t *fg, const uint8_t *bg);
+
+/**
+ * @brief Switch the terminal grid between the narrow and 48-column layout.
+ *
+ * Changes the font and row padding of all LINKR_TERM_ROWS labels. Call it
+ * before pushing the rows again, so the batch is laid out at the new width.
+ */
+void linkr_ui_terminal_set_geometry(bool wide);
 
 #endif /* LINKR_UI_H_ */

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * LVGL two-page screen for the Waveshare ESP32-C5-Touch-LCD-2.8.
  *
  * Page 0 (LINKR_UI_PAGE_STATUS, default) is the status and control page. It
@@ -69,9 +69,11 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
  * page keeps Consolas 10: column alignment matters there.
  */
 LV_FONT_DECLARE(lv_font_consola_10);
+LV_FONT_DECLARE(lv_font_consola_7);
 
 #define UI_FONT      (&lv_font_montserrat_14)
-#define UI_TERM_FONT (&lv_font_consola_10)
+#define UI_TERM_FONT        (&lv_font_consola_10)
+#define UI_TERM_FONT_WIDE   (&lv_font_consola_7)
 
 /* Material-ish dark palette (taken from the web client's DESIGN.md). */
 #define UI_CARD_BG     0x151B26U
@@ -129,8 +131,17 @@ LV_FONT_DECLARE(lv_font_consola_10);
 #define UI_TERM_BAR_Y    0
 #define UI_TERM_CARD_Y   18
 #define UI_TERM_CARD_H   300
+/* Wide mode uses the full panel width: 62 columns at the 7 px face's
+ * 3.875 px advance need 240.25 px, so the card loses its side margins and
+ * the text starts at the very edge.
+ */
+#define UI_TERM_CARD_X_WIDE 0
+#define UI_TERM_CARD_W_WIDE 240
+#define UI_TERM_X_WIDE      0
+#define UI_TERM_WIDTH_WIDE  240
 #define UI_TERM_Y        20
 #define UI_TERM_PITCH    12
+#define UI_TERM_PITCH_WIDE 9
 #define UI_TERM_X        6
 #define UI_TERM_WIDTH    228
 
@@ -168,8 +179,24 @@ static lv_obj_t *feedback_label;
 static lv_obj_t *tri_label;
 static lv_obj_t *unread_dot;
 static lv_obj_t *term_bar;
+static lv_obj_t *term_card;
 static lv_obj_t *term_cont;
-static lv_obj_t *term_lines[LINKR_TERM_HISTORY];
+static lv_obj_t *term_canvas;
+static const lv_font_t *term_font;
+static uint8_t term_rows;
+static uint8_t term_cols;
+static lv_coord_t term_pitch;
+static lv_coord_t term_line_h;
+static lv_coord_t term_adv;
+
+/* RGB565 canvas for the whole terminal grid. The wide grid is 240 x 297 px;
+ * the buffer is shared by both grids and lives in PSRAM next to the LVGL
+ * heap.
+ */
+#define UI_TERM_CANVAS_W 240
+#define UI_TERM_CANVAS_H 297
+static uint8_t term_canvas_buf[UI_TERM_CANVAS_W * UI_TERM_CANVAS_H * 2U]
+	__attribute__((section(".linkr_psram")));
 
 static bool link_state[LINKR_UI_LINK_COUNT];
 
@@ -192,7 +219,7 @@ static lv_obj_t *ui_add_label(lv_obj_t *parent, const char *text, uint32_t color
 }
 
 /* A Material-style rounded card: padded, 1 px border, no shadow. */
-static void ui_add_card(lv_obj_t *parent, int32_t y, int32_t h)
+static lv_obj_t *ui_add_card(lv_obj_t *parent, int32_t y, int32_t h)
 {
 	lv_obj_t *card = lv_obj_create(parent);
 
@@ -205,6 +232,7 @@ static void ui_add_card(lv_obj_t *parent, int32_t y, int32_t h)
 	lv_obj_set_style_border_width(card, 1, 0);
 	lv_obj_set_style_border_color(card, lv_color_hex(UI_CARD_BORDER), 0);
 	lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	return card;
 }
 
 /* Section header: a symbol glyph plus an upper-case label, dimmed so the
@@ -510,45 +538,35 @@ static void ui_build_terminal_page(void)
 
 	/* One rounded card holds the whole terminal, matching the cards on the
 	 * status page. */
-	ui_add_card(page_term_obj, UI_TERM_CARD_Y, UI_TERM_CARD_H);
+	term_card = ui_add_card(page_term_obj, UI_TERM_CARD_Y, UI_TERM_CARD_H);
 
-	/* Fixed terminal grid: exactly LINKR_TERM_ROWS labels, no scrolling and
-	 * no scrollback. linkr_terminal.c scrolls the text buffer itself, so the
-	 * view always shows live output and the page needs no touch handling.
+	/* One canvas renders the whole grid: full-screen programs need per-cell
+	 * foreground and background colours, which per-row labels cannot express.
 	 */
 	term_cont = lv_obj_create(page_term_obj);
-	lv_obj_set_size(term_cont, UI_TERM_WIDTH, LINKR_TERM_ROWS * UI_TERM_PITCH);
+	lv_obj_set_size(term_cont, UI_TERM_WIDTH, LINKR_TERM_ROWS_NARROW * UI_TERM_PITCH);
 	lv_obj_set_pos(term_cont, UI_TERM_X, UI_TERM_Y);
 	lv_obj_set_style_bg_opa(term_cont, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(term_cont, 0, 0);
 	lv_obj_set_style_radius(term_cont, 0, 0);
 	lv_obj_set_style_pad_all(term_cont, 0, 0);
 	lv_obj_clear_flag(term_cont, LV_OBJ_FLAG_SCROLLABLE);
-	/* Let a horizontal swipe that starts inside the terminal bubble up to the
-	 * page, where the gesture handler lives.
-	 */
 	lv_obj_add_flag(term_cont, LV_OBJ_FLAG_EVENT_BUBBLE);
-	/* Flex column instead of manual y offsets: the labels stack by
-	 * themselves, so a bad offset cannot collapse every line onto the same
-	 * row (which looked like "only the last line updates").
-	 */
-	lv_obj_set_layout(term_cont, LV_LAYOUT_FLEX);
-	lv_obj_set_flex_flow(term_cont, LV_FLEX_FLOW_COLUMN);
-	lv_obj_set_style_pad_row(term_cont, UI_TERM_PITCH - 11, 0);
 
-	for (uint8_t row = 0U; row < LINKR_TERM_HISTORY; row++) {
-		lv_obj_t *line = lv_label_create(term_cont);
+	term_font = UI_TERM_FONT;
+	term_rows = LINKR_TERM_ROWS_NARROW;
+	term_cols = LINKR_TERM_COLS_NARROW;
+	term_pitch = UI_TERM_PITCH;
+	term_line_h = 11;
+	term_adv = 88;
 
-		/* Seed with a space, not "": an empty label has zero height, which
-		 * made the flex column stack every line onto the same row.
-		 */
-		lv_label_set_text(line, " ");
-		lv_label_set_long_mode(line, LV_LABEL_LONG_CLIP);
-		lv_obj_set_style_text_font(line, UI_TERM_FONT, 0);
-		lv_obj_set_style_text_color(line, lv_color_hex(term_palette[7]), 0);
-		lv_obj_set_width(line, UI_TERM_WIDTH);
-		term_lines[row] = line;
-	}
+	term_canvas = lv_canvas_create(term_cont);
+	lv_obj_set_pos(term_canvas, 0, 0);
+	lv_canvas_set_buffer(term_canvas, term_canvas_buf, UI_TERM_WIDTH,
+			     LINKR_TERM_ROWS_NARROW * UI_TERM_PITCH,
+			     LV_COLOR_FORMAT_RGB565);
+	lv_obj_clear_flag(term_canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(term_canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
 static void ui_build(void)
@@ -741,29 +759,132 @@ void linkr_ui_terminal_unread(bool unread)
 #endif
 }
 
-void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
-				 uint8_t count)
+void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
+			      size_t stride, const uint8_t *fg, const uint8_t *bg)
 {
-	if (texts == NULL || colors == NULL) {
+	/* Draw tasks reference the label text until the layer is finished, so
+	 * every run's text is copied into one frame arena first. Worst case is
+	 * one run per cell (a colour change on every column), which needs one
+	 * character plus a NUL each.
+	 */
+	static char run_text[LINKR_TERM_ROWS_MAX * LINKR_TERM_COLS_MAX * 2U];
+	size_t run_used = 0U;
+	lv_layer_t layer;
+
+	if (term_canvas == NULL || fg == NULL || bg == NULL) {
 		return;
 	}
-	if (count > LINKR_TERM_HISTORY) {
-		count = LINKR_TERM_HISTORY;
+	if (rows > term_rows) {
+		rows = term_rows;
+	}
+	if (cols > term_cols) {
+		cols = term_cols;
 	}
 
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_lock();
 #endif
-	for (uint8_t row = 0U; row < count; row++) {
-		lv_obj_t *line = term_lines[row];
+	lv_canvas_fill_bg(term_canvas, lv_color_hex(UI_CARD_BG), LV_OPA_COVER);
+	lv_canvas_init_layer(term_canvas, &layer);
 
-		if (line == NULL || texts[row] == NULL) {
-			continue;
+	for (uint8_t row = 0U; row < rows; row++) {
+		lv_coord_t y = (lv_coord_t)(row * term_pitch);
+		uint8_t col = 0U;
+
+		while (col < cols) {
+			size_t index = (size_t)row * LINKR_TERM_COLS_MAX + col;
+			uint8_t f = fg[index];
+			uint8_t b = bg[index];
+			uint8_t end = (uint8_t)(col + 1U);
+
+			/* One run per colour pair: full-screen programs change colour
+			 * per column but the text between changes is contiguous.
+			 */
+			while (end < cols) {
+				size_t next = (size_t)row * LINKR_TERM_COLS_MAX + end;
+
+				if (fg[next] != f || bg[next] != b) {
+					break;
+				}
+				end++;
+			}
+
+			lv_coord_t x0 = (lv_coord_t)(((int32_t)col * term_adv) >> 4);
+			lv_coord_t x1 = (lv_coord_t)(((int32_t)end * term_adv) >> 4);
+			lv_area_t area = { x0, y, (lv_coord_t)(x1 - 1), (lv_coord_t)(y + term_line_h - 1) };
+
+			if (b != 0xFFU) {
+				lv_draw_rect_dsc_t rdsc;
+
+				lv_draw_rect_dsc_init(&rdsc);
+				rdsc.bg_color = lv_color_hex(term_palette[b & 0x0FU]);
+				rdsc.bg_opa = LV_OPA_COVER;
+				lv_draw_rect(&layer, &rdsc, &area);
+			}
+
+			size_t len = (size_t)(end - col);
+
+			if (run_used + len + 1U > sizeof(run_text)) {
+				break;
+			}
+			memcpy(&run_text[run_used], &cells[(size_t)row * stride + col], len);
+			run_text[run_used + len] = '\0';
+
+			lv_draw_label_dsc_t ldsc;
+
+			lv_draw_label_dsc_init(&ldsc);
+			ldsc.color = lv_color_hex(term_palette[f & 0x0FU]);
+			ldsc.font = term_font;
+			ldsc.text = &run_text[run_used];
+			run_used += len + 1U;
+			lv_draw_label(&layer, &ldsc, &area);
+			col = end;
 		}
-		lv_obj_set_style_text_color(line,
-					    lv_color_hex(term_palette[colors[row] & 0x0FU]), 0);
-		lv_label_set_text(line, texts[row]);
 	}
+
+	lv_canvas_finish_layer(term_canvas, &layer);
+	lv_obj_invalidate(term_canvas);
+#if defined(CONFIG_LV_Z_LVGL_MUTEX)
+	lvgl_unlock();
+#endif
+}
+
+void linkr_ui_terminal_set_geometry(bool wide)
+{
+	lv_coord_t width;
+	lv_coord_t height;
+
+	if (term_cont == NULL || term_canvas == NULL) {
+		return;
+	}
+
+	term_font = wide ? UI_TERM_FONT_WIDE : UI_TERM_FONT;
+	term_pitch = wide ? UI_TERM_PITCH_WIDE : UI_TERM_PITCH;
+	term_line_h = wide ? 8 : 11;
+	term_rows = wide ? LINKR_TERM_ROWS_WIDE : LINKR_TERM_ROWS_NARROW;
+	term_cols = wide ? LINKR_TERM_COLS_WIDE : LINKR_TERM_COLS_NARROW;
+	/* Advance in 1/16 px, straight from the generated font tables:
+	 * Consolas 10 is 88 (5.5 px), Consolas 7 is 62 (3.875 px).
+	 */
+	term_adv = wide ? 62 : 88;
+	width = wide ? UI_TERM_WIDTH_WIDE : UI_TERM_WIDTH;
+	height = (lv_coord_t)term_rows * term_pitch;
+
+#if defined(CONFIG_LV_Z_LVGL_MUTEX)
+	lvgl_lock();
+#endif
+	if (term_card != NULL) {
+		lv_obj_set_pos(term_card, wide ? UI_TERM_CARD_X_WIDE : UI_CARD_X,
+			       UI_TERM_CARD_Y);
+		lv_obj_set_size(term_card, wide ? UI_TERM_CARD_W_WIDE : UI_CARD_W,
+				UI_TERM_CARD_H);
+		lv_obj_set_style_radius(term_card, wide ? 0 : UI_CARD_RADIUS, 0);
+	}
+	lv_obj_set_pos(term_cont, wide ? UI_TERM_X_WIDE : UI_TERM_X, UI_TERM_Y);
+	lv_obj_set_size(term_cont, width, height);
+	lv_canvas_set_buffer(term_canvas, term_canvas_buf, width, height,
+			     LV_COLOR_FORMAT_RGB565);
+	lv_obj_update_layout(term_cont);
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
@@ -832,12 +953,20 @@ void linkr_ui_terminal_unread(bool unread)
 	ARG_UNUSED(unread);
 }
 
-void linkr_ui_terminal_set_lines(const char *const *texts, const uint8_t *colors,
-				 uint8_t count)
+void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
+			      size_t stride, const uint8_t *fg, const uint8_t *bg)
 {
-	ARG_UNUSED(texts);
-	ARG_UNUSED(colors);
-	ARG_UNUSED(count);
+	ARG_UNUSED(rows);
+	ARG_UNUSED(cols);
+	ARG_UNUSED(cells);
+	ARG_UNUSED(stride);
+	ARG_UNUSED(fg);
+	ARG_UNUSED(bg);
+}
+
+void linkr_ui_terminal_set_geometry(bool wide)
+{
+	ARG_UNUSED(wide);
 }
 
 #endif /* CONFIG_LINKR_LCD && CONFIG_LVGL */

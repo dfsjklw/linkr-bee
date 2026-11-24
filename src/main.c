@@ -1830,6 +1830,7 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 			    data[1] == 'd' || data[1] == 's' ||
 			    data[1] == 'a' || data[1] == 'n' ||
 			    data[1] == 'l' || data[1] == 'o' || data[1] == 'r' ||
+			    data[1] == 'g' ||
 			    data[1] == 'p' || data[1] == 'y') &&
 			   (len == 2 || data[2] == '?' ||
 			    data[2] == '=' || data[2] == ' ')) {
@@ -1861,7 +1862,7 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	bool readonly = !strcmp(body, "h") || !strcmp(body, "help") ||
 		!strcmp(body, "aux") ||
 		!strcmp(body, "i?") || !strcmp(body, "info?") ||
-		!strcmp(body, "u?") || !strcmp(body, "uart?") ||
+		!strcmp(body, "u?") || !strcmp(body, "uart?") || !strcmp(body, "g?") ||
 		!strcmp(body, "n?") || !strcmp(body, "name?") ||
 		!strcmp(body, "a?") || !strcmp(body, "autobaud?") ||
 		!strcmp(body, "w?") || !strcmp(body, "wifi?") ||
@@ -2065,8 +2066,24 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	}
 #endif /* LINKR_UART_AUTOBAUD */
 
+	/* ---- LCD grid query (@g?) ---- */
+	if (!strcmp(body, "g?")) {
+		(void)send_control_response(conn, "OK lcd=%ux%u wide=%u\r\n",
+					    (unsigned int)linkr_terminal_cols(),
+					    (unsigned int)linkr_terminal_rows(),
+					    (unsigned int)linkr_terminal_wide());
+		return true;
+	}
+
 	/* ---- UART (@u / @linkr uart) ---- */
 	if (!strcmp(body, "uart?") || !strcmp(body, "u?")) {
+		/* Feature toggle for the panel: every UART query flips the
+		 * terminal grid between 38 and 60 columns so a full-screen TUI
+		 * can be sized for the LCD. Deliberately unguarded -- it only
+		 * changes how the panel renders the mirrored stream, never the
+		 * target UART or its tty size.
+		 */
+		linkr_terminal_set_wide(!linkr_terminal_wide());
 		(void)uart_status_response(conn, "OK");
 		return true;
 	}
@@ -2562,6 +2579,7 @@ static void uart_to_ble_thread(void)
 	uint8_t buf[UART_RX_CHUNK];
 	size_t len = 0;
 	int64_t last_rx = 0;
+	int64_t last_tail_poll = 0;
 	bool accounted = false;
 
 	k_sem_take(&bridge_start_sem, K_FOREVER);
@@ -2602,6 +2620,44 @@ static void uart_to_ble_thread(void)
 			last_rx = k_uptime_get();
 
 			continue;
+		}
+
+		/* The C5 UART can leave the tail of a burst in the FIFO when no
+		 * further byte arrives to re-trigger the RX interrupt. Poll the
+		 * FIFO every 50 ms to deliver that tail to both consumers; the
+		 * interval is short enough to keep a prompt/echo current and long
+		 * enough not to spin on an empty FIFO.
+		 */
+		int64_t now = k_uptime_get();
+
+		if (now - last_tail_poll >= 50) {
+			uint8_t tail[32];
+			int tail_len;
+
+			last_tail_poll = now;
+			key = irq_lock();
+			uart_irq_update(bridge_uart);
+			tail_len = uart_irq_rx_ready(bridge_uart) ?
+				uart_fifo_read(bridge_uart, tail, sizeof(tail)) : 0;
+			irq_unlock(key);
+
+			if (tail_len > 0) {
+				uint32_t written = ring_buf_put(&uart_rx_ring, tail,
+								(uint32_t)tail_len);
+
+				if (written < (uint32_t)tail_len) {
+					atomic_add(&uart_rx_dropped,
+						   (uint32_t)tail_len - written);
+				}
+				if (written > 0U) {
+					atomic_add(&bridge_rx_delta, (atomic_val_t)written);
+				}
+#if defined(CONFIG_LINKR_LCD)
+				linkr_terminal_feed(tail, (size_t)tail_len);
+#endif
+				signal_uart_activity();
+				last_rx = k_uptime_get();
+			}
 		}
 
 		if (len > 0 &&

@@ -33,4 +33,22 @@ bool linkr_terminal_unread(void);
 /** @brief Forget the unread flag; the terminal page is now on screen. */
 void linkr_terminal_unread_clear(void);
 
+/**
+ * @brief Switch the panel grid between 38x24 and 60x33.
+ *
+ * RAM-only: the next boot starts narrow again. This changes only how the
+ * panel renders the mirrored stream; the target's tty keeps whatever size
+ * the host gave it with stty.
+ */
+void linkr_terminal_set_wide(bool wide);
+
+/** @brief True while the 60-column grid is active. */
+bool linkr_terminal_wide(void);
+
+/** @brief Active column count (38 or 60). */
+uint8_t linkr_terminal_cols(void);
+
+/** @brief Active row count (24 or 32). */
+uint8_t linkr_terminal_rows(void);
+
 #endif /* LINKR_TERMINAL_H_ */
