@@ -2579,7 +2579,9 @@ static void uart_to_ble_thread(void)
 	uint8_t buf[UART_RX_CHUNK];
 	size_t len = 0;
 	int64_t last_rx = 0;
+#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
 	int64_t last_tail_poll = 0;
+#endif
 	bool accounted = false;
 
 	k_sem_take(&bridge_start_sem, K_FOREVER);
@@ -2622,11 +2624,13 @@ static void uart_to_ble_thread(void)
 			continue;
 		}
 
-		/* The C5 UART can leave the tail of a burst in the FIFO when no
-		 * further byte arrives to re-trigger the RX interrupt. Poll the
-		 * FIFO every 50 ms to deliver that tail to both consumers; the
-		 * interval is short enough to keep a prompt/echo current and long
-		 * enough not to spin on an empty FIFO.
+#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
+		/* The newer ESP32 UART IP can leave the tail of a burst in the
+		 * FIFO when no further byte arrives to re-trigger the RX
+		 * interrupt. Poll the FIFO every 50 ms to deliver that tail to
+		 * both consumers; the interval is short enough to keep a
+		 * prompt/echo current and long enough not to spin on an empty
+		 * FIFO. Older ESP32 variants do not need this and compile it out.
 		 */
 		int64_t now = k_uptime_get();
 
@@ -2659,6 +2663,7 @@ static void uart_to_ble_thread(void)
 				last_rx = k_uptime_get();
 			}
 		}
+#endif /* CONFIG_LINKR_UART_RX_TAIL_POLL */
 
 		if (len > 0 &&
 		    k_uptime_get() - last_rx >= CONFIG_LINKR_BLE_BRIDGE_UART_IDLE_MS) {
