@@ -349,9 +349,10 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   饿死优先级 7 的 RX 消费线程、把 4 KB RX 环挤满。
 - 1.5 Mbaud 下仍有一个**未解决**的 UART RX 尾字节滞留：短提示符/回显的最后
   几个字节要等下一次输出才出现。**只在 C5 LCD 构建出现，非 LCD 的 C5 DevKitC
-  不出现**；因此本板启用 50 ms 轮询 `CONFIG_LINKR_UART_RX_TAIL_POLL=y`
-  （Kconfig 默认 n），但它不保证取到尾部。临时规避：重新应用一次 UART 设置
-  （`@u=...`）或降低波特率。现象、取证与对照实验见
+  不出现**；因此本板启用每字节 RX 中断（`CONFIG_UART_ESP32_RX_FIFO_THRESH=1`）
+  和 50 ms 轮询 `CONFIG_LINKR_UART_RX_TAIL_POLL=y`（后者 Kconfig 默认 n），
+  但它们不保证完全解决。临时规避：重新应用一次 UART 设置（`@u=...`）或降低
+  波特率。现象、取证与对照实验见
   [ISSUE_C5_UART_RX_TAIL.md](ISSUE_C5_UART_RX_TAIL.md)。
 - 清屏功能已按要求移除（连同上滑回看与 CLR/FOL/STAT 三个按钮）；`CLR` 曾经
   清理的只是面板视图，现在由"内容自然上移"取代。
