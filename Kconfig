@@ -931,17 +931,6 @@ config LINKR_LCD_BACKLIGHT_DEFAULT
 	  0 leaves the panel dark (useful while the ST7789 init sequence is
 	  being validated); 255 is full brightness.
 
-config LINKR_UART_RX_TAIL_POLL
-	bool "Poll the UART RX FIFO for a stuck tail"
-	default y if SOC_ESP32C5 || SOC_ESP32C6 || SOC_ESP32H2
-	help
-	  The newer ESP32 UART IP (C5/C6/H2) can leave the last bytes of a
-	  burst in the RX FIFO when the hardware RX timeout does not fire;
-	  those bytes then wait for the next byte before the BLE path or the
-	  panel sees them. Poll the FIFO every 50 ms on those SoCs and feed
-	  the tail to both consumers. Older ESP32 variants use the direct
-	  RX timeout registers and do not need the workaround.
-
 endmenu
 
 source "Kconfig.zephyr"

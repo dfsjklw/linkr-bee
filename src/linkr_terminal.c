@@ -94,6 +94,14 @@ static atomic_t unread;
 
 static struct k_work_delayable flush_work;
 
+/* The render must not run on the system workqueue: that queue is cooperative
+ * (CONFIG_SYSTEM_WORKQUEUE_PRIORITY=-1), so a long frame blocks the UART RX
+ * consumer (priority 7) and the 4 KB RX ring overflows at 1.5 Mbaud. Run it on
+ * a preemptible queue below the RX thread so the ring is always drained.
+ */
+K_THREAD_STACK_DEFINE(term_work_stack, 4096);
+static struct k_work_q term_work_q;
+
 /* Scrollback lives in PSRAM: 48 lines do not fit in internal SRAM next to the
  * BLE/WiFi stacks. boards/linkr_c5_lvgl_psram.ld places .linkr_psram in the
  * same window as the LVGL buffers.
@@ -1119,7 +1127,8 @@ void linkr_terminal_feed(const uint8_t *data, size_t len)
 	atomic_set(&unread, 1);
 
 	if (atomic_cas(&flush_pending, 0, 1)) {
-		(void)k_work_reschedule(&flush_work, K_MSEC(FLUSH_PERIOD_MS));
+		(void)k_work_reschedule_for_queue(&term_work_q, &flush_work,
+						  K_MSEC(FLUSH_PERIOD_MS));
 	}
 }
 
@@ -1181,6 +1190,8 @@ uint8_t linkr_terminal_rows(void)
 static int linkr_terminal_init(void)
 {
 	k_work_init_delayable(&flush_work, flush_handler);
+	k_work_queue_start(&term_work_q, term_work_stack,
+			   K_THREAD_STACK_SIZEOF(term_work_stack), 8, NULL);
 
 	/* Start with an empty grid. The old self-test banner (ANSI colour samples
 	 * plus 27 "line NN" lines) existed to exercise multi-line rendering and

@@ -344,10 +344,13 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   尾部缺失，重新配置 UART 后恢复）。现在 ISR 只做 `ring_buf_put + k_sem_give`，
   由 `uart_to_ble_thread` 在读出同一批字节时喂面板；非 LCD 构建本来就是这个
   ISR 形状，所以从未出现该问题。
-- 1.5 Mbaud 下 LCD 构建的终端渲染（直接写 canvas 的 PSRAM 像素）会占用 CPU/总线，
-  可能把 UART RX FIFO 的尾部字节挤掉（128 B 只有约 853 µs 余量）。因此
-  `CONFIG_LINKR_UART_RX_TAIL_POLL` 在 C5/C6/H2 上默认开启：每 50 ms 兜底读一次
-  FIFO，并同时喂 BLE 环和面板；非 LCD 构建不编译这段逻辑。
+- 终端 flush/render 跑在**专用可抢占工作队列**（优先级 8），LVGL 刷屏也在
+  独立的可抢占线程（优先级 8），避免 1.5 Mbaud 下协作式 system workqueue
+  饿死优先级 7 的 RX 消费线程、把 4 KB RX 环挤满。
+- 1.5 Mbaud 下仍有一个**未解决**的 UART RX 尾字节滞留：短提示符/回显的最后
+  几个字节要等下一次输出才出现。临时规避：重新应用一次 UART 设置（`@u=...`）
+  或降低波特率。现象、取证与对照实验见
+  [ISSUE_C5_UART_RX_TAIL.md](ISSUE_C5_UART_RX_TAIL.md)。
 - 清屏功能已按要求移除（连同上滑回看与 CLR/FOL/STAT 三个按钮）；`CLR` 曾经
   清理的只是面板视图，现在由"内容自然上移"取代。
 - **始终跟随最新输出**（`src/linkr_terminal.c`）：
