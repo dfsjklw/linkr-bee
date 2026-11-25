@@ -75,11 +75,10 @@ AHB/APB FIFO 路径；问题很可能落在 Zephyr `drivers/serial/uart_esp32.c`
     `src/linkr_terminal.c`；
   - LVGL 刷屏线程（优先级 8）：
     `boards/linkr_c5_touch_lcd.conf` 的 `CONFIG_LV_Z_FLUSH_THREAD*`。
-- C5 LCD 专用的缓解（均在 `boards/linkr_c5_touch_lcd.conf` 打开）：
+- C5 LCD 专用的缓解（在 `boards/linkr_c5_touch_lcd.conf` 打开）：
   - `CONFIG_UART_ESP32_RX_FIFO_THRESH=1`：每字节 RX 中断，短突发不再等 22 字节
-    阈值；1.5 Mbaud 下约 15 万次中断/秒，需关注 CPU 负载；
-  - `CONFIG_LINKR_UART_RX_TAIL_POLL`（50 ms 轮询）：兜底 FIFO 尾字节。两项都不
-    保证完全解决，仍需 UART 重配规避；
+    阈值；1.5 Mbaud 下约 15 万次中断/秒（实测 btop 约 66 KB/s 时约 6.6 万次/秒），
+    需关注 CPU 负载。50 ms 轮询与它功能重叠，已删除；
 - 已回退的实验：
   - 临时诊断（reliable write、stale ticket、UART RX hex）。
 - 相关提交：`1b6017e`（feed 移出 ISR）、`e4a7376`（轮询）、

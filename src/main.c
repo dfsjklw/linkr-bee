@@ -2581,9 +2581,6 @@ static void uart_to_ble_thread(void)
 	uint8_t buf[UART_RX_CHUNK];
 	size_t len = 0;
 	int64_t last_rx = 0;
-#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
-	int64_t last_tail_poll = 0;
-#endif
 	bool accounted = false;
 
 	k_sem_take(&bridge_start_sem, K_FOREVER);
@@ -2634,46 +2631,6 @@ static void uart_to_ble_thread(void)
 
 			continue;
 		}
-
-#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
-		/* The C5 UART can leave the tail of a burst in the FIFO when no
-		 * further byte arrives to re-trigger the RX interrupt. Poll the
-		 * FIFO every 50 ms and feed the tail to both consumers. This is
-		 * enabled only by the C5 LCD board; the non-LCD build does not
-		 * show the issue and compiles it out.
-		 */
-		int64_t now = k_uptime_get();
-
-		if (now - last_tail_poll >= 50) {
-			uint8_t tail[32];
-			int tail_len;
-
-			last_tail_poll = now;
-			key = irq_lock();
-			uart_irq_update(bridge_uart);
-			tail_len = uart_irq_rx_ready(bridge_uart) ?
-				uart_fifo_read(bridge_uart, tail, sizeof(tail)) : 0;
-			irq_unlock(key);
-
-			if (tail_len > 0) {
-				uint32_t written = ring_buf_put(&uart_rx_ring, tail,
-								(uint32_t)tail_len);
-
-				if (written < (uint32_t)tail_len) {
-					atomic_add(&uart_rx_dropped,
-						   (uint32_t)tail_len - written);
-				}
-				if (written > 0U) {
-					atomic_add(&bridge_rx_delta, (atomic_val_t)written);
-				}
-#if defined(CONFIG_LINKR_LCD)
-				linkr_terminal_feed(tail, (size_t)tail_len);
-#endif
-				signal_uart_activity();
-				last_rx = k_uptime_get();
-			}
-		}
-#endif /* CONFIG_LINKR_UART_RX_TAIL_POLL */
 
 		if (len > 0 &&
 		    k_uptime_get() - last_rx >= CONFIG_LINKR_BLE_BRIDGE_UART_IDLE_MS) {
