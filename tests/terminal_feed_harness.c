@@ -120,6 +120,32 @@ static inline int k_work_reschedule(struct k_work_delayable *work, int delay)
 	return 0;
 }
 
+struct k_work_q {
+	int unused;
+};
+
+#define K_THREAD_STACK_DEFINE(name, size) static uint8_t name[(size)]
+#define K_THREAD_STACK_SIZEOF(name) sizeof(name)
+
+static inline int k_work_queue_start(struct k_work_q *queue, void *stack,
+				     size_t size, int prio, const void *cfg)
+{
+	ARG_UNUSED(queue);
+	ARG_UNUSED(stack);
+	ARG_UNUSED(size);
+	ARG_UNUSED(prio);
+	ARG_UNUSED(cfg);
+	return 0;
+}
+
+static inline int k_work_reschedule_for_queue(struct k_work_q *queue,
+					      struct k_work_delayable *work,
+					      int delay)
+{
+	ARG_UNUSED(queue);
+	return k_work_reschedule(work, delay);
+}
+
 static int64_t fake_now;
 
 static inline int64_t k_uptime_get(void)
@@ -264,15 +290,15 @@ static void feed_lines(unsigned int first, unsigned int last)
 static void test_burst_keeps_the_newest_line(void)
 {
 	reset_state();
-	feed_lines(1U, 3000U);
+	feed_lines(1U, 6000U);
 	CHECK(atomic_get(&feed_dropped) > 0);
 
 	flush_handler(NULL);
 
 	CHECK(batch_calls == 1U);
-	CHECK(strcmp(last_visible_line(), "L3000") == 0);
-	CHECK(line_is((uint8_t)(linkr_terminal_rows() - 2U), "L3000"));
-	CHECK(line_is((uint8_t)(linkr_terminal_rows() - 3U), "L2999"));
+	CHECK(strcmp(last_visible_line(), "L6000") == 0);
+	CHECK(line_is((uint8_t)(linkr_terminal_rows() - 2U), "L6000"));
+	CHECK(line_is((uint8_t)(linkr_terminal_rows() - 3U), "L5999"));
 }
 
 /* A burst that fits must not report loss and must render every line. */
@@ -354,7 +380,7 @@ static void test_unterminated_osc_releases_the_parser(void)
  */
 static void test_overflow_resynchronises_the_parser(void)
 {
-	static char burst[6000];
+	static char burst[40000];
 
 	reset_state();
 	linkr_terminal_feed((const uint8_t *)"\x1b]0;title", 9);
@@ -366,6 +392,19 @@ static void test_overflow_resynchronises_the_parser(void)
 
 	flush_handler(NULL);
 	CHECK(strcmp(last_visible_line(), "AFTER") == 0);
+}
+
+static void test_utf8_box_characters(void)
+{
+	reset_state();
+	/* U+2500 box drawing, 'A', U+2588 full block, 'B': one cell each. */
+	linkr_terminal_feed((const uint8_t *)"\xe2\x94\x80" "A" "\xe2\x96\x88" "B", 8);
+	flush_handler(NULL);
+	CHECK(shown[0][0] == '-');
+	CHECK(shown[0][1] == 'A');
+	CHECK(shown[0][2] == '#');
+	CHECK(shown[0][3] == 'B');
+	CHECK(shown[0][4] == ' ');
 }
 
 /* The @u? toggle switches the grid between 38 and 80 columns. The width must
@@ -558,6 +597,7 @@ int main(void)
 	test_osc_title_is_skipped();
 	test_unterminated_osc_releases_the_parser();
 	test_overflow_resynchronises_the_parser();
+	test_utf8_box_characters();
 	test_width_switch();
 	test_cursor_and_erase();
 	test_line_editing();

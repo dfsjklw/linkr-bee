@@ -39,12 +39,11 @@ LOG_MODULE_REGISTER(linkr_terminal, CONFIG_LOG_DEFAULT_LEVEL);
 
 #if defined(CONFIG_LINKR_LCD) && defined(CONFIG_LVGL)
 
-/* 4 KB covers 355 ms at 115200 baud, so one 100 ms flush window plus a stuck
- * render still fits. The old 512 B ring held less than half of a single
- * 100 ms window at that baud rate, so a target printing at full speed always
- * lost most of its output.
+/* 32 KB: a full-screen btop frame at 1.5 Mbaud can be tens of kilobytes, and
+ * btop sustains ~66 KB/s, so a 4 KB ring (27 ms) drops most of a frame and
+ * garbles the layout. 32 KB covers ~480 ms at that rate.
  */
-#define FEED_RING_SIZE  4096U
+#define FEED_RING_SIZE  32768U
 #define FLUSH_PERIOD_MS 100U
 
 /* Log at most one overflow summary per 10 s: a saturated link drops
@@ -129,6 +128,8 @@ static enum parse_state state = PARSE_TEXT;
 static char csi[24];
 static size_t csi_len;
 static uint8_t osc_len;
+static uint32_t utf8_cp;
+static uint8_t utf8_len;
 
 /* Full-screen state: scroll region, DEC line-drawing charset and the
  * alternate screen used by btop/htop/ncurses. The saved screen lives in
@@ -897,6 +898,61 @@ static char dec_graphics_map(char c)
 	}
 }
 
+/* Terminals use many non-ASCII glyphs (btop draws with UTF-8 box, block,
+ * braille and arrow characters). The panel's 3x5 face is ASCII only, so
+ * decode the UTF-8 sequence and map it to one ASCII cell; otherwise every
+ * byte would become a separate '.' and the whole grid would drift right.
+ */
+static char utf8_to_ascii(uint32_t cp)
+{
+	if (cp < 0x80U) {
+		return (char)cp;
+	}
+	if (cp >= 0x2500U && cp <= 0x257FU) { /* box drawing */
+		if (cp == 0x2502U || cp == 0x2503U) {
+			return '|';
+		}
+		if (cp == 0x2500U || cp == 0x2501U) {
+			return '-';
+		}
+		if (cp == 0x2571U) {
+			return '/';
+		}
+		if (cp == 0x2572U) {
+			return 'X';
+		}
+		if (cp == 0x2573U) {
+			return 'X';
+		}
+		return '+';
+	}
+	if (cp >= 0x2580U && cp <= 0x259FU) { /* blocks */
+		return '#';
+	}
+	if (cp >= 0x2800U && cp <= 0x28FFU) { /* braille graphs */
+		return '#';
+	}
+	if (cp >= 0x25A0U && cp <= 0x25FFU) { /* geometric shapes */
+		return '#';
+	}
+	if (cp >= 0x2190U && cp <= 0x21FFU) { /* arrows */
+		switch (cp) {
+		case 0x2190U:
+			return '<';
+		case 0x2192U:
+			return '>';
+		case 0x2191U:
+			return '^';
+		case 0x2193U:
+			return 'v';
+		default:
+			return '-';
+		}
+	}
+	/* CJK and everything else: keep the column, draw nothing. */
+	return ' ';
+}
+
 static void term_put(char c)
 {
 	switch (state) {
@@ -940,6 +996,32 @@ static void term_put(char c)
 		}
 		if ((use_g1 ? g1_graphics : g0_graphics) && c >= 0x60 && c <= 0x7E) {
 			c = dec_graphics_map(c);
+		}
+		if (utf8_len > 0U) {
+			if (((uint8_t)c & 0xC0U) != 0x80U) {
+				utf8_len = 0U;
+			} else {
+				utf8_cp = (utf8_cp << 6) | ((uint8_t)c & 0x3FU);
+				if (--utf8_len == 0U) {
+					put_char(utf8_to_ascii(utf8_cp));
+				}
+				return;
+			}
+		}
+		if (((uint8_t)c & 0x80U) != 0U) {
+			uint8_t byte = (uint8_t)c;
+
+			if (byte >= 0xC2U && byte <= 0xDFU) {
+				utf8_cp = byte & 0x1FU;
+				utf8_len = 1U;
+			} else if (byte >= 0xE0U && byte <= 0xEFU) {
+				utf8_cp = byte & 0x0FU;
+				utf8_len = 2U;
+			} else if (byte >= 0xF0U && byte <= 0xF4U) {
+				utf8_cp = byte & 0x07U;
+				utf8_len = 3U;
+			}
+			return;
 		}
 		if ((c < 0x20) || (c > 0x7E)) {
 			c = '.';

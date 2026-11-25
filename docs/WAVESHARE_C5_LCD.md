@@ -344,15 +344,17 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   尾部缺失，重新配置 UART 后恢复）。现在 ISR 只做 `ring_buf_put + k_sem_give`，
   由 `uart_to_ble_thread` 在读出同一批字节时喂面板；非 LCD 构建本来就是这个
   ISR 形状，所以从未出现该问题。
+- btop 使用 UTF-8 的方块/盲文/画线字符：解析器按 UTF-8 解码，把画线映射为
+  `- | +`、方块/盲文映射为 `#`（每个字符只占一格），否则多字节字符会被拆成
+  多格、整屏右移；终端 feed 环为 32 KB，以容纳 btop 约 66 KB/s 的整帧突发。
 - 终端 flush/render 跑在**专用可抢占工作队列**（优先级 8），LVGL 刷屏也在
   独立的可抢占线程（优先级 8），避免 1.5 Mbaud 下协作式 system workqueue
   饿死优先级 7 的 RX 消费线程、把 4 KB RX 环挤满。
 - 1.5 Mbaud 下仍有一个**未解决**的 UART RX 尾字节滞留：短提示符/回显的最后
   几个字节要等下一次输出才出现。**只在 C5 LCD 构建出现，非 LCD 的 C5 DevKitC
-  不出现**；因此本板启用每字节 RX 中断（`CONFIG_UART_ESP32_RX_FIFO_THRESH=1`）
-  和 50 ms 轮询 `CONFIG_LINKR_UART_RX_TAIL_POLL=y`（后者 Kconfig 默认 n），
-  但它们不保证完全解决。临时规避：重新应用一次 UART 设置（`@u=...`）或降低
-  波特率。现象、取证与对照实验见
+  不出现**；因此本板启用每字节 RX 中断（`CONFIG_UART_ESP32_RX_FIFO_THRESH=1`），
+  它覆盖了短突发的 FIFO 尾字节；50 ms 轮询与它重叠，已删除。临时规避：重新
+  应用一次 UART 设置（`@u=...`）或降低波特率。现象、取证与对照实验见
   [ISSUE_C5_UART_RX_TAIL.md](ISSUE_C5_UART_RX_TAIL.md)。
 - 清屏功能已按要求移除（连同上滑回看与 CLR/FOL/STAT 三个按钮）；`CLR` 曾经
   清理的只是面板视图，现在由"内容自然上移"取代。
