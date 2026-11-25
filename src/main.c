@@ -892,13 +892,6 @@ static void uart_rx_irq_callback(const struct device *dev, void *user_data)
 			atomic_add(&bridge_rx_delta, (atomic_val_t)written);
 		}
 
-#if defined(CONFIG_LINKR_LCD)
-		/* Mirror the bridge traffic on the panel. The helper only copies
-		 * into a lock-protected ring, so it is safe from this ISR.
-		 */
-		linkr_terminal_feed((const uint8_t *)buf, (size_t)rx_len);
-#endif
-
 		k_sem_give(&uart_rx_sem);
 	}
 }
@@ -2068,22 +2061,31 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 
 	/* ---- LCD grid query (@g?) ---- */
 	if (!strcmp(body, "g?")) {
+#if defined(CONFIG_LINKR_LCD)
 		(void)send_control_response(conn, "OK lcd=%ux%u wide=%u\r\n",
 					    (unsigned int)linkr_terminal_cols(),
 					    (unsigned int)linkr_terminal_rows(),
 					    (unsigned int)linkr_terminal_wide());
+#else
+		/* Boards without the panel compile no terminal view; report an
+		 * empty grid instead of the narrow default so a host can tell
+		 * that there is nothing to size. */
+		(void)send_control_response(conn, "OK lcd=0x0 wide=0\r\n");
+#endif
 		return true;
 	}
 
 	/* ---- UART (@u / @linkr uart) ---- */
 	if (!strcmp(body, "uart?") || !strcmp(body, "u?")) {
+#if defined(CONFIG_LINKR_LCD)
 		/* Feature toggle for the panel: every UART query flips the
 		 * terminal grid between 38 and 60 columns so a full-screen TUI
-		 * can be sized for the LCD. Deliberately unguarded -- it only
-		 * changes how the panel renders the mirrored stream, never the
-		 * target UART or its tty size.
+		 * can be sized for the LCD. It only changes how the panel
+		 * renders the mirrored stream, never the target UART or its
+		 * tty size.
 		 */
 		linkr_terminal_set_wide(!linkr_terminal_wide());
+#endif
 		(void)uart_status_response(conn, "OK");
 		return true;
 	}
@@ -2579,9 +2581,6 @@ static void uart_to_ble_thread(void)
 	uint8_t buf[UART_RX_CHUNK];
 	size_t len = 0;
 	int64_t last_rx = 0;
-#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
-	int64_t last_tail_poll = 0;
-#endif
 	bool accounted = false;
 
 	k_sem_take(&bridge_start_sem, K_FOREVER);
@@ -2617,53 +2616,21 @@ static void uart_to_ble_thread(void)
 		irq_unlock(key);
 
 		if (got > 0) {
+#if defined(CONFIG_LINKR_LCD)
+			/* Mirror the bridge traffic on the panel. Doing this here
+			 * keeps the UART ISR down to ring_buf_put + k_sem_give, the
+			 * same work the non-LCD build does; feeding the panel from
+			 * the ISR widened the window in which the C5 leaves the
+			 * tail byte in the RX FIFO.
+			 */
+			linkr_terminal_feed(buf + len, got);
+#endif
 			signal_uart_activity();
 			len += got;
 			last_rx = k_uptime_get();
 
 			continue;
 		}
-
-#if IS_ENABLED(CONFIG_LINKR_UART_RX_TAIL_POLL)
-		/* The newer ESP32 UART IP can leave the tail of a burst in the
-		 * FIFO when no further byte arrives to re-trigger the RX
-		 * interrupt. Poll the FIFO every 50 ms to deliver that tail to
-		 * both consumers; the interval is short enough to keep a
-		 * prompt/echo current and long enough not to spin on an empty
-		 * FIFO. Older ESP32 variants do not need this and compile it out.
-		 */
-		int64_t now = k_uptime_get();
-
-		if (now - last_tail_poll >= 50) {
-			uint8_t tail[32];
-			int tail_len;
-
-			last_tail_poll = now;
-			key = irq_lock();
-			uart_irq_update(bridge_uart);
-			tail_len = uart_irq_rx_ready(bridge_uart) ?
-				uart_fifo_read(bridge_uart, tail, sizeof(tail)) : 0;
-			irq_unlock(key);
-
-			if (tail_len > 0) {
-				uint32_t written = ring_buf_put(&uart_rx_ring, tail,
-								(uint32_t)tail_len);
-
-				if (written < (uint32_t)tail_len) {
-					atomic_add(&uart_rx_dropped,
-						   (uint32_t)tail_len - written);
-				}
-				if (written > 0U) {
-					atomic_add(&bridge_rx_delta, (atomic_val_t)written);
-				}
-#if defined(CONFIG_LINKR_LCD)
-				linkr_terminal_feed(tail, (size_t)tail_len);
-#endif
-				signal_uart_activity();
-				last_rx = k_uptime_get();
-			}
-		}
-#endif /* CONFIG_LINKR_UART_RX_TAIL_POLL */
 
 		if (len > 0 &&
 		    k_uptime_get() - last_rx >= CONFIG_LINKR_BLE_BRIDGE_UART_IDLE_MS) {

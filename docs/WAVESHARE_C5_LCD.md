@@ -336,10 +336,12 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
     换行、256/truecolor→16 色，以及 Linux 控制台的 G0/G1 + SI/SO 画线字符集
     ——这是 `TERM=linux` 下 htop 能在面板上正确显示的前提。
   - 终端栏显示当前 `TERMINAL 60x33 …` / `TERMINAL 38x24 …`。
-- 1.5 Mbaud 下 C5 的 UART 会把一批数据的最后几个字节留在 FIFO：`uart_to_ble_thread`
-  每 50 ms 兜底读一次 FIFO，并同时喂 BLE 环和面板 feed，否则提示符/回显的尾部
-  要等下一个字节才出现。该兜底由 `CONFIG_LINKR_UART_RX_TAIL_POLL` 控制，默认只在
-  C5/C6/H2（使用 `tout_conf_sync` 的新 UART IP）上开启；老 ESP32/S3/C3 编译时排除。
+- 面板 mirror 不在 UART ISR 里做：`linkr_terminal_feed()`（自旋锁、逐字节复制、
+  重排 flush work）会拉长 ISR 里“读完 FIFO → 下一次状态检查”的窗口，C5 上会把
+  一批数据的最后几个字节留在 RX FIFO，直到下一个字节才出来（表现为提示符/回显
+  尾部缺失，重新配置 UART 后恢复）。现在 ISR 只做 `ring_buf_put + k_sem_give`，
+  由 `uart_to_ble_thread` 在读出同一批字节时喂面板；非 LCD 构建本来就是这个
+  ISR 形状，所以从未出现该问题。
 - 清屏功能已按要求移除（连同上滑回看与 CLR/FOL/STAT 三个按钮）；`CLR` 曾经
   清理的只是面板视图，现在由"内容自然上移"取代。
 - **始终跟随最新输出**（`src/linkr_terminal.c`）：
