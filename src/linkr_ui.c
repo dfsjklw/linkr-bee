@@ -69,11 +69,11 @@ LOG_MODULE_REGISTER(linkr_ui, CONFIG_LOG_DEFAULT_LEVEL);
  * page keeps Consolas 10: column alignment matters there.
  */
 LV_FONT_DECLARE(lv_font_consola_10);
-LV_FONT_DECLARE(lv_font_consola_7);
+LV_FONT_DECLARE(lv_font_terminal_3x5);
 
 #define UI_FONT      (&lv_font_montserrat_14)
 #define UI_TERM_FONT        (&lv_font_consola_10)
-#define UI_TERM_FONT_WIDE   (&lv_font_consola_7)
+#define UI_TERM_FONT_WIDE   (&lv_font_terminal_3x5)
 
 /* Material-ish dark palette (taken from the web client's DESIGN.md). */
 #define UI_CARD_BG     0x151B26U
@@ -141,7 +141,7 @@ LV_FONT_DECLARE(lv_font_consola_7);
 #define UI_TERM_WIDTH_WIDE  240
 #define UI_TERM_Y        20
 #define UI_TERM_PITCH    12
-#define UI_TERM_PITCH_WIDE 9
+#define UI_TERM_PITCH_WIDE 6
 #define UI_TERM_X        6
 #define UI_TERM_WIDTH    228
 
@@ -860,13 +860,13 @@ void linkr_ui_terminal_set_geometry(bool wide)
 
 	term_font = wide ? UI_TERM_FONT_WIDE : UI_TERM_FONT;
 	term_pitch = wide ? UI_TERM_PITCH_WIDE : UI_TERM_PITCH;
-	term_line_h = wide ? 8 : 11;
+	term_line_h = wide ? 6 : 11;
 	term_rows = wide ? LINKR_TERM_ROWS_WIDE : LINKR_TERM_ROWS_NARROW;
 	term_cols = wide ? LINKR_TERM_COLS_WIDE : LINKR_TERM_COLS_NARROW;
 	/* Advance in 1/16 px, straight from the generated font tables:
 	 * Consolas 10 is 88 (5.5 px), Consolas 7 is 62 (3.875 px).
 	 */
-	term_adv = wide ? 62 : 88;
+	term_adv = wide ? 48 : 88;
 	width = wide ? UI_TERM_WIDTH_WIDE : UI_TERM_WIDTH;
 	height = (lv_coord_t)term_rows * term_pitch;
 

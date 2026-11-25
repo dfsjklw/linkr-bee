@@ -66,6 +66,7 @@ if(CONFIG_LINKR_LCD)
   target_sources(app PRIVATE
     src/board_io.c
     src/fonts/lv_font_consola_7.c
+    src/fonts/lv_font_terminal_3x5.c
     src/fonts/lv_font_consola_10.c
     src/fonts/lv_font_consola_14.c
     src/linkr_display.c

@@ -2079,7 +2079,7 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 	if (!strcmp(body, "uart?") || !strcmp(body, "u?")) {
 #if defined(CONFIG_LINKR_LCD)
 		/* Feature toggle for the panel: every UART query flips the
-		 * terminal grid between 38 and 60 columns so a full-screen TUI
+		 * terminal grid between 38 and 80 columns so a full-screen TUI
 		 * can be sized for the LCD. It only changes how the panel
 		 * renders the mirrored stream, never the target UART or its
 		 * tty size.

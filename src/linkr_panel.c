@@ -290,7 +290,7 @@ static void update_terminal_bar(void)
 	char line[64];
 
 	format_quantity(rate_text, sizeof(rate_text), rx_rate);
-	snprintf(line, sizeof(line), "TERMINAL %ux%u  %u  %s/s",
+	snprintf(line, sizeof(line), "%ux%u  %u  %s/s",
 		 (unsigned int)linkr_terminal_cols(),
 		 (unsigned int)linkr_terminal_rows(),
 		 (unsigned int)linkr_bridge_uart_baud(), rate_text);

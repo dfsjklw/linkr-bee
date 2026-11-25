@@ -368,9 +368,9 @@ static void test_overflow_resynchronises_the_parser(void)
 	CHECK(strcmp(last_visible_line(), "AFTER") == 0);
 }
 
-/* The @u? toggle switches the grid between 38 and 48 columns. The width must
- * change where the parser wraps, not only in the label layout, otherwise a
- * 48-column TUI is folded at 38 columns and looks scrambled.
+/* The @u? toggle switches the grid between 38 and 80 columns. The width must
+ * change where the parser wraps, not only in the label layout, otherwise an
+ * 80-column TUI is folded at 38 columns and looks scrambled.
  */
 static size_t row_len(uint8_t row)
 {
@@ -384,7 +384,7 @@ static size_t row_len(uint8_t row)
 
 static void feed_run(char c, unsigned int count)
 {
-	char text[80];
+	char text[128];
 
 	memset(text, c, count);
 	text[count] = '\0';
@@ -398,31 +398,33 @@ static void test_width_switch(void)
 	CHECK(linkr_terminal_cols() == LINKR_TERM_COLS_NARROW);
 	CHECK(linkr_terminal_rows() == LINKR_TERM_ROWS_NARROW);
 
-	/* 70 characters in the narrow grid wrap at 38 + 32. */
-	feed_run('N', 70U);
+	/* 90 characters in the narrow grid wrap at 38 + 52. */
+	feed_run('N', 90U);
 	flush_handler(NULL);
 	CHECK(row_len(0) == LINKR_TERM_COLS_NARROW);
-	CHECK(row_len(1) == 70U - LINKR_TERM_COLS_NARROW);
+	CHECK(row_len(1) == LINKR_TERM_COLS_NARROW);
+	CHECK(row_len(2) == 90U - 2U * LINKR_TERM_COLS_NARROW);
 
-	/* Same buffer, wide grid: wrap at 62 + 8. */
+	/* Same buffer, wide grid: wrap at 80 + 10. */
 	linkr_terminal_set_wide(true);
 	CHECK(linkr_terminal_wide());
 	CHECK(linkr_terminal_cols() == LINKR_TERM_COLS_WIDE);
 	CHECK(linkr_terminal_rows() == LINKR_TERM_ROWS_WIDE);
 	linkr_terminal_feed((const uint8_t *)"\x1b[2J", 4);
-	feed_run('W', 70U);
+	feed_run('W', 90U);
 	flush_handler(NULL);
 	CHECK(row_len(0) == LINKR_TERM_COLS_WIDE);
-	CHECK(row_len(1) == 70U - LINKR_TERM_COLS_WIDE);
+	CHECK(row_len(1) == 90U - LINKR_TERM_COLS_WIDE);
 
 	/* And back to the narrow grid. */
 	linkr_terminal_set_wide(false);
 	CHECK(!linkr_terminal_wide());
 	linkr_terminal_feed((const uint8_t *)"\x1b[2J", 4);
-	feed_run('X', 70U);
+	feed_run('X', 90U);
 	flush_handler(NULL);
 	CHECK(row_len(0) == LINKR_TERM_COLS_NARROW);
-	CHECK(row_len(1) == 70U - LINKR_TERM_COLS_NARROW);
+	CHECK(row_len(1) == LINKR_TERM_COLS_NARROW);
+	CHECK(row_len(2) == 90U - 2U * LINKR_TERM_COLS_NARROW);
 }
 
 /* Cursor addressing, erase, insert/delete and the alternate screen are what

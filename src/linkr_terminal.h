@@ -34,7 +34,7 @@ bool linkr_terminal_unread(void);
 void linkr_terminal_unread_clear(void);
 
 /**
- * @brief Switch the panel grid between 38x24 and 60x33.
+ * @brief Switch the panel grid between 38x24 and 80x49.
  *
  * RAM-only: the next boot starts narrow again. This changes only how the
  * panel renders the mirrored stream; the target's tty keeps whatever size
@@ -42,7 +42,7 @@ void linkr_terminal_unread_clear(void);
  */
 void linkr_terminal_set_wide(bool wide);
 
-/** @brief True while the 60-column grid is active. */
+/** @brief True while the 80-column grid is active. */
 bool linkr_terminal_wide(void);
 
 /** @brief Active column count (38 or 60). */

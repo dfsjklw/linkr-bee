@@ -31,12 +31,12 @@
  * linkr_terminal_set_wide().
  */
 #define LINKR_TERM_COLS_NARROW 38
-#define LINKR_TERM_COLS_WIDE   60
+#define LINKR_TERM_COLS_WIDE   80
 #define LINKR_TERM_COLS_MAX    LINKR_TERM_COLS_WIDE
 #define LINKR_TERM_COLS        LINKR_TERM_COLS_NARROW
 
 #define LINKR_TERM_ROWS_NARROW 24
-#define LINKR_TERM_ROWS_WIDE   33
+#define LINKR_TERM_ROWS_WIDE   49
 #define LINKR_TERM_ROWS_MAX    LINKR_TERM_ROWS_WIDE
 /* The UI builds one label per possible row; the mode decides how many are
  * visible. */
