@@ -16,12 +16,14 @@ enum linkr_watchdog_channel {
 #ifdef CONFIG_LINKR_BLE_BRIDGE_WATCHDOG
 void linkr_watchdog_feed(enum linkr_watchdog_channel channel);
 void linkr_watchdog_boot_complete(void);
+const char *linkr_watchdog_reset_cause_str(void);
 #else
 static inline void linkr_watchdog_feed(enum linkr_watchdog_channel channel)
 {
 	(void)channel;
 }
 static inline void linkr_watchdog_boot_complete(void) {}
+static inline const char *linkr_watchdog_reset_cause_str(void) { return "n/a"; }
 #endif
 
 #endif

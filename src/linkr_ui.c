@@ -377,8 +377,15 @@ static void tri_refresh(void)
 	size_t used = 0U;
 
 	for (uint8_t i = 0U; i < LINKR_UI_LINK_COUNT; i++) {
-		int n = snprintf(buf + used, sizeof(buf) - used, "%s%c%s", i ? " " : "",
-				 link_state[i] ? '+' : '-', names[i]);
+		int n;
+
+#if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+		if (i == 1U || i == 2U) {
+			continue;
+		}
+#endif
+		n = snprintf(buf + used, sizeof(buf) - used, "%s%c%s", used ? " " : "",
+			     link_state[i] ? '+' : '-', names[i]);
 
 		if (n <= 0 || (size_t)n >= sizeof(buf) - used) {
 			break;
@@ -475,7 +482,11 @@ static void ui_build_status_page(void)
 	/* Right-aligned so the three indicators keep a stable position no
 	 * matter how long the texts get.
 	 */
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
 	tri_label = ui_add_label(page_status_obj, "BLE- WIFI- LAN-", UI_LABEL_COLOR, UI_FONT, 0, 0);
+#else
+	tri_label = ui_add_label(page_status_obj, "BLE-", UI_LABEL_COLOR, UI_FONT, 0, 0);
+#endif
 	lv_obj_align(tri_label, LV_ALIGN_TOP_RIGHT, -22, UI_TITLE_Y);
 
 	unread_dot = lv_obj_create(page_status_obj);
@@ -487,8 +498,19 @@ static void ui_build_status_page(void)
 	lv_obj_set_style_bg_opa(unread_dot, LV_OPA_TRANSP, 0);
 	lv_obj_clear_flag(unread_dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
-	/* ---- Card 1: network ------------------------------------------- */
-	ui_add_card(page_status_obj, UI_CARD1_Y, UI_CARD_H);
+	lv_coord_t card_h = UI_CARD_H;
+	lv_coord_t uart_y = UI_CARD1_Y;
+	lv_coord_t system_y;
+
+#if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+	/* Two cards instead of three: give each one five value rows. */
+	card_h = UI_ROW_PITCH * 6 + 10;
+#endif
+	system_y = uart_y + card_h + 3;
+
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+	/* ---- Card 1: network (only when the board has WiFi) ------------ */
+	ui_add_card(page_status_obj, UI_CARD1_Y, card_h);
 	ui_add_card_title(page_status_obj, UI_CARD1_Y, LV_SYMBOL_WIFI, "NETWORK");
 
 	field_labels[LINKR_UI_FIELD_IP] =
@@ -498,27 +520,50 @@ static void ui_build_status_page(void)
 	field_labels[LINKR_UI_FIELD_BLE] =
 		ui_add_card_value(page_status_obj, UI_CARD1_Y, 3);
 
-	/* ---- Card 2: UART and traffic ---------------------------------- */
-	ui_add_card(page_status_obj, UI_CARD2_Y, UI_CARD_H);
-	ui_add_card_title(page_status_obj, UI_CARD2_Y, LV_SYMBOL_REFRESH, "UART / TRAFFIC");
+	uart_y = UI_CARD2_Y;
+	system_y = UI_CARD2_Y + card_h + 3;
+#endif
+
+	/* ---- Card: UART and traffic ------------------------------------ */
+	ui_add_card(page_status_obj, uart_y, card_h);
+	ui_add_card_title(page_status_obj, uart_y, LV_SYMBOL_REFRESH, "UART / TRAFFIC");
 
 	field_labels[LINKR_UI_FIELD_UART] =
-		ui_add_card_value(page_status_obj, UI_CARD2_Y, 1);
+		ui_add_card_value(page_status_obj, uart_y, 1);
 	field_labels[LINKR_UI_FIELD_TRAFFIC] =
-		ui_add_card_value(page_status_obj, UI_CARD2_Y, 2);
+		ui_add_card_value(page_status_obj, uart_y, 2);
 	field_labels[LINKR_UI_FIELD_BUFFER] =
-		ui_add_card_value(page_status_obj, UI_CARD2_Y, 3);
+		ui_add_card_value(page_status_obj, uart_y, 3);
+#if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+	field_labels[LINKR_UI_FIELD_BLE_DROP] =
+		ui_add_card_value(page_status_obj, uart_y, 4);
+	field_labels[LINKR_UI_FIELD_UART_DROP] =
+		ui_add_card_value(page_status_obj, uart_y, 5);
+#endif
 
-	/* ---- Card 3: system -------------------------------------------- */
-	ui_add_card(page_status_obj, UI_CARD3_Y, UI_CARD_H);
-	ui_add_card_title(page_status_obj, UI_CARD3_Y, LV_SYMBOL_SETTINGS, "SYSTEM");
+	/* ---- Card: system ---------------------------------------------- */
+	ui_add_card(page_status_obj, system_y, card_h);
+	ui_add_card_title(page_status_obj, system_y, LV_SYMBOL_SETTINGS, "SYSTEM");
 
+#if IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
 	field_labels[LINKR_UI_FIELD_LAN] =
-		ui_add_card_value(page_status_obj, UI_CARD3_Y, 1);
+		ui_add_card_value(page_status_obj, system_y, 1);
 	field_labels[LINKR_UI_FIELD_SYSTEM] =
-		ui_add_card_value(page_status_obj, UI_CARD3_Y, 2);
+		ui_add_card_value(page_status_obj, system_y, 2);
 	field_labels[LINKR_UI_FIELD_DAV] =
-		ui_add_card_value(page_status_obj, UI_CARD3_Y, 3);
+		ui_add_card_value(page_status_obj, system_y, 3);
+#else
+	field_labels[LINKR_UI_FIELD_SYSTEM] =
+		ui_add_card_value(page_status_obj, system_y, 1);
+	field_labels[LINKR_UI_FIELD_RESET] =
+		ui_add_card_value(page_status_obj, system_y, 2);
+	field_labels[LINKR_UI_FIELD_FW] =
+		ui_add_card_value(page_status_obj, system_y, 3);
+	field_labels[LINKR_UI_FIELD_GRID] =
+		ui_add_card_value(page_status_obj, system_y, 4);
+	field_labels[LINKR_UI_FIELD_PSRAM] =
+		ui_add_card_value(page_status_obj, system_y, 5);
+#endif
 
 	feedback_label = ui_add_label(page_status_obj, "", UI_OK_COLOR, UI_FONT, UI_CARD_X + UI_CARD_PAD,
 				      UI_FEEDBACK_Y);

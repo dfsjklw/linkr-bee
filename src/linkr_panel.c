@@ -16,6 +16,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/mem_stats.h>
+#include <zephyr/sys/cpu_load.h>
+#include <esp_heap_caps.h>
+#include <esp_psram.h>
+#include <zephyr/version.h>
 #include <zephyr/sys/sys_heap.h>
 
 #include <stdio.h>
@@ -27,6 +31,8 @@
 #if defined(CONFIG_LINKR_LCD) && defined(CONFIG_LVGL)
 
 #include "ble_security.h"
+#include "ble_peers.h"
+#include "watchdog.h"
 #include "linkr_bridge_stats.h"
 #include "linkr_terminal.h"
 #include "uart_autobaud.h"
@@ -284,16 +290,65 @@ static void update_system(void)
 	linkr_ui_set_field(LINKR_UI_FIELD_SYSTEM, line);
 }
 
+#if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+static void update_extra(void)
+{
+	char qty[12];
+	char line[56];
+
+	format_quantity(qty, sizeof(qty), linkr_ble_peer_dropped());
+	snprintf(line, sizeof(line), "ble tx drop %s", qty);
+	linkr_ui_set_field(LINKR_UI_FIELD_BLE_DROP, line);
+
+	format_quantity(qty, sizeof(qty), linkr_bridge_drop_count());
+	snprintf(line, sizeof(line), "uart drop %s", qty);
+	linkr_ui_set_field(LINKR_UI_FIELD_UART_DROP, line);
+
+	snprintf(line, sizeof(line), "reset %s", linkr_watchdog_reset_cause_str());
+	linkr_ui_set_field(LINKR_UI_FIELD_RESET, line);
+
+	snprintf(line, sizeof(line), "fw %s / %s",
+		 CONFIG_LINKR_BLE_BRIDGE_FIRMWARE_VERSION, KERNEL_VERSION_STRING);
+	linkr_ui_set_field(LINKR_UI_FIELD_FW, line);
+
+	snprintf(line, sizeof(line), "grid %ux%u %s",
+		 (unsigned int)linkr_terminal_cols(), (unsigned int)linkr_terminal_rows(),
+		 linkr_terminal_wide() ? "wide" : "narrow");
+	linkr_ui_set_field(LINKR_UI_FIELD_GRID, line);
+
+	{
+		size_t free_k = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U;
+		size_t total_k = esp_psram_get_size() / 1024U;
+
+		snprintf(line, sizeof(line), "psram %uK/%uK", (unsigned int)free_k,
+			 (unsigned int)total_k);
+	}
+	linkr_ui_set_field(LINKR_UI_FIELD_PSRAM, line);
+}
+#endif
+
 static void update_terminal_bar(void)
 {
 	char rate_text[12];
 	char line[64];
 
 	format_quantity(rate_text, sizeof(rate_text), rx_rate);
+#if IS_ENABLED(CONFIG_CPU_LOAD)
+	{
+		int load = cpu_load_get_cpu(0U, true);
+
+		snprintf(line, sizeof(line), "%ux%u  %u  %s/s  cpu %d%%",
+			 (unsigned int)linkr_terminal_cols(),
+			 (unsigned int)linkr_terminal_rows(),
+			 (unsigned int)linkr_bridge_uart_baud(), rate_text,
+			 load > 0 ? load / 10 : 0);
+	}
+#else
 	snprintf(line, sizeof(line), "%ux%u  %u  %s/s",
 		 (unsigned int)linkr_terminal_cols(),
 		 (unsigned int)linkr_terminal_rows(),
 		 (unsigned int)linkr_bridge_uart_baud(), rate_text);
+#endif
 	linkr_ui_set_terminal_bar(line);
 }
 
@@ -361,6 +416,9 @@ static void panel_work_handler(struct k_work *work)
 	update_counters();
 	update_health();
 	update_system();
+#if !IS_ENABLED(CONFIG_LINKR_BLE_BRIDGE_WIFI)
+	update_extra();
+#endif
 	update_terminal_bar();
 	update_feedback();
 

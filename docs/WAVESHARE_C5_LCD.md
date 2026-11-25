@@ -126,7 +126,7 @@ CI 的面板 job 会断言这一点。影响范围：
 |---|---|
 | BLE 串口桥 / 管理通道 / 配对 | ✅ 不受影响 |
 | 面板 UI、触摸、终端视图 | ✅ 不受影响 |
-| WiFi 配网 `@w=`、扫描、IP | ❌ 编译期移除（状态页 WIFI 点恒为灭） |
+| WiFi 配网 `@w=`、扫描、IP | ❌ 编译期移除（状态页不显示 WIFI/NETWORK） |
 | LAN WebSocket 桥 `ws://<ip>/ws` | ❌ 随 WiFi 移除 |
 | WebDAV 日志上传 `@d` | ❌ 随 WiFi 移除 |
 
@@ -228,8 +228,9 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 1. 烧写后串口应出现
    `CH32V003 expander ready at 0x24`、`panel up: 240x320 ST7789` 与
    `status screen ready (2 pages)`。
-2. 屏幕应停在状态页：`Linkr` 标题、`BLE- WIFI- LAN-` 三态点、IP 行与 `PAIR` /
-   `BAUD` / `TERM` 三个按钮；开机 1 s 内各字段被填满。
+2. 屏幕应停在状态页：`Linkr` 标题、`BLE-` 指示、`UART / TRAFFIC` 与
+   `SYSTEM` 两张卡片（本板 WiFi 关闭，各 5 行）以及 `PAIR` / `BAUD` / `TERM`
+   三个按钮；开机 1 s 内各字段被填满。
 3. 若出现 `direction register write failed`：检查 I²C 是否被改到 GPIO0/GPIO1
    （overlay 生效）以及 expander 供电。
 4. 若背光不亮但日志正常：确认 `CONFIG_LINKR_LCD_BACKLIGHT_DEFAULT` 非 0，
@@ -240,7 +241,7 @@ Zephyr 的 ST7789V 驱动只做**软件复位**，所以硬件复位必须早于
 6. 若出现 PSRAM 相关 HardFault 或花屏：用 `nm` 确认 `__lvgl_psram_start`
    与 `_ext_ram_heap_end` 未重叠（见 4.1）。
 7. 确认 BLE 功能未回归：开启 PSRAM 后必须重跑既有 BLE 回归与 24 h 压测。
-   本板 WiFi 已在编译期关闭（4.0 节），状态页 WIFI 点恒灭属预期，不要当成故障。
+   本板 WiFi 已在编译期关闭（4.0 节），状态页不显示 WIFI/NETWORK/DAV 属预期。
 8. 触摸：状态页按钮与手势响应正常；串口不应出现 `linkr_touch` 的读取错误。
 9. 传感器：串口**不应**出现 `linkr_status` 模块日志（该模块已删除，传感器不再上屏）。
 10. 终端：上电后终端区应**空白**（自检 banner 已移除）；向桥接串口发送文本（115200）
@@ -312,13 +313,26 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
 - 尝试过给 LVGL 模块单独加 `-O2`（`target_compile_options` / `COMPILE_FLAGS` /
   源文件级属性），生成的命令行一律是 `-O2 ... -Os`，**GCC 取最后一个**，无效。
 
+### 状态页卡片（WiFi 关闭时）
+
+`CONFIG_LINKR_BLE_BRIDGE_WIFI=n` 时 NETWORK 卡片和顶栏的 `WIFI`/`LAN` 指示都
+不创建，剩下的两张卡片各显示 5 行：
+
+- `UART / TRAFFIC`：UART 配置、流量、缓冲、**BLE TX 丢包**、**UART RX 丢包**；
+- `SYSTEM`：uptime、**复位原因**、**固件/Zephyr 版本**、**终端网格**、
+  **PSRAM 空闲/总量**。
+
+WiFi/WebLAN 可用的构建保持原来的三张卡片和 `BLE+ WIFI+ LAN+` 三态指示。
+底部按钮固定为 `PAIR`（配对授权窗口）、`BAUD`（115200/921600/460800 循环）、
+`TERM`（切到终端页）。
+
 ### UI 字体与排版
 
 - 标题/状态/详情用 **Consolas 14**（4 bpp 抗锯齿等宽），终端区用 **Consolas 10**
   （2 bpp，11 px 行高、12 px 行距）。两个字面都由 `lv_font_conv` 生成并随源码提交
   （`src/fonts/lv_font_consola_14.c`、`src/fonts/lv_font_consola_10.c`），
   生成命令见 `src/linkr_ui.c` 注释。
-- 终端区为 **24 行**（窄，38 列）或 **33 行**（宽，60 列），卡片内
+- 终端区为 **24 行**（窄，38 列）或 **49 行**（宽，80 列），卡片内
   `y=20..308` / `y=0..294`。UI 侧是一块 **240×297 RGB565 canvas**（缓冲按最大网格分配）
   （`.linkr_psram`，142,560 B），逐单元格绘制背景矩形 + 字形，不再用逐行
   label，因此全屏程序的前景/背景色能逐格还原；`linkr_terminal.c` 在缓冲区
@@ -328,7 +342,7 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   - 宽屏 **80×49**：Tom Thumb 3×5，步进 48/16 = 3 px，行高 6 px（49×6=294），
     卡片左右贴边且为直角（圆角会裁掉首尾列）。80 列正好占满 240 px，没有余量；
     3×5 字形适合 btop/htop 这类全屏场景，需要清晰字体时用 `@u?` 切回 38×24。
-  宽窄只影响面板渲染；目标 tty 的列/行由主机用 `stty rows 33 cols 60` 决定，
+  宽窄只影响面板渲染；目标 tty 的列/行由主机用 `stty rows 49 cols 80` 决定，
   全屏程序必须在切换后启动，运行中的程序不会因 `@u?` 重排。
   - 切换入口是管理查询 **`@u?`**：每查询一次翻转一次
     （`linkr_terminal_set_wide()`），状态只在 RAM，重启回 38×24；`@g?` 只读
@@ -336,8 +350,9 @@ SPI 传输，切页结束时打印 `page X->Y ... | render ... | N fps`）。**�
   - 解析器支持光标寻址、擦除、插入/删除、滚动区、`?1049` 备用屏、`?7` 自动
     换行、256/truecolor→16 色，以及 Linux 控制台的 G0/G1 + SI/SO 画线字符集
     ——这是 `TERM=linux` 下 htop 能在面板上正确显示的前提。
-  - 顶栏保留键盘图标和动态状态（列×行、波特率、速率），不再显示 `TERMINAL`
-    英文标识；例如 `⌨ 80x49 1500000 0/s`。
+  - 顶栏保留键盘图标和动态状态（列×行、波特率、速率、CPU 负载），不再显示
+    `TERMINAL` 英文标识；例如 `⌨ 80x49 1500000 0/s cpu 12%`。CPU 负载由
+    `CONFIG_CPU_LOAD` 的 idle-hook 后端提供。
 - 面板 mirror 不在 UART ISR 里做：`linkr_terminal_feed()`（自旋锁、逐字节复制、
   重排 flush work）会拉长 ISR 里“读完 FIFO → 下一次状态检查”的窗口，C5 上会把
   一批数据的最后几个字节留在 RX FIFO，直到下一个字节才出来（表现为提示符/回显

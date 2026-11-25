@@ -30,6 +30,7 @@ static int channels[LINKR_WDT_CHANNEL_COUNT];
 /* Written only by the owning thread/work item, after initialization. */
 static int64_t last_feed[LINKR_WDT_CHANNEL_COUNT];
 static struct k_work_delayable health_work;
+static uint32_t boot_reset_cause;
 
 static void watchdog_expired(int channel_id, void *user_data)
 {
@@ -67,7 +68,6 @@ void linkr_watchdog_boot_complete(void)
 static int watchdog_init(void)
 {
 	const struct device *hardware = DEVICE_DT_GET(DT_ALIAS(watchdog0));
-	uint32_t reset_cause;
 	int err;
 
 	if (!device_is_ready(hardware)) {
@@ -89,8 +89,8 @@ static int watchdog_init(void)
 		}
 		last_feed[i] = k_uptime_get();
 	}
-	if (hwinfo_get_reset_cause(&reset_cause) == 0) {
-		LOG_INF("Reset cause: 0x%08x", reset_cause);
+	if (hwinfo_get_reset_cause(&boot_reset_cause) == 0) {
+		LOG_INF("Reset cause: 0x%08x", boot_reset_cause);
 		(void)hwinfo_clear_reset_cause();
 	}
 	k_work_init_delayable(&health_work, health_check);
@@ -98,6 +98,29 @@ static int watchdog_init(void)
 	LOG_INF("Watchdog active: task timeout %u ms, hardware fallback enabled",
 		CONFIG_LINKR_BLE_BRIDGE_WATCHDOG_TIMEOUT_MS);
 	return 0;
+}
+
+const char *linkr_watchdog_reset_cause_str(void)
+{
+	if (boot_reset_cause & RESET_POR) {
+		return "power-on";
+	}
+	if (boot_reset_cause & RESET_WATCHDOG) {
+		return "watchdog";
+	}
+	if (boot_reset_cause & RESET_SOFTWARE) {
+		return "software";
+	}
+	if (boot_reset_cause & RESET_CPU_LOCKUP) {
+		return "cpu lockup";
+	}
+	if (boot_reset_cause & RESET_BROWNOUT) {
+		return "brownout";
+	}
+	if (boot_reset_cause & RESET_PIN) {
+		return "pin";
+	}
+	return "unknown";
 }
 
 /* Run before static application threads start, including management workers.

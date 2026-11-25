@@ -64,6 +64,12 @@ enum linkr_ui_field {
 	LINKR_UI_FIELD_LAN,     /* ws up:80  cli 1                       */
 	LINKR_UI_FIELD_SYSTEM,  /* up 00:12:33  heap 18K                 */
 	LINKR_UI_FIELD_DAV,     /* dav on  q 0  fail 0                   */
+	LINKR_UI_FIELD_BLE_DROP, /* peer tx drop                          */
+	LINKR_UI_FIELD_UART_DROP,/* uart rx drop                          */
+	LINKR_UI_FIELD_RESET,   /* reset cause                           */
+	LINKR_UI_FIELD_FW,      /* firmware / zephyr version             */
+	LINKR_UI_FIELD_GRID,    /* terminal grid                         */
+	LINKR_UI_FIELD_PSRAM,   /* psram free                            */
 	LINKR_UI_FIELD_COUNT
 };
 
