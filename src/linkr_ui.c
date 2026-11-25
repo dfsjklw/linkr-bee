@@ -188,6 +188,9 @@ static uint8_t term_cols;
 static lv_coord_t term_pitch;
 static lv_coord_t term_line_h;
 static lv_coord_t term_adv;
+static uint16_t term_canvas_w;
+static uint16_t term_canvas_h;
+static uint8_t term_bpp;
 
 /* RGB565 canvas for the whole terminal grid. The wide grid is 240 x 297 px;
  * the buffer is shared by both grids and lives in PSRAM next to the LVGL
@@ -565,6 +568,9 @@ static void ui_build_terminal_page(void)
 	lv_canvas_set_buffer(term_canvas, term_canvas_buf, UI_TERM_WIDTH,
 			     LINKR_TERM_ROWS_NARROW * UI_TERM_PITCH,
 			     LV_COLOR_FORMAT_RGB565);
+	term_canvas_w = UI_TERM_WIDTH;
+	term_canvas_h = LINKR_TERM_ROWS_NARROW * UI_TERM_PITCH;
+	term_bpp = 2;
 	lv_obj_clear_flag(term_canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_add_flag(term_canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
@@ -759,19 +765,95 @@ void linkr_ui_terminal_unread(bool unread)
 #endif
 }
 
+static uint16_t rgb565(uint32_t rgb)
+{
+	return (uint16_t)((((rgb >> 16) & 0xFFU) >> 3) << 11 |
+			  (((rgb >> 8) & 0xFFU) >> 2) << 5 |
+			  ((rgb & 0xFFU) >> 3));
+}
+
+static uint16_t mix565(uint16_t fg, uint16_t bg, uint8_t alpha)
+{
+	uint32_t fr = (fg >> 11) & 0x1FU;
+	uint32_t fgc = (fg >> 5) & 0x3FU;
+	uint32_t fb = fg & 0x1FU;
+	uint32_t br = (bg >> 11) & 0x1FU;
+	uint32_t bgc = (bg >> 5) & 0x3FU;
+	uint32_t bb = bg & 0x1FU;
+	uint32_t r = (fr * alpha + br * (255U - alpha)) / 255U;
+	uint32_t g = (fgc * alpha + bgc * (255U - alpha)) / 255U;
+	uint32_t b = (fb * alpha + bb * (255U - alpha)) / 255U;
+
+	return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void fill565(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
+		    int32_t x, int32_t y, int32_t w, int32_t h, uint16_t color)
+{
+	for (int32_t row = 0; row < h; row++) {
+		int32_t py = y + row;
+
+		if (py < 0 || py >= (int32_t)fb_h) {
+			continue;
+		}
+		for (int32_t col = 0; col < w; col++) {
+			int32_t px = x + col;
+
+			if (px >= 0 && px < (int32_t)fb_w) {
+				fb[(size_t)py * fb_w + px] = color;
+			}
+		}
+	}
+}
+
+static void blit_glyph(uint16_t *fb, uint16_t fb_w, uint16_t fb_h,
+		       int32_t x, int32_t y, const lv_font_glyph_dsc_t *g,
+		       const uint8_t *bmp, uint8_t bpp, uint16_t fg, uint16_t bg)
+{
+	for (uint16_t gy = 0U; gy < g->box_h; gy++) {
+		int32_t py = y + (int32_t)gy;
+
+		if (py < 0 || py >= (int32_t)fb_h) {
+			continue;
+		}
+		for (uint16_t gx = 0U; gx < g->box_w; gx++) {
+			int32_t px = x + (int32_t)gx;
+			uint32_t bit;
+			uint8_t alpha;
+
+			if (px < 0 || px >= (int32_t)fb_w) {
+				continue;
+			}
+			bit = (uint32_t)gy * g->box_w + gx;
+			if (bpp == 1U) {
+				alpha = ((bmp[bit >> 3] >> (7U - (bit & 7U))) & 1U) ?
+					255U : 0U;
+			} else {
+				uint32_t bit2 = bit * 2U;
+				uint8_t value = (bmp[bit2 >> 3] >> (6U - (bit2 & 7U))) & 3U;
+
+				alpha = (uint8_t)(value * 85U);
+			}
+			if (alpha == 0U) {
+				continue;
+			}
+			fb[(size_t)py * fb_w + px] = (alpha == 255U) ?
+				fg : mix565(fg, bg, alpha);
+		}
+	}
+}
+
 void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
 			      size_t stride, const uint8_t *fg, const uint8_t *bg)
 {
-	/* Draw tasks reference the label text until the layer is finished, so
-	 * every run's text is copied into one frame arena first. Worst case is
-	 * one run per cell (a colour change on every column), which needs one
-	 * character plus a NUL each.
-	 */
-	static char run_text[LINKR_TERM_ROWS_MAX * LINKR_TERM_COLS_MAX * 2U];
-	size_t run_used = 0U;
-	lv_layer_t layer;
+	uint16_t *fb = (uint16_t *)term_canvas_buf;
+	uint16_t fb_w = term_canvas_w;
+	uint16_t fb_h = term_canvas_h;
+	uint16_t card = rgb565(UI_CARD_BG);
+	const lv_font_t *font = term_font;
+	uint8_t bpp = term_bpp;
 
-	if (term_canvas == NULL || fg == NULL || bg == NULL) {
+	if (term_canvas == NULL || fb == NULL || fg == NULL || bg == NULL) {
 		return;
 	}
 	if (rows > term_rows) {
@@ -784,11 +866,10 @@ void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_lock();
 #endif
-	lv_canvas_fill_bg(term_canvas, lv_color_hex(UI_CARD_BG), LV_OPA_COVER);
-	lv_canvas_init_layer(term_canvas, &layer);
+	fill565(fb, fb_w, fb_h, 0, 0, fb_w, fb_h, card);
 
 	for (uint8_t row = 0U; row < rows; row++) {
-		lv_coord_t y = (lv_coord_t)(row * term_pitch);
+		int32_t y = (int32_t)row * term_pitch;
 		uint8_t col = 0U;
 
 		while (col < cols) {
@@ -796,10 +877,8 @@ void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
 			uint8_t f = fg[index];
 			uint8_t b = bg[index];
 			uint8_t end = (uint8_t)(col + 1U);
+			uint16_t run_bg;
 
-			/* One run per colour pair: full-screen programs change colour
-			 * per column but the text between changes is contiguous.
-			 */
 			while (end < cols) {
 				size_t next = (size_t)row * LINKR_TERM_COLS_MAX + end;
 
@@ -809,40 +888,47 @@ void linkr_ui_terminal_render(uint8_t rows, uint8_t cols, const char *cells,
 				end++;
 			}
 
-			lv_coord_t x0 = (lv_coord_t)(((int32_t)col * term_adv) >> 4);
-			lv_coord_t x1 = (lv_coord_t)(((int32_t)end * term_adv) >> 4);
-			lv_area_t area = { x0, y, (lv_coord_t)(x1 - 1), (lv_coord_t)(y + term_line_h - 1) };
-
+			run_bg = (b != 0xFFU) ? rgb565(term_palette[b & 0x0FU]) : card;
 			if (b != 0xFFU) {
-				lv_draw_rect_dsc_t rdsc;
+				int32_t x0 = ((int32_t)col * term_adv) >> 4;
+				int32_t x1 = ((int32_t)end * term_adv) >> 4;
 
-				lv_draw_rect_dsc_init(&rdsc);
-				rdsc.bg_color = lv_color_hex(term_palette[b & 0x0FU]);
-				rdsc.bg_opa = LV_OPA_COVER;
-				lv_draw_rect(&layer, &rdsc, &area);
+				fill565(fb, fb_w, fb_h, x0, y, x1 - x0,
+					term_line_h, run_bg);
 			}
 
-			size_t len = (size_t)(end - col);
+			for (uint8_t c = col; c < end; c++) {
+				char ch = cells[(size_t)row * stride + c];
+				lv_font_glyph_dsc_t g;
 
-			if (run_used + len + 1U > sizeof(run_text)) {
-				break;
+				if (ch < 0x20 || ch > 0x7E) {
+					continue;
+				}
+				if (!lv_font_get_glyph_dsc(font, &g, (uint8_t)ch, 0)) {
+					continue;
+				}
+				g.req_raw_bitmap = 1;
+				/* Call the font's own callback: the public wrapper
+				 * clears req_raw_bitmap and then needs a draw_buf,
+				 * which we do not have for static C fonts.
+				 */
+				const uint8_t *bmp =
+					(const uint8_t *)font->get_glyph_bitmap(&g, NULL);
+
+				if (bmp == NULL || g.box_w == 0U || g.box_h == 0U) {
+					continue;
+				}
+				int32_t gx = (((int32_t)c * term_adv) >> 4) + g.ofs_x;
+				int32_t gy = y + (font->line_height - font->base_line) -
+					     g.box_h - g.ofs_y;
+
+				blit_glyph(fb, fb_w, fb_h, gx, gy, &g, bmp, bpp,
+					   rgb565(term_palette[f & 0x0FU]), run_bg);
 			}
-			memcpy(&run_text[run_used], &cells[(size_t)row * stride + col], len);
-			run_text[run_used + len] = '\0';
-
-			lv_draw_label_dsc_t ldsc;
-
-			lv_draw_label_dsc_init(&ldsc);
-			ldsc.color = lv_color_hex(term_palette[f & 0x0FU]);
-			ldsc.font = term_font;
-			ldsc.text = &run_text[run_used];
-			run_used += len + 1U;
-			lv_draw_label(&layer, &ldsc, &area);
 			col = end;
 		}
 	}
 
-	lv_canvas_finish_layer(term_canvas, &layer);
 	lv_obj_invalidate(term_canvas);
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
@@ -867,6 +953,7 @@ void linkr_ui_terminal_set_geometry(bool wide)
 	 * Consolas 10 is 88 (5.5 px), Consolas 7 is 62 (3.875 px).
 	 */
 	term_adv = wide ? 48 : 88;
+	term_bpp = wide ? 1 : 2;
 	width = wide ? UI_TERM_WIDTH_WIDE : UI_TERM_WIDTH;
 	height = (lv_coord_t)term_rows * term_pitch;
 
@@ -884,6 +971,8 @@ void linkr_ui_terminal_set_geometry(bool wide)
 	lv_obj_set_size(term_cont, width, height);
 	lv_canvas_set_buffer(term_canvas, term_canvas_buf, width, height,
 			     LV_COLOR_FORMAT_RGB565);
+	term_canvas_w = (uint16_t)width;
+	term_canvas_h = (uint16_t)height;
 	lv_obj_update_layout(term_cont);
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
