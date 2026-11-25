@@ -931,6 +931,17 @@ config LINKR_LCD_BACKLIGHT_DEFAULT
 	  0 leaves the panel dark (useful while the ST7789 init sequence is
 	  being validated); 255 is full brightness.
 
+config LINKR_UART_RX_TAIL_POLL
+	bool "Poll the UART RX FIFO for a stuck tail"
+	default n
+	help
+	  Poll the UART RX FIFO every 50 ms and feed any bytes that the C5
+	  UART leaves behind to both consumers. The issue has only been seen on
+	  the C5 LCD build (Waveshare panel); the non-LCD C5 DevKitC does not
+	  show it. Enable it from the board configuration that needs it; the
+	  workaround is still incomplete (the 50 ms poll did not always
+	  retrieve the tail), so keep the UART-reconfigure workaround in mind.
+
 endmenu
 
 source "Kconfig.zephyr"
