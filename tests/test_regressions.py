@@ -115,6 +115,25 @@ class FirmwareTests(unittest.TestCase):
                        "\nstatic void recycled(void)", ["disconnected"])
         self.assertIn("linkr_ble_peer_disconnected(conn);", body)
 
+    def test_lcd_grid_is_switched_by_g_not_by_uart_queries(self):
+        """@u? must stay a pure query; the grid is a deliberate @g= action.
+
+        The panel used to flip between 38x24 and 80x49 on every UART settings
+        query, so the web client's connect-time @u? resized the panel behind
+        the operator's back. The switch now goes through @g= (applied on the
+        panel work queue) or the status-page button.
+        """
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
+        uart = extract(main, 'if (!strcmp(body, "uart?") || !strcmp(body, "u?"))',
+                       '\n\tif (!strncmp(body, "uart=", 5)', ["uart_status_response"])
+        self.assertNotIn("linkr_terminal_set_wide", uart)
+
+        grid = extract(main, 'if (!strncmp(body, "g=", 2))',
+                       "\n\t/* ---- UART (@u / @linkr uart) ---- */",
+                       ["linkr_panel_request_grid"])
+        self.assertIn("linkr_panel_request_grid(wide)", grid)
+        self.assertIn("ERR format: @g=wide|narrow|1|0", grid)
+
     def test_webdav_setters_reject_before_mutating_and_publish_atomically(self):
         """The production setters, not a simulation of them."""
         (summary,) = self.run_scenario("setters")

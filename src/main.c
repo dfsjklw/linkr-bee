@@ -40,7 +40,9 @@
 #include "target_binding.h"
 
 #if defined(CONFIG_LINKR_LCD)
+#include "linkr_panel.h"
 #include "linkr_terminal.h"
+#include "linkr_ui.h"
 #endif
 #include "ble_mgmt.h"
 #include "ble_uart_reliable.h"
@@ -2075,17 +2077,40 @@ static bool handle_control_command_complete(struct bt_conn *conn,
 		return true;
 	}
 
+	/* ---- LCD grid set (@g=wide / @g=narrow) ---- */
+	if (!strncmp(body, "g=", 2)) {
+#if defined(CONFIG_LINKR_LCD)
+		const char *value = body + 2;
+		bool wide;
+
+		if (!strcmp(value, "1") || !strcmp(value, "wide") ||
+		    !strcmp(value, "80x49")) {
+			wide = true;
+		} else if (!strcmp(value, "0") || !strcmp(value, "narrow") ||
+			   !strcmp(value, "38x24")) {
+			wide = false;
+		} else {
+			(void)send_control_response(
+				conn, "ERR format: @g=wide|narrow|1|0\r\n");
+			return true;
+		}
+		/* Applied on the panel work queue: the switch rebuilds LVGL
+		 * objects, which must not run on this thread. */
+		linkr_panel_request_grid(wide);
+		(void)send_control_response(
+			conn, "OK lcd=%ux%u wide=%u\r\n",
+			(unsigned int)(wide ? LINKR_TERM_COLS_WIDE : LINKR_TERM_COLS_NARROW),
+			(unsigned int)(wide ? LINKR_TERM_ROWS_WIDE : LINKR_TERM_ROWS_NARROW),
+			(unsigned int)wide);
+#else
+		/* No panel compiles a terminal view on this board. */
+		(void)send_control_response(conn, "ERR lcd unavailable\r\n");
+#endif
+		return true;
+	}
+
 	/* ---- UART (@u / @linkr uart) ---- */
 	if (!strcmp(body, "uart?") || !strcmp(body, "u?")) {
-#if defined(CONFIG_LINKR_LCD)
-		/* Feature toggle for the panel: every UART query flips the
-		 * terminal grid between 38 and 80 columns so a full-screen TUI
-		 * can be sized for the LCD. It only changes how the panel
-		 * renders the mirrored stream, never the target UART or its
-		 * tty size.
-		 */
-		linkr_terminal_set_wide(!linkr_terminal_wide());
-#endif
 		(void)uart_status_response(conn, "OK");
 		return true;
 	}

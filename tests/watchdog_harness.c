@@ -17,6 +17,13 @@
 #define ARG_UNUSED(x) (void)(x)
 #define K_MSEC(x) (x)
 #define SYS_REBOOT_COLD 0
+/* hwinfo reset-cause bits; the zephyr include that defines them is stripped. */
+#define RESET_POR 0x01
+#define RESET_WATCHDOG 0x02
+#define RESET_SOFTWARE 0x04
+#define RESET_CPU_LOCKUP 0x08
+#define RESET_BROWNOUT 0x10
+#define RESET_PIN 0x20
 #define LOG_MODULE_REGISTER(...)
 #define LOG_ERR(...) ((void)snprintf(message, sizeof(message), __VA_ARGS__))
 #define LOG_INF(...) ((void)0)

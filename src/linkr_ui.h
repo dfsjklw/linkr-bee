@@ -25,9 +25,10 @@
  * rounded card frame as the status page, and 25 rows would push the card past
  * the bottom edge.
  */
-/* Two grids share the page: the normal 38x24 log view (Consolas 10) and a
- * 60x33 view (Consolas 7) for full-screen TUIs such as htop. The mode is
- * RAM-only and toggled by the @u? management query; see
+/* Two grids share the page: the normal 38x24 log view (Consolas 10) and an
+ * 80x49 view (Tom Thumb) for full-screen TUIs such as htop. The mode is
+ * RAM-only and switched by the status page's size button or the explicit
+ * @g= management command; UART queries never change it. See
  * linkr_terminal_set_wide().
  */
 #define LINKR_TERM_COLS_NARROW 38

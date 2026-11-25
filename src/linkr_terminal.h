@@ -38,7 +38,9 @@ void linkr_terminal_unread_clear(void);
  *
  * RAM-only: the next boot starts narrow again. This changes only how the
  * panel renders the mirrored stream; the target's tty keeps whatever size
- * the host gave it with stty.
+ * the host gave it with stty. The status page's size button and the explicit
+ * @g= management command are the only callers; a UART *query* must never
+ * change the mode.
  */
 void linkr_terminal_set_wide(bool wide);
 

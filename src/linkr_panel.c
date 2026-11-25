@@ -15,6 +15,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/mem_stats.h>
 #include <zephyr/sys/cpu_load.h>
 #include <esp_heap_caps.h>
@@ -45,6 +46,11 @@ LOG_MODULE_REGISTER(linkr_panel, CONFIG_LOG_DEFAULT_LEVEL);
 #define FEEDBACK_HOLD_MS  3000
 
 static struct k_work_delayable panel_work;
+/* Grid changes are applied from the workqueue, never in the caller's context:
+ * the @g= management command runs on the BLE/LAN thread and the grid switch
+ * rebuilds LVGL objects (font, canvas, row labels). */
+static struct k_work grid_work;
+static atomic_t grid_request_wide;
 
 /* 64-bit running totals, fed by draining the 32-bit ISR deltas once a second.
  * At 921600 baud the raw counters wrap in ~13 hours, so the drain interval is
@@ -425,6 +431,27 @@ static void panel_work_handler(struct k_work *work)
 	(void)k_work_reschedule(&panel_work, K_MSEC(PANEL_PERIOD_MS));
 }
 
+/* Apply a requested grid change in UI context. */
+static void grid_work_handler(struct k_work *work)
+{
+	char text[32];
+	bool wide = atomic_get(&grid_request_wide) != 0;
+
+	ARG_UNUSED(work);
+
+	linkr_terminal_set_wide(wide);
+	snprintf(text, sizeof(text), "grid %ux%u %s",
+		 (unsigned int)linkr_terminal_cols(),
+		 (unsigned int)linkr_terminal_rows(), wide ? "wide" : "narrow");
+	linkr_panel_feedback(text);
+}
+
+void linkr_panel_request_grid(bool wide)
+{
+	atomic_set(&grid_request_wide, wide ? 1 : 0);
+	(void)k_work_submit(&grid_work);
+}
+
 void linkr_panel_feedback(const char *text)
 {
 	if (text == NULL) {
@@ -442,6 +469,7 @@ void linkr_panel_feedback(const char *text)
 
 static int linkr_panel_init(void)
 {
+	k_work_init(&grid_work, grid_work_handler);
 	k_work_init_delayable(&panel_work, panel_work_handler);
 	/* First update after one second: the deltas are meaningless before the
 	 * bridge has run for a measurable window.
@@ -460,6 +488,11 @@ SYS_INIT(linkr_panel_init, APPLICATION, 97);
 void linkr_panel_feedback(const char *text)
 {
 	ARG_UNUSED(text);
+}
+
+void linkr_panel_request_grid(bool wide)
+{
+	ARG_UNUSED(wide);
 }
 
 #endif /* CONFIG_LINKR_LCD && CONFIG_LVGL */

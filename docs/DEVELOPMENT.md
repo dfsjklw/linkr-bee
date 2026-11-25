@@ -794,6 +794,13 @@ rather than leaving a dead control.
 | `@u?` | `@linkr uart?` | Query UART settings |
 | `@u=baud,data,parity,stop,flow` | `@linkr uart=...` | Set UART mode |
 
+### LCD Panel Commands (boards with a terminal panel)
+
+| Short Form | Long Form | Description |
+|------------|-----------|-------------|
+| `@g?` | — | Report the panel grid (`OK lcd=<cols>x<rows> wide=0\|1`) |
+| `@g=wide\|narrow` | — | Switch the panel grid (also `1`/`0`, `80x49`/`38x24`); never changes the target tty |
+
 ### Autobaud Commands (ESP32-WROOM)
 
 | Short Form | Long Form | Description |

@@ -20,7 +20,7 @@
  *   y=172  uptime (also the liveness heartbeat)
  *   y=191  separator
  *   y=196  feedback line
- *   y=248  PAIR / BAUD / TERM buttons (72x52)
+ *   y=280  PAIR / BAUD / grid-size buttons (72x32)
  *
  * Page 1 (LINKR_UI_PAGE_TERMINAL) is the serial terminal only: a status bar and
  * a rounded card holding a fixed 24 x 38 grid of 10 px text. linkr_terminal.c
@@ -182,6 +182,7 @@ static lv_obj_t *term_bar;
 static lv_obj_t *term_card;
 static lv_obj_t *term_cont;
 static lv_obj_t *term_canvas;
+static lv_obj_t *grid_label;
 static const lv_font_t *term_font;
 static uint8_t term_rows;
 static uint8_t term_cols;
@@ -279,7 +280,8 @@ static lv_obj_t *ui_add_page(lv_obj_t *parent)
 }
 
 static lv_obj_t *ui_add_button(lv_obj_t *parent, const char *text, int32_t x,
-			       int32_t y, int32_t w, int32_t h, lv_event_cb_t cb)
+			       int32_t y, int32_t w, int32_t h, lv_event_cb_t cb,
+			       lv_obj_t **label_out)
 {
 	lv_obj_t *btn = lv_button_create(parent);
 	lv_obj_t *label;
@@ -301,6 +303,10 @@ static lv_obj_t *ui_add_button(lv_obj_t *parent, const char *text, int32_t x,
 
 	if (cb != NULL) {
 		lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+	}
+
+	if (label_out != NULL) {
+		*label_out = label;
 	}
 
 	return btn;
@@ -426,7 +432,7 @@ static void page_gesture_cb(lv_event_t *event)
 	}
 }
 
-static void term_button_cb(lv_event_t *event);
+static void grid_button_cb(lv_event_t *event);
 
 static void pair_button_cb(lv_event_t *event)
 {
@@ -464,11 +470,17 @@ static void baud_button_cb(lv_event_t *event)
 	linkr_panel_feedback(text);
 }
 
-static void term_button_cb(lv_event_t *event)
+/* The third status-page button shows the current grid and switches it.
+ *
+ * It replaced the old TERM button: the terminal page is reached by swiping
+ * left, and the grid is the thing an operator actually needs at a glance on a
+ * phone-sized screen. The label carries the size, so no extra field is needed.
+ */
+static void grid_button_cb(lv_event_t *event)
 {
 	ARG_UNUSED(event);
 
-	linkr_ui_show_page(LINKR_UI_PAGE_TERMINAL);
+	linkr_panel_request_grid(!linkr_terminal_wide());
 }
 
 /* ---------------------------------------------------------------------- */
@@ -569,11 +581,11 @@ static void ui_build_status_page(void)
 				      UI_FEEDBACK_Y);
 
 	ui_add_button(page_status_obj, "PAIR", UI_CONTENT_X, UI_BTN_Y, UI_BTN_W, UI_BTN_H,
-		      pair_button_cb);
+		      pair_button_cb, NULL);
 	ui_add_button(page_status_obj, "BAUD", UI_CONTENT_X + UI_BTN_W + UI_BTN_GAP, UI_BTN_Y,
-		      UI_BTN_W, UI_BTN_H, baud_button_cb);
-	ui_add_button(page_status_obj, "TERM", UI_CONTENT_X + 2 * (UI_BTN_W + UI_BTN_GAP), UI_BTN_Y,
-		      UI_BTN_W, UI_BTN_H, term_button_cb);
+		      UI_BTN_W, UI_BTN_H, baud_button_cb, NULL);
+	ui_add_button(page_status_obj, "38x24", UI_CONTENT_X + 2 * (UI_BTN_W + UI_BTN_GAP),
+		      UI_BTN_Y, UI_BTN_W, UI_BTN_H, grid_button_cb, &grid_label);
 
 	tri_refresh();
 }
@@ -1019,6 +1031,9 @@ void linkr_ui_terminal_set_geometry(bool wide)
 	term_canvas_w = (uint16_t)width;
 	term_canvas_h = (uint16_t)height;
 	lv_obj_update_layout(term_cont);
+	if (grid_label != NULL) {
+		lv_label_set_text(grid_label, wide ? "80x49" : "38x24");
+	}
 #if defined(CONFIG_LV_Z_LVGL_MUTEX)
 	lvgl_unlock();
 #endif
